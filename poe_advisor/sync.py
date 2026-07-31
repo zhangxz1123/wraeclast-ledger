@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
+import math
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from .clients import (
@@ -36,7 +37,11 @@ from .models import (
     iso_utc,
     parse_datetime,
 )
-from .normalization import normalize_ggg_markets, normalize_poe_ninja
+from .normalization import (
+    assert_poe_ninja_chaos_parity,
+    normalize_ggg_markets,
+    normalize_poe_ninja,
+)
 from .storage import Storage
 
 
@@ -90,11 +95,160 @@ DEFAULT_ITEM_CATEGORIES = [
 
 STANDARD_ANCHOR_SOURCE = "poe.ninja-standard"
 CURRENT_HISTORY_PRICE_SOURCE = "poe.watch-history"
+POE_NINJA_CURRENT_HISTORY_STATE_SOURCE = "poe.ninja-current-history"
 CURRENT_HISTORY_ITEM_CATEGORY = "current-item-history"
 CURRENT_HISTORY_DIVINE_CATEGORY = "current-divine-history"
 CURRENT_HISTORY_CATALOG_CATEGORY = "current-history-catalog"
-CURRENT_HISTORY_MAX_ITEMS = 100
+CURRENT_HISTORY_MAX_ITEMS = 2_000
 CURRENT_HISTORY_REQUEST_PAUSE_SECONDS = 0.03
+
+
+def _positive_float(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) and parsed > 0 else None
+
+
+def _poe_ninja_exchange_history_points(
+    payload: Any,
+    league: League,
+    *,
+    pair_ids: tuple[str, ...] = ("chaos", "chaos-orb"),
+) -> list[dict[str, Any]]:
+    if not isinstance(payload, dict) or not isinstance(payload.get("pairs"), list):
+        raise DataSourceError("poe.ninja exchange details had no pairs array")
+    accepted = {value.casefold() for value in pair_ids}
+    pair = next(
+        (
+            row
+            for row in payload["pairs"]
+            if isinstance(row, dict)
+            and str(row.get("id") or "").casefold() in accepted
+        ),
+        None,
+    )
+    if pair is None or not isinstance(pair.get("history"), list):
+        raise DataSourceError(
+            "poe.ninja exchange details had no dated Chaos pair history"
+        )
+    start = parse_datetime(league.start_at)
+    end = parse_datetime(league.end_at)
+    if start is None:
+        raise DataSourceError("League start timestamp is unavailable")
+    if end is not None and end < start:
+        # poe.ninja uses 0001-01-01 as an open-ended league sentinel. It is
+        # not a real completion date and must not discard every current-day
+        # history observation.
+        end = None
+    by_day: dict[int, dict[str, Any]] = {}
+    for row in pair["history"]:
+        if not isinstance(row, dict):
+            continue
+        observed = parse_datetime(str(row.get("timestamp") or ""))
+        rate = _positive_float(row.get("rate"))
+        volume = _positive_float(row.get("volumePrimaryValue"))
+        if (
+            observed is None
+            or rate is None
+            or volume is None
+            or observed.date() < start.date()
+        ):
+            continue
+        if end is not None and observed.date() > end.date():
+            continue
+        day = league_day(observed, start)
+        candidate = {
+            "league_day": day,
+            "observed_at": iso_utc(observed),
+            "mean": rate,
+            "volume": volume,
+            "confidence": 0.95,
+        }
+        previous = by_day.get(day)
+        if (
+            previous is not None
+            and candidate["observed_at"] == previous["observed_at"]
+            and candidate["mean"] != previous["mean"]
+        ):
+            raise DataSourceError(
+                "poe.ninja exchange history contained conflicting values for "
+                f"{candidate['observed_at']}"
+            )
+        if previous is None or (
+            str(candidate["observed_at"]),
+            float(candidate.get("volume") or 0.0),
+        ) > (
+            str(previous["observed_at"]),
+            float(previous.get("volume") or 0.0),
+        ):
+            by_day[day] = candidate
+    return [by_day[day] for day in sorted(by_day)]
+
+
+def _poe_ninja_stash_history_points(
+    payload: Any,
+    league: League,
+    fetched_at: str,
+) -> list[dict[str, Any]]:
+    if not isinstance(payload, list):
+        raise DataSourceError("poe.ninja stash item history was not an array")
+    start = parse_datetime(league.start_at)
+    fetched = parse_datetime(fetched_at)
+    end = parse_datetime(league.end_at)
+    if start is None or fetched is None:
+        raise DataSourceError("League start or history fetch timestamp is invalid")
+    if end is not None and end < start:
+        end = None
+    utc_midnight = datetime(
+        fetched.year,
+        fetched.month,
+        fetched.day,
+        tzinfo=timezone.utc,
+    )
+    by_day: dict[int, dict[str, Any]] = {}
+    for row in payload:
+        if not isinstance(row, dict):
+            continue
+        try:
+            days_ago = int(row.get("daysAgo"))
+        except (TypeError, ValueError):
+            continue
+        value = _positive_float(row.get("value"))
+        if days_ago < 0 or value is None:
+            continue
+        observed = utc_midnight - timedelta(days=days_ago)
+        if observed.date() < start.date() or (
+            end is not None and observed.date() > end.date()
+        ):
+            continue
+        day = league_day(observed, start)
+        count = _positive_float(row.get("count"))
+        if count is None:
+            continue
+        candidate = {
+            "league_day": day,
+            "observed_at": iso_utc(observed),
+            "mean": value,
+            "volume": count,
+            "listing_count": int(count),
+            "confidence": 0.95 if count >= 10 else 0.8,
+        }
+        previous = by_day.get(day)
+        # Stash history supplies day offsets, not intraday timestamps. If an
+        # upstream duplicate appears, prefer the larger listing sample so the
+        # choice is deterministic and independent of response order.
+        if previous is not None and candidate["mean"] != previous["mean"]:
+            raise DataSourceError(
+                "poe.ninja stash history contained conflicting values for "
+                f"{candidate['observed_at']}"
+            )
+        if previous is None or float(candidate.get("volume") or 0.0) > float(
+            previous.get("volume") or 0.0
+        ):
+            by_day[day] = candidate
+    return [by_day[day] for day in sorted(by_day)]
 
 
 class SyncAlreadyRunning(RuntimeError):
@@ -211,6 +365,390 @@ class SyncService:
         return self._lock.locked()
 
     def sync_current_item_histories(
+        self,
+        league: League,
+        item_keys: list[str],
+        *,
+        max_items: int = CURRENT_HISTORY_MAX_ITEMS,
+    ) -> dict[str, Any]:
+        """Backfill authoritative dated curves from poe.ninja detail APIs."""
+
+        requested_keys = list(
+            dict.fromkeys(
+                str(item_key).strip()
+                for item_key in item_keys
+                if str(item_key).strip()
+            )
+        )[: max(1, min(int(max_items), CURRENT_HISTORY_MAX_ITEMS))]
+        summary: dict[str, Any] = {
+            "status": "running",
+            "source": PoeNinjaClient.SOURCE,
+            "price_source": PoeNinjaClient.SOURCE,
+            "state_source": POE_NINJA_CURRENT_HISTORY_STATE_SOURCE,
+            "requested_items": len(requested_keys),
+            "matched_items": 0,
+            "unmatched_items": 0,
+            "ambiguous_items": 0,
+            "unmatched": [],
+            "fetched_items": 0,
+            "cached_items": 0,
+            "failed_items": 0,
+            "rows_written": 0,
+            "snapshots_written": 0,
+            "assets_written": 0,
+            "coverage": {},
+            "warnings": [],
+        }
+        if not self._current_history_lock.acquire(blocking=False):
+            summary.update(
+                status="busy",
+                message="A current-league item-history backfill is already running.",
+            )
+            return summary
+        try:
+            if league.is_demo:
+                summary.update(
+                    status="skipped",
+                    message="Current history is unavailable in demo mode.",
+                )
+                return summary
+            if not league.start_at:
+                summary.update(
+                    status="skipped",
+                    message=(
+                        "Current history needs a verified league start timestamp."
+                    ),
+                )
+                return summary
+            if not requested_keys:
+                summary.update(
+                    status="success",
+                    message="No ranked item histories were requested.",
+                )
+                return summary
+
+            exchange_types = {
+                str(category).casefold()
+                for category in self.storage.get_setting(
+                    "exchange_categories",
+                    DEFAULT_EXCHANGE_CATEGORIES,
+                )
+            }
+            selected: list[dict[str, Any]] = []
+            for item_key in requested_keys:
+                rows = self.storage.item_histories(
+                    league.id,
+                    days=max(90, int(league.day or 1) + 14),
+                    item_key=item_key,
+                    sources=(PoeNinjaClient.SOURCE,),
+                ).get(item_key, [])
+                latest = rows[-1] if rows else None
+                details = (
+                    latest.get("details")
+                    if isinstance(latest, dict)
+                    and isinstance(latest.get("details"), dict)
+                    else {}
+                )
+                category = str(latest.get("category") or "") if latest else ""
+                history_kind = (
+                    "exchange"
+                    if category.casefold() in exchange_types
+                    else "stash-item"
+                )
+                source_item_id = (
+                    details.get("detailsId")
+                    if history_kind == "exchange"
+                    else details.get("poe_ninja_id")
+                )
+                if latest is None or source_item_id in (None, "") or not category:
+                    summary["unmatched_items"] += 1
+                    if len(summary["unmatched"]) < 20:
+                        summary["unmatched"].append(
+                            {
+                                "item_key": item_key,
+                                "reason": "missing_poe_ninja_history_identity",
+                            }
+                        )
+                    continue
+                selected.append(
+                    {
+                        "item_key": item_key,
+                        "name": str(latest["name"]),
+                        "category": category,
+                        "source_item_id": str(source_item_id),
+                        "history_kind": history_kind,
+                    }
+                )
+            summary["matched_items"] = len(selected)
+            if summary["unmatched_items"]:
+                self._current_history_warning(
+                    summary,
+                    f"{summary['unmatched_items']} of {summary['requested_items']} "
+                    "ranked keys lacked an exact poe.ninja history identity.",
+                )
+            if not selected:
+                summary.update(
+                    status="partial",
+                    message=(
+                        "No ranked item had an exact poe.ninja detail-history "
+                        "identity; no histories were attached."
+                    ),
+                )
+                return summary
+
+            divine_record = self._poe_ninja_current_history_response(
+                league,
+                category="Currency",
+                source_item_id="divine-orb",
+                history_kind="exchange",
+                snapshot_category=CURRENT_HISTORY_DIVINE_CATEGORY,
+                summary=summary,
+            )
+            try:
+                divine_points = _poe_ninja_exchange_history_points(
+                    divine_record["payload"],
+                    league,
+                )
+                raw_divine_curve = {
+                    int(point["league_day"]): float(point["mean"])
+                    for point in divine_points
+                }
+                divine_quality = _validate_divine_curve(
+                    raw_divine_curve,
+                    minimum_points=1,
+                    reject_adjacent_jumps=False,
+                )
+            except Exception as error:
+                self.storage.update_snapshot_metadata(
+                    int(divine_record["snapshot_id"]),
+                    {
+                        "kind": "current-divine-history",
+                        "provider": PoeNinjaClient.SOURCE,
+                        "source_item_id": "divine-orb",
+                        "valid": False,
+                        "validation_error": str(error),
+                        "interpolation": "none",
+                    },
+                )
+                raise
+            divine_snapshot_id = self._store_poe_ninja_current_history_record(
+                divine_record,
+                league,
+                CURRENT_HISTORY_DIVINE_CATEGORY,
+                {
+                    "kind": "current-divine-history",
+                    "provider": PoeNinjaClient.SOURCE,
+                    "source_item_id": "divine-orb",
+                    "provider_observed_days": sorted(raw_divine_curve),
+                    "usable_days": sorted(divine_quality.prices),
+                    "rejected_days": sorted(divine_quality.rejected_days),
+                    "quality_issues": list(divine_quality.issues),
+                    "normalization": "Chaos per Divine, exact dated pair history",
+                },
+                summary,
+            )
+            divine_points_by_day = {
+                int(point["league_day"]): point
+                for point in divine_points
+                if int(point["league_day"]) in divine_quality.prices
+            }
+            current_day = max(1, int(league.day or 1))
+
+            for asset in selected:
+                item_key = str(asset["item_key"])
+                source_item_id = str(asset["source_item_id"])
+                try:
+                    record = self._poe_ninja_current_history_response(
+                        league,
+                        category=str(asset["category"]),
+                        source_item_id=source_item_id,
+                        history_kind=str(asset["history_kind"]),
+                        snapshot_category=CURRENT_HISTORY_ITEM_CATEGORY,
+                        summary=summary,
+                    )
+                    if asset["history_kind"] == "exchange":
+                        item_points = _poe_ninja_exchange_history_points(
+                            record["payload"],
+                            league,
+                        )
+                    else:
+                        item_points = _poe_ninja_stash_history_points(
+                            record["payload"],
+                            league,
+                            str(record["fetched_at"]),
+                        )
+                    item_points = [
+                        point
+                        for point in item_points
+                        if 1 <= int(point["league_day"]) <= current_day
+                    ]
+                    provider_days = {
+                        int(point["league_day"]) for point in item_points
+                    }
+                    normalized_days = sorted(
+                        provider_days.intersection(divine_quality.prices)
+                    )
+                    missing_provider_days = [
+                        day
+                        for day in range(1, current_day + 1)
+                        if day not in provider_days
+                    ]
+                    missing_divine_days = sorted(
+                        provider_days.difference(divine_quality.prices)
+                    )
+                    metadata = {
+                        "kind": "current-item-history",
+                        "provider": PoeNinjaClient.SOURCE,
+                        "provider_league": league.id,
+                        **asset,
+                        "provider_observed_days": sorted(provider_days),
+                        "provider_first_observed_day": (
+                            min(provider_days) if provider_days else None
+                        ),
+                        "provider_last_observed_day": (
+                            max(provider_days) if provider_days else None
+                        ),
+                        "provider_missing_days": missing_provider_days,
+                        "normalized_days": normalized_days,
+                        "missing_divine_anchor_days": missing_divine_days,
+                        "interpolation": "none",
+                    }
+                    snapshot_id = self._store_poe_ninja_current_history_record(
+                        record,
+                        league,
+                        CURRENT_HISTORY_ITEM_CATEGORY,
+                        metadata,
+                        summary,
+                    )
+                    points: list[PricePoint] = []
+                    for point in item_points:
+                        point_day = int(point["league_day"])
+                        divine_point = divine_points_by_day.get(point_day)
+                        if divine_point is None:
+                            continue
+                        divine_chaos = divine_quality.prices[point_day]
+                        points.append(
+                            PricePoint(
+                                league_id=league.id,
+                                item_key=item_key,
+                                name=str(asset["name"]),
+                                category=str(asset["category"]),
+                                source=PoeNinjaClient.SOURCE,
+                                observed_at=str(point["observed_at"]),
+                                chaos_value=float(point["mean"]),
+                                divine_value=float(point["mean"]) / divine_chaos,
+                                listing_count=point.get("listing_count"),
+                                volume=point.get("volume"),
+                                confidence=min(
+                                    float(point["confidence"]),
+                                    float(divine_point["confidence"]),
+                                    0.95,
+                                ),
+                                details={
+                                    "history_backfill": True,
+                                    "provider": PoeNinjaClient.SOURCE,
+                                    "source_item_id": source_item_id,
+                                    "history_kind": asset["history_kind"],
+                                    **(
+                                        {"detailsId": source_item_id}
+                                        if asset["history_kind"] == "exchange"
+                                        else {"poe_ninja_id": source_item_id}
+                                    ),
+                                    "league_day": point_day,
+                                    "divine_chaos": divine_chaos,
+                                    "normalization": (
+                                        "exact same-league, same-day poe.ninja "
+                                        "Divine/Chaos pair"
+                                    ),
+                                    "interpolated": False,
+                                    "divine_snapshot_id": divine_snapshot_id,
+                                },
+                                snapshot_id=snapshot_id,
+                            )
+                        )
+                    if item_points and not points:
+                        raise DataSourceError(
+                            "no item day had an exact poe.ninja Divine/Chaos anchor"
+                        )
+                    summary["rows_written"] += (
+                        self.storage.insert_price_points(points) if points else 0
+                    )
+                    summary["coverage"][item_key] = {
+                        "source": PoeNinjaClient.SOURCE,
+                        "source_item_id": source_item_id,
+                        "first_observed_day": (
+                            min(provider_days) if provider_days else None
+                        ),
+                        "last_observed_day": (
+                            max(provider_days) if provider_days else None
+                        ),
+                        "observed_days": sorted(provider_days),
+                        "missing_days": missing_provider_days,
+                        "normalized_days": normalized_days,
+                        "missing_divine_anchor_days": missing_divine_days,
+                        "interpolation": "none",
+                    }
+                    summary[
+                        "cached_items" if record["cached"] else "fetched_items"
+                    ] += 1
+                except Exception as error:
+                    summary["failed_items"] += 1
+                    self._current_history_warning(
+                        summary,
+                        f"{asset['name']} ({source_item_id}): {error}",
+                    )
+
+            if divine_quality.partial:
+                self._current_history_warning(
+                    summary,
+                    "poe.ninja Divine/Chaos history contained rejected days: "
+                    + "; ".join(divine_quality.issues),
+                )
+            summary["status"] = (
+                "partial"
+                if summary["failed_items"]
+                or summary["unmatched_items"]
+                or divine_quality.partial
+                else "success"
+            )
+            summary["message"] = (
+                "Current ranked-item archive updated from authoritative dated "
+                "poe.ninja detail histories; genuine missing days were preserved."
+            )
+            self.storage.update_source_state(
+                source=POE_NINJA_CURRENT_HISTORY_STATE_SOURCE,
+                endpoint=f"{league.id}:ranked-current-history",
+                league_id=league.id,
+                category="ranked-current-history",
+                status=summary["status"],
+                detail=(
+                    f"{summary['matched_items']} exact ranked identities; "
+                    f"{summary['unmatched_items']} unmatched; "
+                    f"{summary['rows_written']} normalized daily rows; "
+                    f"{summary['failed_items']} failures."
+                ),
+                success=True,
+            )
+            return summary
+        except Exception as error:
+            summary["status"] = "failed"
+            summary["message"] = (
+                f"Current ranked-item history stopped safely: {error}"
+            )
+            self._current_history_warning(summary, str(error))
+            self.storage.update_source_state(
+                source=POE_NINJA_CURRENT_HISTORY_STATE_SOURCE,
+                endpoint=f"{league.id}:ranked-current-history",
+                league_id=league.id,
+                category="ranked-current-history",
+                status="unavailable",
+                detail=str(error),
+            )
+            return summary
+        finally:
+            self._current_history_lock.release()
+
+    def _sync_current_item_histories_poe_watch_archive(
         self,
         league: League,
         item_keys: list[str],
@@ -649,6 +1187,84 @@ class SyncService:
         finally:
             self._current_history_lock.release()
 
+    def _poe_ninja_current_history_response(
+        self,
+        league: League,
+        *,
+        category: str,
+        source_item_id: str,
+        history_kind: str,
+        snapshot_category: str,
+        summary: dict[str, Any],
+    ) -> dict[str, Any]:
+        if history_kind == "exchange":
+            endpoint = self.poe_ninja.exchange_details_url(
+                league.id,
+                category,
+                source_item_id,
+            )
+            fetcher = self.poe_ninja.fetch_exchange_details
+        elif history_kind == "stash-item":
+            endpoint = self.poe_ninja.stash_item_history_url(
+                league.id,
+                category,
+                source_item_id,
+            )
+            fetcher = self.poe_ninja.fetch_stash_item_history
+        else:
+            raise DataSourceError(f"Unsupported poe.ninja history kind: {history_kind}")
+        cached = self.storage.latest_snapshot(
+            source=PoeNinjaClient.SOURCE,
+            endpoint=endpoint,
+            league_id=league.id,
+            category=snapshot_category,
+        )
+        if cached is not None and self._history_snapshot_is_current_day(
+            league,
+            str(cached.get("fetched_at") or ""),
+        ):
+            return {
+                "payload": self._decode_cached_json(cached["raw"], endpoint),
+                "snapshot_id": int(cached["id"]),
+                "cached": True,
+                "endpoint": endpoint,
+                "fetched_at": cached["fetched_at"],
+            }
+        result = fetcher(league.id, category, source_item_id)
+        time.sleep(CURRENT_HISTORY_REQUEST_PAUSE_SECONDS)
+        snapshot_id, created = self._store_snapshot(
+            result,
+            source=PoeNinjaClient.SOURCE,
+            league_id=league.id,
+            category=snapshot_category,
+            metadata={
+                "provider": PoeNinjaClient.SOURCE,
+                "history_kind": history_kind,
+                "source_item_id": source_item_id,
+            },
+        )
+        summary["snapshots_written"] += int(created)
+        return {
+            "payload": result.payload,
+            "snapshot_id": snapshot_id,
+            "cached": False,
+            "endpoint": endpoint,
+            "fetched_at": result.fetched_at,
+        }
+
+    def _store_poe_ninja_current_history_record(
+        self,
+        record: dict[str, Any],
+        league: League,
+        category: str,
+        metadata: dict[str, Any],
+        summary: dict[str, Any],
+    ) -> int:
+        del league, category, summary
+        snapshot_id = int(record["snapshot_id"])
+        self.storage.update_snapshot_metadata(snapshot_id, metadata)
+        return snapshot_id
+
     def _current_history_assets(
         self,
         league: League,
@@ -813,6 +1429,8 @@ class SyncService:
             "standard_endpoints_checked": 0,
             "standard_failed_endpoints": 0,
             "standard_anchor_available": False,
+            "poe_ninja_parity_rows": 0,
+            "standard_parity_rows": 0,
             "demo_seeded": False,
             "live": False,
         }
@@ -824,9 +1442,9 @@ class SyncService:
             self.storage.set_sync_run_league(run_id, league.id)
 
             successful_core = self._sync_poe_ninja(league, warnings, stats)
-            successful_forbidden = self._sync_forbidden_jewels(
-                league, warnings, stats
-            )
+            # Optional legacy enrichment is quarantined from the golden price
+            # path and must never make a failed poe.ninja price sync look fresh.
+            self._sync_forbidden_jewels(league, warnings, stats)
             stats["standard_anchor_available"] = (
                 self._sync_standard_prices(warnings, stats)
             )
@@ -845,11 +1463,7 @@ class SyncService:
                 )
 
             existing = self.storage.status_counts(league.id)["price_points"]
-            fresh_prices = (
-                successful_core
-                or successful_forbidden
-                or stats["official_hours"] > 0
-            )
+            fresh_prices = successful_core
             if not fresh_prices:
                 if existing == 0:
                     return self._finish_without_live_data(run_id, warnings, stats)
@@ -968,7 +1582,12 @@ class SyncService:
             current = self.storage.get_current_league()
             return current if current and not current.is_demo else None
 
-        # Optional enrichment: poe.watch exposes exact league start times.
+        # poe.ninja is authoritative whenever it supplies the league start.
+        # Only fall back to optional metadata when that field is absent.
+        if league.start_at:
+            return league
+
+        # Optional enrichment: poe.watch can fill a missing league start.
         watch_endpoint = self.poe_watch.leagues_url()
         watch_state = self.storage.get_source_state(
             PoeWatchClient.SOURCE, watch_endpoint
@@ -1091,8 +1710,45 @@ class SyncService:
                     stats["standard_endpoints_checked"] += 1
                 if result.not_modified:
                     stats["not_modified"] += 1
+                    cached = self.storage.latest_snapshot(
+                        source=state_source,
+                        endpoint=endpoint,
+                        league_id=league.id,
+                        category=category,
+                    )
+                    if cached is None:
+                        raise DataSourceError(
+                            "poe.ninja returned 304 without a cached source snapshot"
+                        )
+                    cached_payload = self._decode_cached_json(
+                        cached["raw"],
+                        endpoint,
+                    )
+                    points = normalize_poe_ninja(
+                        cached_payload,
+                        league_id=league.id,
+                        category=category,
+                        observed_at=result.fetched_at,
+                        snapshot_id=int(cached["id"]),
+                    )
+                    parity_rows = assert_poe_ninja_chaos_parity(
+                        cached_payload,
+                        points,
+                    )
+                    stats[
+                        "standard_parity_rows"
+                        if standard_anchor
+                        else "poe_ninja_parity_rows"
+                    ] += parity_rows
+                    written = self.storage.insert_price_points(points)
+                    stats["rows_written"] += written
+                    if standard_anchor:
+                        stats["standard_rows_written"] += written
                     any_success = True
-                    detail = "Not modified; using the locally cached snapshot."
+                    detail = (
+                        f"Revalidated unchanged; stored {len(points)} "
+                        "fresh daily observations from the cached payload."
+                    )
                 else:
                     snapshot_id, created = self._store_snapshot(
                         result,
@@ -1108,6 +1764,15 @@ class SyncService:
                         observed_at=result.fetched_at,
                         snapshot_id=snapshot_id,
                     )
+                    parity_rows = assert_poe_ninja_chaos_parity(
+                        result.payload,
+                        points,
+                    )
+                    stats[
+                        "standard_parity_rows"
+                        if standard_anchor
+                        else "poe_ninja_parity_rows"
+                    ] += parity_rows
                     written = self.storage.insert_price_points(points)
                     stats["rows_written"] += written
                     if standard_anchor:

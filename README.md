@@ -51,10 +51,11 @@ clearly labelled offline demo fixture. Demo values are never reported as live
 prices.
 
 After the first live market sync, open the gear menu and click **Build /
-continue past-league archive**. Forecasts use exact item/day observations from
-the four broadly covered softcore trade leagues: Mirage, Keepers (also
-reported upstream as Keepers of the Flame), Mercenaries, and Settlers. The
-backfill is resumable, so later passes skip successful item/league histories.
+continue past-league archive**. The first pass imports the four selected
+broad-league ZIP dumps listed by poe.ninja; later passes use saved dump
+fingerprints to skip every unchanged league. Forecasts use exact item/day
+observations from those softcore trade leagues: Mirage, Keepers (also
+reported upstream as Keepers of the Flame), Mercenaries, and Settlers.
 
 ## GitHub Pages and automatic daily updates
 
@@ -64,13 +65,16 @@ the local API or a raw copy of the local SQLite database. The included
 
 1. Restores the most recent sanitized, compressed market database from the
    `market-archive` GitHub Release.
-2. Runs the full unattended refresh: current prices, optional build
-   composition, top-ranked current-league curves, a resumable completed-league
-   batch, and the recommendation model.
-3. Exports one all-item catalog with exact 3/7/14-day ranks plus 256 lazily
-   loaded, content-hashed curve shards.
-4. Creates an integrity-checked, public-market-only SQLite backup and rotates
-   the prior good backup as `poe_market_history.previous.sqlite3.gz`. Raw HTTP
+2. Runs the full unattended refresh: poe.ninja current overviews, exact
+   top-ranked detail histories, optional build composition, any not-yet-imported
+   broad-league official dumps, and the recommendation model.
+3. Exports a lightweight all-item search/filter index, small content-hashed
+   3/7/14-day ranking pages, and lazily loaded price-curve shards. The hosted
+   page never downloads or parses one giant all-item recommendation catalog.
+4. Creates an integrity-checked, public-market-only SQLite backup, preserves
+   the safe poe.ninja dump checkpoints so immutable ZIPs are imported only
+   once, and rotates the prior good backup as
+   `poe_market_compact_history.previous.sqlite3.gz`. Raw HTTP
    payloads, local diagnostics, and settings outside a narrow crawl allowlist
    are removed before compression.
 5. Deploys only the static dashboard data to GitHub Pages.
@@ -101,7 +105,7 @@ server is open:
 
 ```powershell
 python -m poe_advisor --db data/poe_advisor.sqlite3 archive-snapshot `
-  --output build/archive/poe_market_history.sqlite3.gz `
+  --output build/archive/poe_market_compact_history.sqlite3.gz `
   --public-market-only
 ```
 
@@ -117,12 +121,17 @@ browser preferences, diagnostic error text, filesystem paths, or credentials.
 The SQLite database contains:
 
 - League metadata and whether the active dataset is live or demo.
-- Every successful raw HTTP response, gzip-compressed and content-hashed.
+- Successful current/detail response bodies, gzip-compressed and
+  content-hashed.
 - Divine-relative normalized price observations.
-- The full poe.watch item catalog used for historical discovery.
-- Completed-league daily prices, fetch progress, volume, and confidence.
-- Exact dated current-league poe.watch histories for ranked items, including
-  the raw item and same-day Divine Orb responses used for normalization.
+- Exact poe.ninja source item IDs and variant metadata from the current
+  overview catalog.
+- Exact dated current-league poe.ninja detail histories for ranked items,
+  including the raw item and same-day Divine/Chaos responses used for
+  normalization.
+- Completed-league daily prices imported from poe.ninja's official ZIP dumps,
+  plus the ZIP fingerprint/checkpoint, direct Chaos quote, confidence, and
+  source metadata retained for fast queries.
 - Prices for excluded low-end markets, including essences, fossils, oils,
   resonators, scarabs, Delirium Orbs, artifacts, and incubators. Keeping these
   observations does not place those categories in the forecast ranking.
@@ -141,35 +150,37 @@ The default database is under the local `data/` directory. Set
 that database to preserve the history accumulated by daily syncs.
 
 Raw snapshots are append-only by content hash. Repeated `304 Not Modified`
-responses do not duplicate them.
+responses do not duplicate them. Completed-league ZIPs are streamed through a
+temporary file; their normalized rows, SHA-256 fingerprint, and successful
+import checkpoint remain in SQLite, so an unchanged dump is not downloaded
+again.
 
 ## Sync and backfill behavior
 
 The **Sync market & run model** button calls `POST /api/sync`. A normal sync:
 
 1. Discovers the current PoE 1 softcore trade league from poe.ninja.
-2. Optionally enriches the league start time from poe.watch.
-3. Uses conditional requests to fetch the configured full PoE 1 poe.ninja
+2. Uses conditional requests to fetch the configured full PoE 1 poe.ninja
    universe by default: 18 exchange categories and 25 item-overview
    categories. This includes currencies, fragments, divination cards,
    crafting consumables, uniques, gems, maps, bases, beasts, and the other
    currently documented modalities. Collection scope is broader than
    recommendation scope, so excluded consumables still accumulate local
    history.
-4. Stores the full poe.watch catalog and derives current prices for every
-   exact Forbidden Flesh/Flame passive variant.
-5. Stores GGG's official passive-tree export and uses it to map those exact
-   variants to ascendancies; ambiguous or unknown passives are left unadjusted.
-6. Stores each raw response before writing normalized price points and leaves
+3. Preserves poe.ninja's exact source IDs and visible variant fields; an item
+   without a unique identity is not joined to historical data.
+4. Stores GGG's official passive-tree export as metadata for exact Forbidden
+   Jewel identities; ambiguous or unknown passives remain unmapped.
+5. Stores each raw response before writing normalized price points and leaves
    existing local data intact when one source or category fails.
-7. Archives poe.ninja's indexed-build class distribution and its nearest
+6. Archives poe.ninja's indexed-build class distribution and its nearest
    available past-league time-machine snapshots. The much smaller official
    experience-ladder sample is used only when poe.ninja is unavailable.
-8. Runs a preliminary top-100 ranking, matches those exact item identities in
-   the poe.watch catalog, and archives their dated current-league histories.
-   Prices are normalized only when that item day has an exact same-day Divine
-   Orb observation; missing trades and missing anchors remain gaps.
-9. Regenerates and stores the final ranking after the curve archive is updated.
+7. Runs a preliminary top-100 ranking and requests each exact identity's dated
+   poe.ninja detail history. Prices are normalized only when that item day has
+   an exact same-day poe.ninja Divine/Chaos observation; missing trades and
+   missing anchors remain gaps.
+8. Regenerates and stores the final ranking after the curve archive is updated.
 
 The optional JSON field `backfill_hours` also advances the official GGG
 Currency Exchange hourly archive:
@@ -181,7 +192,8 @@ Currency Exchange hourly archive:
 The official feed is historical, mixes all leagues, and does not expose the
 current hour. Wraeclast Ledger filters the selected league locally and saves a
 resume cursor. Backfill is intentionally bounded; it does not crawl the entire
-multi-year archive in one click.
+multi-year archive in one click. This is a separate research archive and never
+replaces a poe.ninja current or historical price in the forecast.
 
 Recent official hourly payloads can be roughly 1–2 MB each before local gzip
 compression. A 24-hour backfill may therefore download tens of megabytes and
@@ -190,62 +202,81 @@ poe.ninja sync is normally much smaller. Repeated syncs are cheaper because
 ETag and immutable-snapshot caching are used.
 
 The separate completed-league button calls `POST /api/seasonal/backfill`. Each
-pass:
+pass checks the official dump catalog at
+[poe.ninja/poe1/data](https://poe.ninja/poe1/data), then imports each new or
+changed ZIP for the four broadly covered scoring leagues as one complete unit.
+Every usable row in those selected ZIPs is retained; item rows that do not yet
+match a current exact identity remain archive-only and cannot be scored.
+Currency rows must be quoted
+directly against Chaos, and every Divine conversion uses the direct
+same-date Divine/Chaos pair from that same ZIP. Unmatched IDs, identity
+mismatches, and missing anchors remain explicit gaps.
 
-1. Saves the full current poe.watch compact catalog as a compressed raw
-   snapshot.
-2. Prioritizes liquid fungible markets that can be matched exactly to the
-   current poe.ninja catalog.
-3. Fetches the selected item in the six reviewed leagues: Affliction,
-   Necropolis, Settlers, Mercenaries, Keepers, and Mirage.
-4. Fetches each league's Divine Orb curve and converts every Chaos-denominated
-   historical row to Divine Orbs.
-5. Stores one consolidated row per item and league day, plus raw responses and
-   resumable success/failure state.
-6. Archives the nearest available completed-league poe.ninja build snapshots
-   for the meta-demand baseline, with official ladder pages as fallback.
+The ZIP fingerprint and success marker are committed with the normalized rows
+in SQLite. Repeated local passes and scheduled GitHub Actions runs therefore
+skip already imported immutable dumps while retaining the checkpoint in the
+durable sanitized archive.
 
-The default UI batch is 80 assets. Use repeated passes to extend breadth; no
-successful history is downloaded twice.
+Local imports keep the full verbose `seasonal_prices` archive by default,
+including archive-only identities and per-row diagnostics. GitHub Actions sets
+`POE_ADVISOR_COMPACT_HISTORY=1`; in that mode each eligible official daily
+value is streamed through an atomic staging table into integer-keyed
+`WITHOUT ROWID` storage. League, item, and source-item strings are stored once
+in small dictionaries, while the exact league day, observation timestamp,
+Chaos value, Divine value, and confidence remain unchanged. Dump markers keep
+both exact raw/normalized source counts and the smaller exact stored-row count.
+This is what lets a first bootstrap and later archive snapshots fit a standard
+14 GB GitHub runner without weakening the poe.ninja-only provenance rule.
+
+An existing full local archive can be converted without a download and without
+deleting its original rows:
+
+```powershell
+python -m poe_advisor --db data/poe_advisor.sqlite3 compact-history
+```
+
+The conversion streams one league at a time, promotes it atomically, and skips
+already converted leagues on a rerun. Use repeatable `--league LEAGUE` options
+to limit the conversion, or `--force` to rebuild compact rows. Seasonal curve,
+lifecycle, same-day, forward-return, and status queries read the compact
+representation transparently whenever it is present. A public-market snapshot
+then removes the redundant verbose official rows only from its isolated copy;
+the full local source database is never pruned.
 
 ## Historical-data limitations
 
-poe.ninja's supported public API exposes current economy overviews only.
-Sparkline values are relative, untimestamped trend samples, so Wraeclast Ledger
-does not invent dated observations from them. Item history becomes stronger as
-you run real syncs over time.
+poe.ninja's current overview APIs supply the latest market catalog and prices;
+their relative sparklines are never expanded into invented dates. Exact dated
+current-league curves come from poe.ninja's exchange-detail and stash-item
+history responses. Completed-league curves come only from poe.ninja's official
+ZIP dumps.
 
 The official GGG Currency Exchange feed provides genuine hourly historical
 digests for fungible markets. Old hours may eventually be removed upstream,
-which is why downloaded snapshots are retained locally.
+which is why downloaded snapshots are retained locally. The golden-source
+allowlist excludes these rows from scored curves.
 
-poe.watch supplies documented dated item history for known numeric item IDs.
-It does not reliably enumerate completed leagues or their old item catalogs,
-so the application maintains an explicit reviewed six-league calendar and can
-only backfill an item whose stable ID is discoverable from the current
-catalog. Affliction through Mirage have usable early-league Divine histories
-under the stable current ID; older aliases do not and are excluded rather than
-misaligned. Missing rows mean “no usable evidence,” never a zero price.
-Skill-gem history is matched on name, level, quality, and corruption state;
-incomplete variants fail closed so a level-1 uncorrupted gem is never blended
-with a level-4 or corrupted listing.
+The completed-league importer is deliberately exact. Item CSV rows join by
+poe.ninja source ID and then pass a visible-identity check; skill-gem level,
+quality, and corruption and other variant fields cannot be mixed. Currency
+prices and the same-day Divine anchor must be direct Chaos pairs from the dump.
+There is no adjacent-day interpolation or cross-provider fallback. Missing
+rows mean “no usable evidence,” never a zero price.
 
-Historical item prices arrive in Chaos, so each league-day needs a trustworthy
-Chaos-per-Divine anchor. The importer sanity-checks the raw Divine Orb curve,
-removes unsafe derived rows for implausible days while retaining the original
-raw response, and never silently borrows an adjacent day. A sparse direct
-anchor is also rejected when at least two independent direct league curves
-tightly agree and it is more than eight times away. A missing anchor can be
-rebuilt only from the median for that exact league day in at least two other
-validated leagues. Those fallback rows record their donor leagues and values
-and receive deliberately low confidence.
+Legacy poe.watch responses and derived rows may remain in an upgraded local
+database as an auditable quarantine, and optional poe.watch league/catalog
+metadata may still be archived. Production price queries fail closed to the
+poe.ninja source allowlist: poe.watch rows can never supply a current price,
+historical target, Standard reference, chart curve, or ranking score.
 
 If an item lacks an exact future-day price in the broadly covered leagues, the
 affected horizon is shown as `—` with “no exact broad-league future-day
 price.” Missing evidence is never converted to a 0% return.
 
 poe.ninja build distributions and official ladder samples remain in the local
-archive for separate market research. They do not alter the forecast ranking.
+archive as metadata. For Forbidden Jewels only, a valid current-versus-past
+ascendancy-share signal scales the historical target; the unadjusted
+poe.ninja price observations remain visible for audit.
 
 ## Forecast model
 
@@ -275,11 +306,16 @@ Forecast calculations use only the four broadly covered leagues:
 - Mercenaries
 - Settlers
 
-Affliction and Necropolis remain stored but do not contribute to forecasts.
+Legacy archives may still contain Affliction and Necropolis rows, but they do
+not contribute to forecasts.
 For each item and horizon, the model reads the exact historical price at the
-current league day plus 3, 7, or 14 days. That recency-weighted future price is
-compared directly with today's current-league price; a historical entry price
-is not required. The future-day observation count is shown per horizon.
+current league day plus 3, 7, or 14 days. Only poe.ninja observations graded
+Medium or High (normalized confidence at least `0.5`) may enter a forecast,
+the same-day comparison, the structural-decline classifier, or the displayed
+weighted historical curve. Low-confidence rows remain complete in the local
+archive for audit. That recency-weighted future price is compared directly
+with today's current-league price; a historical entry price is not required.
+The qualifying future-day observation count is shown per horizon.
 Missing observations stay missing; the dashboard displays `—` and “no exact
 broad-league future-day price,” never 0%.
 
@@ -293,7 +329,7 @@ observation.
 For each horizon:
 
 1. Calculate the recency-weighted historical future price level from exact
-   broad-league future-day observations.
+   Medium/High-confidence broad-league future-day observations.
 2. Estimate a robust log-price trend from the current-league curve and cap its
    projected move so a brief spike or crash cannot dominate.
 3. When the current curve is usable, blend 70% historical future level and 30%
@@ -309,9 +345,11 @@ In compact form:
 `expected gain = expected price / current price - 1`
 
 After the investment-universe exclusions above, the output does not deduct
-transaction friction or adjust for liquidity, confidence scores, falling-knife
-behavior, disagreement penalties, Standard prices, or build demand. A negative
-forecast remains visible and ranks below a higher forecast.
+transaction friction or adjust for liquidity, confidence within the qualifying
+Medium/High set, falling-knife behavior, disagreement penalties, Standard
+prices, or build demand. A negative forecast remains visible and ranks below a
+higher forecast. An item with no qualifying target remains in the paginated
+universe with a missing forecast.
 
 The chosen 3, 7, or 14-day hold window is the sort horizon. Every row still
 shows all three estimates, their historical targets, current-curve components,
@@ -360,7 +398,7 @@ python -m poe_advisor sync
 # Include a bounded official hourly backfill
 python -m poe_advisor sync --history-hours 24
 
-# Build the next 80 common completed-league item histories
+# Import any official completed-league dumps not already checkpointed
 python -m poe_advisor seasonal-sync --items 80
 
 # Explicitly seed the labelled offline fixture
@@ -378,8 +416,9 @@ python -m poe_advisor recommend --horizon 7
 - `POST /api/sync` — one-click sync; accepts `backfill_hours` from `0` to
   `336` plus optional `horizon`. One ranking run is retained after a successful
   sync. Legacy `budget` input is accepted but cannot affect ranking.
-- `POST /api/seasonal/backfill` — resumable completed-league item backfill;
-  accepts `max_items` from `1` to `2000` plus optional `horizon`.
+- `POST /api/seasonal/backfill` — resumable official poe.ninja dump import;
+  legacy `max_items` input is accepted for compatibility but cannot truncate
+  a league ZIP.
 - `GET /api/recommendations?horizon=7` — every exact ranked item variant sorted
   by the selected gross forecast. The response uses compact rows so the browser
   can paginate and filter the complete universe locally. Each row exposes
@@ -405,6 +444,9 @@ The same server serves `/`, `/styles.css`, `/app.js`, and `/og.png` from
 - `POE_ADVISOR_RETRIES` — retry count for transient failures; default `2`.
 - `POE_ADVISOR_MAX_RETRY_AFTER` — maximum wait honored per retry; default
   `30` seconds.
+- `POE_ADVISOR_COMPACT_HISTORY` — opt in to integer-keyed completed-league
+  storage (`1`, `true`, `yes`, or `on`). The hosted workflow enables it; local
+  imports leave it disabled by default so the full research archive is kept.
 - `POE_OAUTH_TOKEN` — optional service token for official league metadata.
   It is not needed for poe.ninja or the public GGG hourly exchange feed and is
   never returned by the settings API.
@@ -422,13 +464,16 @@ requirements.txt` is optional and performs no package downloads.
 
 ## Data sources and disclaimer
 
-Wraeclast Ledger uses the supported poe.ninja economy endpoints, poe.ninja's
-server-rendered build-composition and time-machine pages, the official GGG
-historical Currency Exchange feed, official public experience-ladder pages
-as fallback, GGG's official passive-tree export, and documented poe.watch
-league, catalog, and item-history endpoints. It uses conditional caching, an
-identifiable User-Agent, bounded retries, and `Retry-After` handling. Do not
-configure it to poll faster than upstream cache windows.
+All current and historical price inputs used by the forecast come from
+poe.ninja: current economy overviews, exact current detail histories, and the
+official completed-league ZIP dumps published at
+[poe.ninja/poe1/data](https://poe.ninja/poe1/data). The application also uses
+poe.ninja's build-composition pages, plus the official GGG Currency Exchange,
+experience-ladder, and passive-tree sources as separately labelled archive or
+metadata context. None of those contextual sources can replace a poe.ninja
+price. poe.watch is optional metadata/legacy archive only and is never a
+recommendation price source. Requests use conditional caching, an identifiable
+User-Agent, bounded retries, and `Retry-After` handling.
 
 This product isn't affiliated with or endorsed by Grinding Gear Games in any
 way. Path of Exile and all related names are trademarks of Grinding Gear Games.

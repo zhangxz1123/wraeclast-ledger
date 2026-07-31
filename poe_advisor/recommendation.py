@@ -10,6 +10,7 @@ from .historical import (
     BROADLY_COVERED_LEAGUE_IDS,
     BROADLY_COVERED_LEAGUES,
     COMPLETED_LEAGUES,
+    league_day as calculate_league_day,
 )
 from .meta import (
     LADDER_SAMPLE_CAVEAT,
@@ -25,6 +26,12 @@ from .models import (
     iso_utc,
     parse_datetime,
     utc_now,
+)
+from .provenance import (
+    CURRENT_PRICE_SOURCES,
+    HISTORICAL_PRICE_SOURCES,
+    STANDARD_PRICE_SOURCES,
+    production_price_provenance,
 )
 from .seasonality import SeasonalModel, SeasonalSignal
 from .storage import Storage
@@ -172,6 +179,7 @@ MAX_PRIORITY_RANKINGS = 100
 FORECAST_HORIZONS = (3, 7, 14)
 HISTORICAL_FORECAST_WEIGHT = 0.70
 CURRENT_CURVE_FORECAST_WEIGHT = 0.30
+HISTORICAL_MODEL_CONFIDENCE_FLOOR = 0.5
 CURRENT_CURVE_LOOKBACK_POINTS = 7
 CURRENT_PROJECTION_GAIN_FLOOR = -0.50
 CURRENT_PROJECTION_GAIN_CEILING = 0.50
@@ -214,6 +222,17 @@ _EXCLUDED_INVESTMENT_CATEGORY_KEYS = frozenset(
 # point-in-time historical sample when the asset's economic lifecycle is
 # known to be unsuitable for appreciation investing.
 KNOWN_DECLINING_LIFECYCLES: dict[str, dict[str, str]] = {
+    "chaosorb": {
+        "name": "Chaos Orb",
+        "code": "divine_relative_reference_currency_decline",
+        "reason": (
+            "Known structural-decline lifecycle: Chaos Orb is the dump's "
+            "quote currency, so poe.ninja has no direct Chaos/Chaos history "
+            "to classify automatically. Its Divine-relative purchasing "
+            "power characteristically falls as a trade league matures, so "
+            "it remains archived but is outside the appreciation ranking."
+        ),
+    },
     "themavenswrit": {
         "name": "The Maven's Writ",
         "code": "expanding_boss_access_supply",
@@ -582,14 +601,19 @@ class RecommendationEngine:
                 persist=persist,
             )
         histories = self.storage.item_histories(
-            league.id, days=max(45, horizon * 5)
+            league.id,
+            days=max(45, horizon * 5),
+            sources=None if league.is_demo else CURRENT_PRICE_SOURCES,
         )
         # Standard is a long-horizon reference only. It is loaded separately
         # and never enters the score, expected return, vetoes, or allocator.
         standard_prices = (
             {}
             if league.is_demo
-            else self.storage.latest_item_prices(STANDARD_LEAGUE_ID)
+            else self.storage.latest_item_prices(
+                STANDARD_LEAGUE_ID,
+                sources=STANDARD_PRICE_SOURCES,
+            )
         )
         seasonal_signals: dict[str, SeasonalSignal] = {}
         if not league.is_demo and league.day is not None:
@@ -1546,6 +1570,21 @@ class RecommendationEngine:
             "mode": "priority_ranking",
             "allocation_mode": "none",
             "generated_at": iso_utc(),
+            "price_provenance": (
+                {
+                    "policy": "offline-demo-fixture",
+                    "golden_provider": None,
+                    "fail_closed": True,
+                    "current_price_sources": ["demo"],
+                    "historical_price_sources": [],
+                    "standard_price_sources": [],
+                    "source_labels": {
+                        "demo": "Illustrative offline fixture data"
+                    },
+                }
+                if league.is_demo
+                else production_price_provenance()
+            ),
             "league": {
                 "id": league.id,
                 "name": league.name,
@@ -1734,8 +1773,12 @@ class RecommendationEngine:
         histories = self.storage.item_histories(
             league.id,
             days=max(90, current_day + 14),
+            sources=CURRENT_PRICE_SOURCES,
         )
-        standard_prices = self.storage.latest_item_prices(STANDARD_LEAGUE_ID)
+        standard_prices = self.storage.latest_item_prices(
+            STANDARD_LEAGUE_ID,
+            sources=STANDARD_PRICE_SOURCES,
+        )
         broad_id_set = frozenset(BROADLY_COVERED_LEAGUE_IDS)
         newest_first = list(reversed(BROADLY_COVERED_LEAGUES))
         age_rank = {
@@ -1749,7 +1792,18 @@ class RecommendationEngine:
         excluded_category_counts: defaultdict[str, int] = defaultdict(int)
         excluded_below_one_chaos_items = 0
         excluded_unknown_chaos_items = 0
+        excluded_stale_current_items = 0
         unresolved_items = 0
+        current_source_verified_at = self.storage.latest_source_success_at(
+            "poe.ninja",
+            league.id,
+        )
+        latest_sync_window = self.storage.latest_successful_sync_window(
+            league.id
+        )
+        latest_sync_started_at = parse_datetime(
+            str((latest_sync_window or {}).get("started_at") or "")
+        )
 
         chaos_unit_divine: float | None = None
         chaos_rows = _daily_rows(histories.get("currency:chaos-orb", []))
@@ -1764,6 +1818,20 @@ class RecommendationEngine:
             if not rows:
                 continue
             latest = rows[-1]
+            observed_at = parse_datetime(str(latest.get("observed_at") or ""))
+            league_start = parse_datetime(league.start_at)
+            if (
+                observed_at is None
+                or league_start is None
+                or calculate_league_day(observed_at, league_start)
+                < current_day - 1
+                or (
+                    latest_sync_started_at is not None
+                    and observed_at < latest_sync_started_at
+                )
+            ):
+                excluded_stale_current_items += 1
+                continue
             category = str(latest["category"])
             if _category_is_excluded(category):
                 excluded_category_counts[category] += 1
@@ -1805,17 +1873,27 @@ class RecommendationEngine:
                 "current_chaos": current_chaos,
             }
 
-        lifecycle_rows = self.storage.seasonal_lifecycle_rows(
-            current_items,
-            BROADLY_COVERED_LEAGUE_IDS,
-            minimum_league_day=1,
-            maximum_league_day=DECLINE_CURVE_MAXIMUM_DAY,
-            minimum_confidence=0.0,
-        )
-        decline_assessments = _historical_decline_assessments(
-            lifecycle_rows,
-            league_weights=raw_league_weight,
-        )
+        # Keep peak memory bounded now that official poe.ninja dumps contain
+        # tens of millions of exact daily rows. Each item's assessment is
+        # independent, so batches can be reduced and merged without changing
+        # the classification result.
+        decline_assessments: dict[str, dict[str, Any]] = {}
+        lifecycle_item_keys = sorted(current_items)
+        for offset in range(0, len(lifecycle_item_keys), 250):
+            lifecycle_rows = self.storage.seasonal_lifecycle_rows(
+                lifecycle_item_keys[offset : offset + 250],
+                BROADLY_COVERED_LEAGUE_IDS,
+                minimum_league_day=1,
+                maximum_league_day=DECLINE_CURVE_MAXIMUM_DAY,
+                minimum_confidence=HISTORICAL_MODEL_CONFIDENCE_FLOOR,
+                sources=HISTORICAL_PRICE_SOURCES,
+            )
+            decline_assessments.update(
+                _historical_decline_assessments(
+                    lifecycle_rows,
+                    league_weights=raw_league_weight,
+                )
+            )
         automatic_decline_vetoes: list[dict[str, Any]] = []
         known_decline_vetoes: list[dict[str, Any]] = []
         for item_key in list(current_items):
@@ -1869,7 +1947,8 @@ class RecommendationEngine:
             rows = self.storage.seasonal_entry_rows(
                 current_day + forecast_horizon,
                 item_keys,
-                minimum_confidence=0.0,
+                minimum_confidence=HISTORICAL_MODEL_CONFIDENCE_FLOOR,
+                sources=HISTORICAL_PRICE_SOURCES,
             )
             for row in rows:
                 if str(row["league_id"]) in broad_id_set:
@@ -1882,7 +1961,8 @@ class RecommendationEngine:
         for row in self.storage.seasonal_entry_rows(
             current_day,
             item_keys,
-            minimum_confidence=0.0,
+            minimum_confidence=HISTORICAL_MODEL_CONFIDENCE_FLOOR,
+            sources=HISTORICAL_PRICE_SOURCES,
         ):
             if str(row["league_id"]) in broad_id_set:
                 same_day_rows[str(row["item_key"])].append(row)
@@ -1904,6 +1984,7 @@ class RecommendationEngine:
                 item_key,
                 league.start_at,
                 minimum_confidence=0.0,
+                sources=CURRENT_PRICE_SOURCES,
             )
             for item_key in forecastable_keys
         }
@@ -1915,7 +1996,12 @@ class RecommendationEngine:
             for row in rows:
                 league_id = str(row["league_id"])
                 price = float(row.get("entry_divine") or 0.0)
-                if league_id not in raw_league_weight or price <= 0:
+                confidence = float(row.get("entry_confidence") or 0.0)
+                if (
+                    league_id not in raw_league_weight
+                    or price <= 0
+                    or confidence < HISTORICAL_MODEL_CONFIDENCE_FLOOR
+                ):
                     continue
                 observations.append(
                     {
@@ -1923,9 +2009,7 @@ class RecommendationEngine:
                         "league_name": row.get("league_name"),
                         "league_day": int(row["entry_day"]),
                         "price_divine": price,
-                        "confidence": float(
-                            row.get("entry_confidence") or 0.0
-                        ),
+                        "confidence": confidence,
                         "source": row.get("source"),
                         "source_item_id": row.get("source_item_id"),
                         "age_rank": age_rank[league_id],
@@ -1952,6 +2036,7 @@ class RecommendationEngine:
             )
 
         rows_for_ranking: list[dict[str, Any]] = []
+        meta_signals: dict[str, dict[str, Any]] = {}
         for item_key, current_item in current_items.items():
             latest = current_item["latest"]
             current = float(current_item["current"])
@@ -1972,6 +2057,31 @@ class RecommendationEngine:
                 if isinstance(details.get("metadata"), dict)
                 else {}
             )
+            ascendancy = str(metadata.get("ascendancy") or "").strip()
+            meta_signal: dict[str, Any] = {
+                "status": "not_applicable",
+                "multiplier": 1.0,
+            }
+            if (
+                str(latest["category"]).casefold() == "forbiddenjewel"
+                and ascendancy
+            ):
+                if ascendancy not in meta_signals:
+                    meta_signals[ascendancy] = (
+                        self.meta_service.ascendancy_multiplier(
+                            league,
+                            BROADLY_COVERED_LEAGUES,
+                            ascendancy,
+                        )
+                    )
+                meta_signal = meta_signals[ascendancy]
+            meta_multiplier = (
+                float(meta_signal.get("multiplier") or 1.0)
+                if meta_signal.get("status") == "ok"
+                else 1.0
+            )
+            if not math.isfinite(meta_multiplier) or meta_multiplier <= 0:
+                meta_multiplier = 1.0
             same_day_price, same_day_observations = weighted_level(
                 same_day_rows.get(item_key, [])
             )
@@ -1984,9 +2094,14 @@ class RecommendationEngine:
                         [],
                     )
                 )
-                historical_gain = (
-                    historical_target / current - 1.0
+                meta_adjusted_target = (
+                    historical_target * meta_multiplier
                     if historical_target is not None
+                    else None
+                )
+                historical_gain = (
+                    meta_adjusted_target / current - 1.0
+                    if meta_adjusted_target is not None
                     else None
                 )
                 current_projection = _current_curve_projection(
@@ -2024,8 +2139,14 @@ class RecommendationEngine:
                         if expected_gain is not None
                         else None
                     ),
-                    "historical_target_price_divine": historical_target,
-                    "historical_target_divine": historical_target,
+                    "raw_historical_target_divine": historical_target,
+                    "historical_target_price_divine": meta_adjusted_target,
+                    "historical_target_divine": meta_adjusted_target,
+                    "meta_adjusted_historical_target_divine": (
+                        meta_adjusted_target
+                    ),
+                    "meta_multiplier": meta_multiplier,
+                    "meta_signal": meta_signal,
                     "historical_target_gain": historical_gain,
                     "historical_target_gain_pct": (
                         historical_gain * 100.0
@@ -2105,8 +2226,8 @@ class RecommendationEngine:
                 + (
                     f"{selected_expected * 100:+.1f}%"
                     if selected_expected is not None
-                    else "unavailable because no broad-league target-day "
-                    "price is stored"
+                    else "unavailable because no Medium/High-confidence "
+                    "broad-league target-day price is stored"
                 )
                 + (
                     f"; historical target "
@@ -2114,6 +2235,12 @@ class RecommendationEngine:
                     f"from {selected['historical_sample_leagues']} broad "
                     f"league(s)"
                     if selected["historical_target_price_divine"] is not None
+                    else ""
+                )
+                + (
+                    f"; {ascendancy} meta multiplier "
+                    f"{meta_multiplier:.3g}x"
+                    if meta_multiplier != 1.0
                     else ""
                 )
                 + (
@@ -2171,6 +2298,13 @@ class RecommendationEngine:
                 "liquidity_score": liquidity,
                 "historical_same_day_price_divine": same_day_price,
                 "weighted_historical_price_divine": same_day_price,
+                "meta_adjusted_same_day_price_divine": (
+                    same_day_price * meta_multiplier
+                    if same_day_price is not None
+                    else None
+                ),
+                "meta_multiplier": meta_multiplier,
+                "meta_signal": meta_signal,
                 "historical_same_day_sample_leagues": len(
                     same_day_observations
                 ),
@@ -2182,6 +2316,11 @@ class RecommendationEngine:
                     else None
                 ),
                 "standard_anchor_divine": standard_value,
+                "standard_anchor_source": (
+                    standard_anchor.get("source")
+                    if standard_anchor is not None
+                    else None
+                ),
                 "standard_anchor_gap_pct": (
                     (standard_value - current) / standard_value * 100.0
                     if standard_value is not None
@@ -2304,9 +2443,15 @@ class RecommendationEngine:
             "price_divine",
             "current_price_divine",
             "price_chaos",
+            "current_observed_at",
+            "current_source",
             "historical_same_day_price_divine",
+            "meta_adjusted_same_day_price_divine",
+            "meta_multiplier",
+            "meta_signal",
             "historical_discount_pct",
             "standard_anchor_divine",
+            "standard_anchor_source",
             "standard_anchor_gap_pct",
             "selected_horizon_days",
             "expected_gain",
@@ -2386,6 +2531,7 @@ class RecommendationEngine:
             "mode": "forecast_ranking",
             "allocation_mode": "none",
             "generated_at": iso_utc(),
+            "price_provenance": production_price_provenance(),
             "league": {
                 "id": league.id,
                 "name": league.name,
@@ -2406,9 +2552,16 @@ class RecommendationEngine:
                 "markets and persistent completed-league decliners are omitted. "
                 "For each horizon, the model compares today's current-league "
                 "price with the recency-weighted target-day price in Settlers, "
-                "Mercenaries, Keepers, and Mirage. When at least two "
+                "Mercenaries, Keepers, and Mirage. Only poe.ninja historical "
+                "observations graded Medium or High (normalized confidence "
+                "at least 0.5) enter that target or the displayed weighted "
+                "curve; Low observations remain archived for audit. When at "
+                "least two "
                 "current-league days exist, it blends 70% historical target "
                 "and 30% robust current-curve projection in log-return space. "
+                "Forbidden Jewel historical targets are adjusted by the "
+                "current-versus-historical ascendancy-share multiplier when "
+                "a valid meta snapshot is available. "
                 "Missing historical target days remain null."
             ),
             "forecast_model": {
@@ -2429,8 +2582,13 @@ class RecommendationEngine:
                     SeasonalModel.RECENCY_DECAY_PER_LEAGUE
                 ),
                 "historical_target_estimator": (
-                    "recency-weighted arithmetic target-day Divine price"
+                    "recency-weighted arithmetic target-day Divine price over "
+                    "poe.ninja Medium/High observations only"
                 ),
+                "historical_confidence_floor": (
+                    HISTORICAL_MODEL_CONFIDENCE_FLOOR
+                ),
+                "low_confidence_history": "retained locally; audit-only",
                 "current_curve_estimator": (
                     "Theil-Sen log-price slope over up to seven exact current "
                     "league-day observations"
@@ -2452,6 +2610,8 @@ class RecommendationEngine:
                 "universe_filters": [
                     "excluded small-consumable categories",
                     "current price below one Chaos Orb",
+                    "current poe.ninja observation older than one league day",
+                    "current item absent from the latest successful or partial poe.ninja sync",
                     "persistent broad-league structural decline",
                     "unresolved source identity",
                 ],
@@ -2474,6 +2634,8 @@ class RecommendationEngine:
                 "excluded_unknown_chaos_items": (
                     excluded_unknown_chaos_items
                 ),
+                "excluded_stale_current_items": excluded_stale_current_items,
+                "current_source_verified_at": current_source_verified_at,
                 "automatic_decline_items": len(automatic_decline_vetoes),
                 "automatic_decline_vetoes": sorted(
                     automatic_decline_vetoes,
@@ -2486,6 +2648,7 @@ class RecommendationEngine:
                     sum(excluded_category_counts.values())
                     + excluded_below_one_chaos_items
                     + excluded_unknown_chaos_items
+                    + excluded_stale_current_items
                     + len(automatic_decline_vetoes)
                     + len(known_decline_vetoes)
                     + unresolved_items

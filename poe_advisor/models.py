@@ -49,7 +49,10 @@ class League:
         start = parse_datetime(self.start_at)
         if start is None:
             return None
-        return max(1, (utc_now() - start).days + 1)
+        # poe.ninja labels daily economy buckets by UTC calendar date. League
+        # launches occur in the evening, so elapsed 24-hour windows would put
+        # every completed-dump row one index away from the current API.
+        return max(1, (utc_now().date() - start.date()).days + 1)
 
 
 @dataclass(slots=True)

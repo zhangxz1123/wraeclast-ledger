@@ -4,6 +4,7 @@ import math
 import unittest
 from typing import Any
 
+from poe_advisor.provenance import HISTORICAL_PRICE_SOURCES
 from poe_advisor.seasonality import SeasonalModel
 
 
@@ -24,7 +25,10 @@ class FakeSeasonalStorage:
         league_day: int,
         horizon: int,
         item_keys: list[str] | None = None,
+        *,
+        sources: tuple[str, ...] | None = None,
     ) -> list[dict[str, Any]]:
+        self.return_sources = sources
         self.calls.append((league_day, horizon, item_keys))
         allowed = set(item_keys or [])
         return [
@@ -37,7 +41,10 @@ class FakeSeasonalStorage:
         self,
         league_day: int,
         item_keys: list[str] | None = None,
+        *,
+        sources: tuple[str, ...] | None = None,
     ) -> list[dict[str, Any]]:
+        self.entry_sources = sources
         self.entry_calls.append((league_day, item_keys))
         allowed = set(item_keys or [])
         return [
@@ -100,6 +107,8 @@ class SeasonalModelTests(unittest.TestCase):
             storage.entry_calls,
             [(12, ["currency:mirror-shard"])],
         )
+        self.assertEqual(storage.return_sources, HISTORICAL_PRICE_SOURCES)
+        self.assertEqual(storage.entry_sources, HISTORICAL_PRICE_SOURCES)
         self.assertEqual(signal.status, "ok")
         self.assertEqual(signal.sample_leagues, 4)
         expected_median = math.expm1(

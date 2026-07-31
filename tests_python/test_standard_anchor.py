@@ -5,6 +5,10 @@ from datetime import timedelta
 from typing import Any
 
 from poe_advisor.models import League, iso_utc, utc_now
+from poe_advisor.provenance import (
+    CURRENT_PRICE_SOURCES,
+    STANDARD_PRICE_SOURCES,
+)
 from poe_advisor.recommendation import RecommendationEngine
 from poe_advisor.seasonality import SeasonalSignal
 
@@ -33,12 +37,25 @@ class FixtureStorage:
         ]
         self.standard: dict[str, dict[str, Any]] = {}
 
-    def item_histories(self, league_id: str, *, days: int) -> dict[str, list]:
+    def item_histories(
+        self,
+        league_id: str,
+        *,
+        days: int,
+        sources: tuple[str, ...] | None = None,
+    ) -> dict[str, list]:
         del league_id, days
+        self.requested_current_sources = sources
         return {ITEM_KEY: self.rows}
 
-    def latest_item_prices(self, league_id: str) -> dict[str, dict[str, Any]]:
+    def latest_item_prices(
+        self,
+        league_id: str,
+        *,
+        sources: tuple[str, ...] | None = None,
+    ) -> dict[str, dict[str, Any]]:
         self.requested_anchor_league = league_id
+        self.requested_anchor_sources = sources
         return self.standard
 
     def save_recommendations(self, *args: Any, **kwargs: Any) -> None:
@@ -175,6 +192,14 @@ class StandardAnchorRecommendationTests(unittest.TestCase):
         )
         self.assertEqual(with_anchor["standard_model"]["matched_items"], 1)
         self.assertEqual(storage.requested_anchor_league, "Standard")
+        self.assertEqual(
+            storage.requested_current_sources,
+            CURRENT_PRICE_SOURCES,
+        )
+        self.assertEqual(
+            storage.requested_anchor_sources,
+            STANDARD_PRICE_SOURCES,
+        )
 
 
 if __name__ == "__main__":

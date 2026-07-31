@@ -283,6 +283,66 @@ class PoeNinjaClient:
             extra_headers={"Referer": f"{self.base_url}/economy/"},
         )
 
+    def exchange_details_url(
+        self,
+        league: str,
+        category: str,
+        item_id: int | str,
+    ) -> str:
+        query = urlencode(
+            {"league": league, "type": category, "id": str(item_id)}
+        )
+        return (
+            f"{self.base_url}/poe1/api/economy/exchange/current/details?"
+            f"{query}"
+        )
+
+    def fetch_exchange_details(
+        self,
+        league: str,
+        category: str,
+        item_id: int | str,
+        *,
+        etag: str | None = None,
+        last_modified: str | None = None,
+    ) -> FetchResult:
+        return self.http.get_json(
+            self.exchange_details_url(league, category, item_id),
+            etag=etag,
+            last_modified=last_modified,
+            extra_headers={"Referer": f"{self.base_url}/economy/"},
+        )
+
+    def stash_item_history_url(
+        self,
+        league: str,
+        category: str,
+        item_id: int | str,
+    ) -> str:
+        query = urlencode(
+            {"league": league, "type": category, "id": str(item_id)}
+        )
+        return (
+            f"{self.base_url}/poe1/api/economy/stash/current/item/history?"
+            f"{query}"
+        )
+
+    def fetch_stash_item_history(
+        self,
+        league: str,
+        category: str,
+        item_id: int | str,
+        *,
+        etag: str | None = None,
+        last_modified: str | None = None,
+    ) -> FetchResult:
+        return self.http.get_json(
+            self.stash_item_history_url(league, category, item_id),
+            etag=etag,
+            last_modified=last_modified,
+            extra_headers={"Referer": f"{self.base_url}/economy/"},
+        )
+
 
 class GGGClient:
     """Official Path of Exile API client.

@@ -256,6 +256,41 @@ test("full item names wrap and include exact visible variant identity", () => {
   assert.doesNotMatch(titleRule, /text-overflow:\s*ellipsis/);
 });
 
+test("forbidden-jewel meta targets stay explicit beside raw history", () => {
+  const result = runInApp(`
+    const forecast = normalizeForecast({
+      meta_multiplier: 1.25,
+      forecast_7d: {
+        days: 7,
+        expected_gain_pct: 50,
+        expected_price_divine: 1.35,
+        historical_target_divine: 1.5,
+        raw_historical_target_divine: 1.2,
+        historical_target_gain_pct: 87.5,
+        meta_multiplier: 1.25,
+        historical_sample_leagues: 4,
+      },
+    }, 7);
+    globalThis.__result = {
+      multiplier: forecast.metaMultiplier,
+      raw: forecast.rawHistoricalTargetDivine,
+      adjusted: forecast.historicalTargetDivine,
+      expectedPrice: forecast.expectedPriceDivine,
+      cell: forecastCellMarkup(forecast, 7, 7),
+      markup: forecastDetailMarkup(forecast, 7),
+    };
+  `);
+
+  assert.equal(result.multiplier, 1.25);
+  assert.equal(result.raw, 1.2);
+  assert.equal(result.adjusted, 1.5);
+  assert.equal(result.expectedPrice, 1.35);
+  assert.match(result.cell, /expected 1\.35 div/);
+  assert.doesNotMatch(result.cell, /expected 1\.50 div/);
+  assert.match(result.markup, /META-ADJUSTED FUTURE TARGET/);
+  assert.match(result.markup, /raw 1\.20 div × 1\.25/);
+});
+
 test("pagination and hidden-item filtering operate on the complete list", () => {
   const result = runInApp(`
     state.page = 2;
@@ -329,30 +364,73 @@ test("GitHub Pages paths and exact horizon ranks are repository-relative", () =>
   assert.deepEqual([...result.ranks], [1, 2, 3]);
 });
 
-test("static catalog and history shards are fetched once and POST is blocked", async () => {
+test("static index, visible rank page, and history shard are each fetched once", async () => {
   const result = await runInApp(`
     globalThis.__result = (async () => {
       let fetchCount = 0;
+      const fetchedUrls = [];
       globalThis.fetch = async (url) => {
         fetchCount += 1;
+        fetchedUrls.push(String(url));
         const isHistory = String(url).includes("/history/");
+        const isIndex = String(url).includes("ranking-index");
+        const isRankingPage = String(url).includes("/rankings/");
         return {
           ok: true,
           status: 200,
-          json: async () => isHistory
-            ? { items: { "item:a": { current_league: { points: [{ league_day: 1, divine_value: 2 }] } } } }
-            : { rankings: [{ key: "item:a" }] },
+          json: async () => {
+            if (isHistory) {
+              return { items: { "item:a": { current_league: { points: [{ league_day: 1, divine_value: 2 }] } } } };
+            }
+            if (isIndex) {
+              return {
+                fields: ["key", "name", "category", "search_text", "price_divine", "price_chaos", "rank_3d", "rank_7d", "rank_14d"],
+                items: [["item:a", "Alpha", "Currency", "alpha currency", 2, 300, 1, 1, 1]],
+              };
+            }
+            if (isRankingPage) {
+              return {
+                horizon: 7,
+                page: 1,
+                items: [{
+                  key: "item:a",
+                  name: "Alpha",
+                  category: "Currency",
+                  price_divine: 2,
+                  history_shard: "aa",
+                  static_ranks: { "3": 1, "7": 1, "14": 1 },
+                  forecast_3d: { days: 3 },
+                  forecast_7d: { days: 7, expected_gain_pct: 12 },
+                  forecast_14d: { days: 14 },
+                }],
+              };
+            }
+            return { ranking_summary: { returned: 1 } };
+          },
         };
       };
       runtime.mode = "static";
       runtime.manifest = {
+        schema_version: 2,
         catalog: "data/catalog.abc.json",
+        ranking_index: "data/ranking-index.abc.json",
+        ranking_pages: {
+          page_size: 100,
+          horizons: {
+            "3": ["data/rankings/3/0001.abc.json"],
+            "7": ["data/rankings/7/0001.abc.json"],
+            "14": ["data/rankings/14/0001.abc.json"],
+          },
+        },
         status: "data/status.abc.json",
         history_shards: { aa: "data/history/aa.abc.json" },
       };
-      state.recommendations = [{ itemKey: "item:a", history_shard: "aa" }];
       const firstCatalog = await api("/api/recommendations?horizon=3");
       const secondCatalog = await api("/api/recommendations?horizon=14");
+      state.recommendations = firstCatalog.rankings.map(normalizeRecommendation);
+      rankStaticRecommendations(state.recommendations, 7);
+      await loadStaticPageDetails(state.recommendations, 7);
+      await loadStaticPageDetails(state.recommendations, 7);
       const firstHistory = await api("/api/history?key=item%3Aa");
       const secondHistory = await api("/api/history?key=item%3Aa");
       let postError = "";
@@ -363,8 +441,10 @@ test("static catalog and history shards are fetched once and POST is blocked", a
       }
       return {
         fetchCount,
+        fetchedUrls,
         firstHorizon: firstCatalog.horizon,
         secondHorizon: secondCatalog.horizon,
+        expectedGain: state.recommendations[0].forecasts[7].expectedGainPct,
         firstHistory,
         secondHistory,
         postError,
@@ -372,9 +452,18 @@ test("static catalog and history shards are fetched once and POST is blocked", a
     })();
   `);
 
-  assert.equal(result.fetchCount, 2);
+  assert.equal(result.fetchCount, 4);
+  assert.equal(
+    result.fetchedUrls.filter((url) => url.includes("ranking-index")).length,
+    1,
+  );
+  assert.equal(
+    result.fetchedUrls.filter((url) => url.includes("/rankings/")).length,
+    1,
+  );
   assert.equal(result.firstHorizon, 3);
   assert.equal(result.secondHorizon, 14);
+  assert.equal(result.expectedGain, 12);
   assert.equal(
     result.firstHistory.seasonal_comparison.current_league.points[0].divine_value,
     2,
@@ -384,4 +473,61 @@ test("static catalog and history shards are fetched once and POST is blocked", a
     JSON.parse(JSON.stringify(result.secondHistory)),
   );
   assert.match(result.postError, /read-only/i);
+});
+
+test("static filtered pages load only shards containing visible rows", async () => {
+  const result = await runInApp(`
+    globalThis.__result = (async () => {
+      const fetched = [];
+      globalThis.fetch = async (url) => {
+        fetched.push(String(url));
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            items: [{
+              key: "item:middle",
+              name: "Middle",
+              category: "SkillGem",
+              price_divine: 5,
+              static_ranks: { "3": 101, "7": 101, "14": 101 },
+              forecast_3d: { days: 3 },
+              forecast_7d: { days: 7 },
+              forecast_14d: { days: 14 },
+            }],
+          }),
+        };
+      };
+      runtime.mode = "static";
+      runtime.manifest = {
+        schema_version: 2,
+        ranking_pages: {
+          page_size: 100,
+          horizons: {
+            "7": [
+              "data/rankings/7/0001.a.json",
+              "data/rankings/7/0002.b.json",
+              "data/rankings/7/0003.c.json",
+            ],
+          },
+        },
+      };
+      const item = normalizeRecommendation({
+        key: "item:middle",
+        name: "Middle",
+        category: "SkillGem",
+        static_ranks: { "3": 101, "7": 101, "14": 101 },
+      }, 0);
+      item.rank = 101;
+      await loadStaticPageDetails([item], 7);
+      return { fetched, key: item.itemKey, rank: item.rank };
+    })();
+  `);
+
+  assert.deepEqual(
+    [...result.fetched],
+    ["https://owner.github.io/wraeclast-ledger/data/rankings/7/0002.b.json"],
+  );
+  assert.equal(result.key, "item:middle");
+  assert.equal(result.rank, 101);
 });

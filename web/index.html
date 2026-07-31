@@ -54,7 +54,8 @@
             compared with its same-day and future prices in the four broadly
             covered leagues—Mirage, Keepers, Mercenaries, and Settlers—then
             blended with its current-league curve to estimate gross 3, 7, and
-            14-day gains.
+            14-day gains. Scored current and historical prices come only from
+            poe.ninja.
           </p>
         </div>
 
@@ -79,7 +80,7 @@
             <span class="sync-icon" aria-hidden="true">↻</span>
             <span>
               <strong id="syncButtonLabel">Sync market &amp; run model</strong>
-              <small>poe.ninja prices/builds + official exchange</small>
+              <small>poe.ninja overviews + exact detail histories</small>
             </span>
             <span class="button-arrow" aria-hidden="true">→</span>
           </button>
@@ -208,7 +209,7 @@
           <li>
             <span>01</span>
             <strong>Broad-league target</strong>
-            <p>For each horizon, estimate the future Divine price from Mirage, Keepers, Mercenaries, and Settlers at the matching league day, with newer leagues weighted more heavily.</p>
+            <p>For each horizon, estimate the future Divine price from exact Medium/High-confidence rows in the official poe.ninja league dumps for Mirage, Keepers, Mercenaries, and Settlers, with newer leagues weighted more heavily. Low-confidence rows stay in the local audit archive but cannot enter the forecast or weighted curve.</p>
           </li>
           <li>
             <span>02</span>
@@ -223,7 +224,7 @@
           <li>
             <span>04</span>
             <strong>Horizon ranking</strong>
-            <p>After the investment-universe filters, rank every remaining exact variant by gross expected gain for the selected 3, 7, or 14-day window. Friction, liquidity, and confidence do not alter that order.</p>
+            <p>After the investment-universe filters, rank every remaining exact variant by gross expected gain for the selected 3, 7, or 14-day window. A variant remains listed with a missing forecast when no qualifying future observation exists; friction and liquidity do not alter the order.</p>
           </li>
         </ol>
       </section>
@@ -233,12 +234,12 @@
           <p class="eyebrow" id="archiveEyebrow"><span>04</span> LOCAL ARCHIVE</p>
           <h2 id="dataTitle">Your history stays on this machine.</h2>
           <p id="archiveDescription">
-            Raw source responses, normalized daily prices, sync logs, and model
-            outputs are retained in a local SQLite database for reproducible
-            forecasts. Excluded markets such as essences, fossils, and
-            oils, sub-1-chaos items, and persistent historical decliners stay
-            archived for fast research; they are simply outside the investment
-            ranking.
+            Raw poe.ninja current/detail responses, normalized official-dump
+            rows, import checkpoints, sync logs, and model outputs are retained
+            in a local SQLite database for reproducible forecasts. Excluded
+            markets such as essences, fossils, and oils, sub-1-chaos items, and
+            persistent historical decliners stay archived for fast research;
+            they are simply outside the investment ranking.
           </p>
         </div>
         <dl class="archive-stats">
@@ -292,28 +293,38 @@
       <div class="dialog-kicker">DATA SETTINGS</div>
       <h2 id="settingsTitle">Local market archive</h2>
       <p id="settingsIntro">
-        Sync stores supported poe.ninja snapshots and official Currency Exchange
-        aggregates locally across all 18 exchange and 25 item-overview categories
-        configured by the app. Storage is deliberately broader than the investment
-        universe: low-end consumables such as essences, fossils, oils, resonators,
-        scarabs, and Delirium Orbs remain in the local archive. Items below 1 Chaos
-        and robustly detected past-league decliners also remain archived but cannot
-        enter the forecast ranking. Exact Forbidden Jewel prices come from the
-        archived poe.watch catalog, while GGG’s official passive-tree export
-        supplies their ascendancy ownership. The app also samples the official
-        top-experience ladder as archived market context. Seasonal backfill stores exactly
-        matched common markets across six reviewed completed leagues; each pass is
-        resumable and can take several minutes.
+        Sync stores poe.ninja current overviews locally across all 18 exchange
+        and 25 item-overview categories configured by the app, then archives
+        exact dated poe.ninja detail histories for the top-ranked identities.
+        Source item IDs and visible variant fields must match; each dated price
+        uses a direct same-day Divine/Chaos observation. Storage is deliberately
+        broader than the investment universe, so excluded low-end consumables,
+        sub-1-chaos items, and persistent past-league decliners remain available
+        for research. GGG’s passive-tree export and build samples are metadata,
+        not alternative price sources. The official Currency Exchange backfill
+        is a separate research archive and cannot enter a forecast curve.
+      </p>
+      <p>
+        Completed-league prices are imported from the official ZIP dumps at
+        <a href="https://poe.ninja/poe1/data" target="_blank" rel="noreferrer">poe.ninja/poe1/data</a>.
+        Exact item IDs and variants must match the current catalog, currency
+        quotes must be directly against Chaos, and the local SQLite checkpoint
+        prevents an unchanged dump from being downloaded again. Legacy
+        poe.watch rows, if present, remain audit-only and can never enter a
+        price curve or forecast score.
       </p>
       <p>
         Forecasts use only the broadly covered leagues: Mirage, Keepers,
-        Mercenaries, and Settlers. Their future price levels are recency
-        weighted, then blended 70/30 in log-price space with a capped robust
-        projection of the current-league curve. A missing exact future-day
-        observation stays missing. The decline filter uses weekly median
+        Mercenaries, and Settlers. Only poe.ninja rows graded Medium or High
+        (normalized confidence at least 0.5) enter their recency-weighted price
+        levels or the displayed weighted curve. Low rows remain stored locally
+        for audit. The qualifying target is blended 70/30 in log-price space
+        with a capped robust projection of the current-league curve. A missing
+        qualifying future-day observation stays missing. The decline filter uses weekly median
         Divine-relative curves, robust slopes, and recency-weighted agreement
-        across at least two broad leagues. No friction, liquidity, or confidence
-        adjustment changes the order within the remaining universe.
+        across at least two broad leagues. No friction or liquidity adjustment
+        changes the order. A valid current-versus-past ascendancy
+        share signal adjusts Forbidden Jewel targets only.
       </p>
       <label>
         <span>Exchange history on next sync</span>
@@ -324,26 +335,24 @@
         </select>
       </label>
       <label>
-        <span>Common assets per seasonal pass</span>
+        <span>Completed-league import</span>
         <select id="historyBatchSelect">
-          <option value="20">20 assets (quick)</option>
-          <option value="80" selected>80 assets (recommended)</option>
-          <option value="160">160 assets (long)</option>
+          <option value="80" selected>Four broad-league dumps</option>
         </select>
       </label>
       <button class="secondary-button history-button" id="historyButton" type="button">
-        Build / continue past-league archive
+        Import / continue official league dumps
       </button>
       <p class="history-meta" id="historyMeta">
-        Uses exact league-day prices from completed softcore trade leagues and
-        locally archived poe.ninja build-composition snapshots.
+        Each selected broad-league ZIP is imported once; its normalized daily
+        rows and safe checkpoint stay in local SQLite.
       </p>
       <p class="history-meta">
-        Divine conversion anchors are sanity-checked. Implausible source days
-        are removed from derived prices while raw responses remain local; a
-        sparse direct outlier also needs two tightly agreeing peer leagues
-        before rejection. A missing day is filled only by a low-confidence
-        same-day median from at least two other validated leagues.
+        Historical rows require an exact poe.ninja item ID/variant and direct
+        Chaos quote from the same dump. Low-confidence rows remain available
+        for local audit but cannot enter forecasts or the weighted historical
+        curve. Missing dates or Divine anchors remain
+        blank—there is no adjacent-day or cross-provider fallback.
       </p>
       <div class="source-list" id="sourceList"></div>
       <button class="secondary-button" id="refreshStatusButton" type="button">Refresh source status</button>

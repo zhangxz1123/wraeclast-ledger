@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Sequence
 
 from .demo import seed_demo
-from .historical import HistoricalBackfillService
+from .ninja_history import PoeNinjaHistoryService
 from .recommendation import RecommendationEngine
 from .server import create_server
 from .storage import Storage
@@ -103,13 +103,32 @@ def build_parser() -> argparse.ArgumentParser:
 
     seasonal_sync = subparsers.add_parser(
         "seasonal-sync",
-        help="Build or continue the completed-league item archive.",
+        help="Import poe.ninja's official completed-league dumps.",
     )
     seasonal_sync.add_argument(
         "--items",
         type=int,
         default=80,
-        help="Common assets to process in this resumable pass (1-2000).",
+        help="Legacy compatibility option; official dumps are imported whole.",
+    )
+
+    compact_history = subparsers.add_parser(
+        "compact-history",
+        help=(
+            "Additively convert eligible full poe.ninja history to the "
+            "integer-keyed hosted format."
+        ),
+    )
+    compact_history.add_argument(
+        "--league",
+        action="append",
+        dest="leagues",
+        help="Completed league ID to convert (repeatable; default: all).",
+    )
+    compact_history.add_argument(
+        "--force",
+        action="store_true",
+        help="Rebuild compact rows for leagues already converted.",
     )
 
     export_pages = subparsers.add_parser(
@@ -284,12 +303,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             )
             return 1
-        result = HistoricalBackfillService(storage).backfill(
+        result = PoeNinjaHistoryService(storage).backfill(
             league,
             max_items=args.items,
         )
         print(json.dumps(result, indent=2))
         return 0 if result.get("status") in {"success", "partial"} else 1
+
+    if args.command == "compact-history":
+        result = storage.compact_official_history_from_full(
+            args.leagues,
+            force=args.force,
+        )
+        print(json.dumps(result, indent=2))
+        return 0
 
     if args.command == "export-pages":
         from .static_export import export_github_pages

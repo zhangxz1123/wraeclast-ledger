@@ -23,7 +23,7 @@ class ForecastRankingTests(unittest.TestCase):
         self.storage = Storage(
             Path(self.temporary_directory.name) / "forecast.sqlite3"
         )
-        self.now = datetime(2026, 7, 30, 20, tzinfo=timezone.utc)
+        self.now = datetime.now(timezone.utc).replace(microsecond=0)
         self.live = League(
             id="Forecast Live",
             name="Forecast Live",
@@ -47,9 +47,6 @@ class ForecastRankingTests(unittest.TestCase):
         volume: float = 1.0,
         details: dict[str, object] | None = None,
     ) -> None:
-        start = datetime.fromisoformat(
-            str(self.live.start_at).replace("Z", "+00:00")
-        )
         self.storage.insert_price_points(
             [
                 PricePoint(
@@ -59,7 +56,8 @@ class ForecastRankingTests(unittest.TestCase):
                     category=category,
                     source="poe.ninja",
                     observed_at=iso_utc(
-                        start + timedelta(days=index, hours=2)
+                        self.now
+                        - timedelta(days=len(values) - index - 1)
                     ),
                     chaos_value=value * 100,
                     divine_value=value,
@@ -91,7 +89,7 @@ class ForecastRankingTests(unittest.TestCase):
         self.storage.upsert_historical_assets(
             [
                 {
-                    "source": "poe.watch",
+                    "source": "poe.ninja-history",
                     "source_item_id": key,
                     "item_key": key,
                     "name": name,
@@ -105,7 +103,7 @@ class ForecastRankingTests(unittest.TestCase):
                 {
                     "league_id": league_id,
                     "item_key": key,
-                    "source": "poe.watch",
+                    "source": "poe.ninja-history",
                     "source_item_id": key,
                     "league_day": int(self.live.day or 1) + horizon,
                     "observed_at": spec.start_at,
@@ -132,7 +130,7 @@ class ForecastRankingTests(unittest.TestCase):
         self.storage.upsert_historical_assets(
             [
                 {
-                    "source": "poe.watch",
+                    "source": "poe.ninja-history",
                     "source_item_id": key,
                     "item_key": key,
                     "name": name,
@@ -150,7 +148,7 @@ class ForecastRankingTests(unittest.TestCase):
                     {
                         "league_id": league_id,
                         "item_key": key,
-                        "source": "poe.watch",
+                        "source": "poe.ninja-history",
                         "source_item_id": key,
                         "league_day": league_day,
                         "observed_at": iso_utc(
@@ -195,6 +193,143 @@ class ForecastRankingTests(unittest.TestCase):
         self.assertGreater(none["rank"], one["rank"])
         self.assertNotIn("eligibility_status", one)
         self.assertEqual(payload["forecast_model"]["eligibility_gates"], [])
+
+    def test_low_confidence_dump_outliers_are_audit_only(self) -> None:
+        tricorne = "basetype:tricorne-85-crusader-variant-crusader"
+        engraved = "basetype:engraved-hatchet-84-elder-variant-elder"
+        infested = "beast:infested-ursa"
+        self.add_current(
+            tricorne,
+            "Tricorne",
+            [0.01],
+            category="BaseType",
+            details={"variant": "Crusader"},
+        )
+        self.add_current(
+            engraved,
+            "Engraved Hatchet",
+            [0.02],
+            category="BaseType",
+            details={"variant": "Elder"},
+        )
+        self.add_current(
+            infested,
+            "Infested Ursa",
+            [0.89],
+            category="Beast",
+            details={"baseType": "Plummeting Ursae|Ursae|The Wilds"},
+        )
+
+        # These reproduce the extreme Low rows in poe.ninja's Mirage dump.
+        self.add_target(
+            tricorne,
+            "Tricorne",
+            "Mirage",
+            7,
+            3.1848,
+            category="BaseType",
+            confidence=0.35,
+        )
+        self.add_target(
+            engraved,
+            "Engraved Hatchet",
+            "Mirage",
+            7,
+            5.308,
+            category="BaseType",
+            confidence=0.35,
+        )
+        self.add_target(
+            infested,
+            "Infested Ursa",
+            "Mirage",
+            7,
+            1111.044,
+            category="Beast",
+            confidence=0.35,
+        )
+        # Engraved Hatchet still has a target from its qualifying observations.
+        self.add_target(
+            engraved,
+            "Engraved Hatchet",
+            "Mercenaries",
+            7,
+            0.02556299452221546,
+            category="BaseType",
+            confidence=0.65,
+        )
+        self.add_target(
+            engraved,
+            "Engraved Hatchet",
+            "Settlers",
+            7,
+            0.04838709677419355,
+            category="BaseType",
+            confidence=0.9,
+        )
+
+        payload = RecommendationEngine(self.storage).generate(
+            self.live,
+            horizon=7,
+            persist=False,
+        )
+        by_name = {row["name"]: row for row in payload["rankings"]}
+
+        # Low data is a forecast-quality rule, not an item eligibility rule.
+        self.assertEqual(
+            set(by_name),
+            {"Tricorne", "Engraved Hatchet", "Infested Ursa"},
+        )
+        self.assertIsNone(by_name["Tricorne"]["expected_gain"])
+        self.assertEqual(by_name["Tricorne"]["forecast_7d"], {"days": 7})
+        self.assertIsNone(by_name["Infested Ursa"]["expected_gain"])
+        self.assertEqual(
+            by_name["Infested Ursa"]["forecast_7d"],
+            {"days": 7},
+        )
+
+        weights = (0.72**2, 0.72**3)
+        expected_target = (
+            0.02556299452221546 * weights[0]
+            + 0.04838709677419355 * weights[1]
+        ) / sum(weights)
+        engraved_forecast = by_name["Engraved Hatchet"]["forecast_7d"]
+        self.assertAlmostEqual(
+            engraved_forecast["raw_historical_target_divine"],
+            expected_target,
+        )
+        self.assertEqual(
+            engraved_forecast["historical_leagues"],
+            ["Mercenaries", "Settlers"],
+        )
+        self.assertLess(
+            engraved_forecast["raw_historical_target_divine"],
+            0.05,
+        )
+        self.assertEqual(payload["rankings"][0]["name"], "Engraved Hatchet")
+        self.assertEqual(
+            payload["forecast_model"]["historical_confidence_floor"],
+            0.5,
+        )
+
+        # The original Low observations are still retained for local audit.
+        raw_low = self.storage.seasonal_price_curve_rows(
+            infested,
+            ["Mirage"],
+            minimum_confidence=0.0,
+            sources=("poe.ninja-history",),
+        )
+        self.assertEqual(len(raw_low), 1)
+        self.assertEqual(raw_low[0]["confidence"], 0.35)
+        self.assertEqual(
+            self.storage.seasonal_price_curve_rows(
+                infested,
+                ["Mirage"],
+                minimum_confidence=0.5,
+                sources=("poe.ninja-history",),
+            ),
+            [],
+        )
 
     def test_sub_chaos_price_is_outside_the_requested_universe(
         self,
@@ -351,6 +486,85 @@ class ForecastRankingTests(unittest.TestCase):
         self.assertEqual(
             set(veto["declining_leagues"]),
             {"Mirage", "Keepers"},
+        )
+
+    def test_chaos_orb_without_direct_dump_curve_is_still_omitted(
+        self,
+    ) -> None:
+        self.add_current("currency:chaos-orb", "Chaos Orb", [0.01])
+        self.add_current("currency:divine-orb", "Divine Orb", [1.0])
+
+        payload = RecommendationEngine(self.storage).generate(
+            self.live,
+            horizon=7,
+            persist=False,
+        )
+
+        names = {row["name"] for row in payload["rankings"]}
+        self.assertNotIn("Chaos Orb", names)
+        self.assertIn("Divine Orb", names)
+        vetoes = payload["investment_scope"]["known_decline_vetoes"]
+        self.assertEqual(len(vetoes), 1)
+        self.assertEqual(vetoes[0]["name"], "Chaos Orb")
+        self.assertEqual(
+            vetoes[0]["code"],
+            "divine_relative_reference_currency_decline",
+        )
+
+    def test_variant_absent_from_latest_successful_sync_is_omitted(
+        self,
+    ) -> None:
+        fresh_key = "skillgem:still-listed"
+        stale_key = "skillgem:vanished-variant"
+        self.add_current(
+            fresh_key,
+            "Still Listed",
+            [2.0],
+            category="SkillGem",
+        )
+        self.storage.insert_price_points(
+            [
+                PricePoint(
+                    league_id=self.live.id,
+                    item_key=stale_key,
+                    name="Vanished Variant",
+                    category="SkillGem",
+                    source="poe.ninja",
+                    observed_at=iso_utc(self.now - timedelta(days=1)),
+                    chaos_value=100.0,
+                    divine_value=1.0,
+                    listing_count=1,
+                    volume=1.0,
+                    confidence=0.2,
+                )
+            ]
+        )
+        with self.storage.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO sync_runs(
+                    started_at, finished_at, status, league_id
+                ) VALUES (?, ?, 'success', ?)
+                """,
+                (
+                    iso_utc(self.now - timedelta(minutes=1)),
+                    iso_utc(self.now),
+                    self.live.id,
+                ),
+            )
+
+        payload = RecommendationEngine(self.storage).generate(
+            self.live,
+            horizon=7,
+            persist=False,
+        )
+
+        names = {row["name"] for row in payload["rankings"]}
+        self.assertIn("Still Listed", names)
+        self.assertNotIn("Vanished Variant", names)
+        self.assertEqual(
+            payload["investment_scope"]["excluded_stale_current_items"],
+            1,
         )
 
     def test_one_declining_league_does_not_trigger_automatic_omission(
@@ -575,11 +789,15 @@ class ForecastRankingTests(unittest.TestCase):
             {
                 row["league_id"] for row in comparison["past_leagues"]
             },
-            {spec.league_id for spec in BROADLY_COVERED_LEAGUES},
+            {
+                spec.league_id
+                for spec in BROADLY_COVERED_LEAGUES
+                if spec.league_id != "Mirage"
+            },
         )
         self.assertEqual(
             comparison["calculation"]["historical_confidence_floor"],
-            0.0,
+            0.5,
         )
         target = comparison["forecast_horizons"]["3"]
         self.assertAlmostEqual(

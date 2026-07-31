@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gzip
+import json
 import os
 import sqlite3
 import tempfile
@@ -131,6 +132,25 @@ class PublicArchiveTests(unittest.TestCase):
                 "exchange_categories": '["Currency"]',
                 "item_categories": '["Gem"]',
                 "ggg_currency_cursor:Currency": "1785000000",
+                "poe_ninja_dump:Mirage": json.dumps(
+                    {
+                        "import_version": 1,
+                        "league_name": "Mirage",
+                        "min_date": "2025-10-31T00:00:00Z",
+                        "max_date": "2026-03-03T00:00:00Z",
+                        "zip_name": "Mirage.zip",
+                        "status": "success",
+                        "sha256": "a" * 64,
+                        "download_bytes": 54748036,
+                        "seasonal_rows_written": 15475,
+                        "stored_seasonal_rows": 15475,
+                        "raw_source_rows_seen": 20000,
+                        "normalized_source_rows": 18000,
+                        "eligible_source_rows": 16000,
+                        "storage_mode": "compact",
+                        "imported_at": "2026-07-31T12:00:00Z",
+                    }
+                ),
                 "gggXcurrencyXcursor:lookalike": '"must-delete"',
                 "ggg_oauth_token": '"must-delete"',
                 "local_path": '"C:/private/path"',
@@ -149,6 +169,65 @@ class PublicArchiveTests(unittest.TestCase):
         with gzip.open(compressed, "rb") as source:
             restored.write_bytes(source.read())
         return restored
+
+    def _seed_additive_compact_conversion(self) -> None:
+        self.storage.upsert_historical_assets(
+            [
+                {
+                    "source": "poe.ninja-history",
+                    "source_item_id": "compact-fixture",
+                    "item_key": "currency:compact-fixture",
+                    "name": "Compact Fixture",
+                    "category": "Currency",
+                    "eligible": True,
+                }
+            ]
+        )
+        self.storage.upsert_seasonal_prices(
+            [
+                {
+                    "league_id": self.league.id,
+                    "item_key": "currency:compact-fixture",
+                    "source": "poe.ninja-history",
+                    "source_item_id": "compact-fixture",
+                    "league_day": day,
+                    "observed_at": f"2026-07-{day:02d}T00:00:00Z",
+                    "chaos_value": float(day),
+                    "divine_value": float(day) / 100.0,
+                    "confidence": 0.9,
+                }
+                for day in (1, 2)
+            ]
+        )
+        converted = self.storage.compact_official_history_from_full(
+            [self.league.id]
+        )
+        self.assertEqual(converted["stored_rows"], 2)
+
+    def _dump_marker(self, *, compact: bool) -> dict[str, object]:
+        marker: dict[str, object] = {
+            "import_version": 3,
+            "league_name": self.league.id,
+            "min_date": "2026-07-01T00:00:00Z",
+            "max_date": "2026-07-31T00:00:00Z",
+            "zip_name": f"{self.league.id}.zip",
+            "status": "success",
+            "sha256": "b" * 64,
+            "download_bytes": 1234,
+            "seasonal_rows_written": 2,
+            "imported_at": "2026-07-31T12:00:00Z",
+        }
+        if compact:
+            marker.update(
+                {
+                    "stored_seasonal_rows": 2,
+                    "raw_source_rows_seen": 2,
+                    "normalized_source_rows": 2,
+                    "eligible_source_rows": 2,
+                    "storage_mode": "compact",
+                }
+            )
+        return marker
 
     def test_public_snapshot_strips_private_state_and_keeps_market_data(
         self,
@@ -269,7 +348,7 @@ class PublicArchiveTests(unittest.TestCase):
                         "SELECT key FROM settings ORDER BY key"
                     )
                 ],
-                ["ggg_currency_cursor:Currency"],
+                ["ggg_currency_cursor:Currency", "poe_ninja_dump:Mirage"],
             )
 
         # VACUUM must physically remove the exact compressed private blob,
@@ -317,6 +396,110 @@ class PublicArchiveTests(unittest.TestCase):
             full_storage.read_snapshot(self.private_snapshot_id),
             self.private_payload,
         )
+
+    def test_public_snapshot_drops_only_redundant_verbose_golden_rows(
+        self,
+    ) -> None:
+        self._seed_additive_compact_conversion()
+        self.storage.set_setting(
+            f"poe_ninja_dump:{self.league.id}",
+            self._dump_marker(compact=True),
+        )
+
+        compressed = self.root / "archive" / "compact-public.sqlite3.gz"
+        summary = create_public_market_snapshot(
+            self.database,
+            compressed,
+            compression_level=1,
+        )
+        self.assertEqual(
+            summary["sanitization"]["verbose_seasonal_rows_removed"],
+            2,
+        )
+        self.assertEqual(
+            summary["sanitization"]["compact_leagues_validated"],
+            1,
+        )
+        with closing(sqlite3.connect(self.database)) as source:
+            self.assertEqual(
+                source.execute(
+                    """
+                    SELECT COUNT(*) FROM seasonal_prices
+                    WHERE source = 'poe.ninja-history'
+                    """
+                ).fetchone()[0],
+                2,
+            )
+
+        restored = self._restore(compressed, "compact-public-restored.sqlite3")
+        with closing(sqlite3.connect(restored)) as archive:
+            self.assertEqual(
+                archive.execute(
+                    """
+                    SELECT COUNT(*) FROM seasonal_prices
+                    WHERE source = 'poe.ninja-history'
+                    """
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                archive.execute(
+                    "SELECT COUNT(*) FROM compact_seasonal_prices"
+                ).fetchone()[0],
+                2,
+            )
+
+    def test_public_snapshot_keeps_verbose_rows_for_full_marker(self) -> None:
+        self._seed_additive_compact_conversion()
+        marker_key = f"poe_ninja_dump:{self.league.id}"
+        self.storage.set_setting(
+            marker_key,
+            self._dump_marker(compact=False),
+        )
+
+        compressed = self.root / "archive" / "full-marker-public.sqlite3.gz"
+        summary = create_public_market_snapshot(
+            self.database,
+            compressed,
+            compression_level=1,
+        )
+        self.assertEqual(
+            summary["sanitization"]["compact_leagues_validated"],
+            0,
+        )
+        self.assertEqual(
+            summary["sanitization"]["verbose_seasonal_rows_removed"],
+            0,
+        )
+
+        restored = self._restore(
+            compressed,
+            "full-marker-public-restored.sqlite3",
+        )
+        with closing(sqlite3.connect(restored)) as archive:
+            self.assertEqual(
+                archive.execute(
+                    """
+                    SELECT COUNT(*) FROM seasonal_prices
+                    WHERE source = 'poe.ninja-history'
+                    """
+                ).fetchone()[0],
+                2,
+            )
+            self.assertEqual(
+                archive.execute(
+                    "SELECT COUNT(*) FROM compact_seasonal_prices"
+                ).fetchone()[0],
+                2,
+            )
+            saved = json.loads(
+                archive.execute(
+                    "SELECT value_json FROM settings WHERE key = ?",
+                    (marker_key,),
+                ).fetchone()[0]
+            )
+            self.assertNotIn("storage_mode", saved)
+            self.assertEqual(saved["seasonal_rows_written"], 2)
 
 
 if __name__ == "__main__":

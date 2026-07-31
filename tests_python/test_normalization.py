@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from poe_advisor.normalization import (
+    assert_poe_ninja_chaos_parity,
     canonical_key,
     normalize_ggg_markets,
     normalize_poe_ninja,
@@ -91,6 +92,7 @@ class PoeNinjaNormalizationTests(unittest.TestCase):
         self.assertEqual(point.details["relative_total_change_pct"], 2.5)
         self.assertGreater(point.confidence, 0.2)
         self.assertLessEqual(point.confidence, 0.98)
+        self.assertEqual(assert_poe_ninja_chaos_parity(payload, points), 1)
 
     def test_stash_item_schema_prefers_direct_values_and_variant_identity(
         self,
@@ -134,6 +136,29 @@ class PoeNinjaNormalizationTests(unittest.TestCase):
         self.assertIn("gemquality-20", point.item_key)
         self.assertEqual(point.details["gemLevel"], 5)
         self.assertEqual(point.details["gemQuality"], 20)
+        self.assertEqual(assert_poe_ninja_chaos_parity(payload, points), 1)
+
+    def test_direct_poe_ninja_chaos_mismatch_is_fatal(self) -> None:
+        payload = {
+            "lines": [
+                {
+                    "id": "chromatic-orb",
+                    "currencyTypeName": "Chromatic Orb",
+                    "divineValue": 0.01,
+                    "chaosValue": 2.06,
+                }
+            ]
+        }
+        points = normalize_poe_ninja(
+            payload,
+            league_id="Fixture League",
+            category="Currency",
+            observed_at="2026-07-31T12:00:00Z",
+            snapshot_id=10,
+        )
+        points[0].chaos_value = 36.4
+        with self.assertRaisesRegex(ValueError, "parity failed"):
+            assert_poe_ninja_chaos_parity(payload, points)
 
     def test_invalid_poe_ninja_shape_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "lines array"):

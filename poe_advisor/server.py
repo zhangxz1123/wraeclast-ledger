@@ -15,7 +15,6 @@ from .historical import (
     BROADLY_COVERED_LEAGUE_IDS,
     BROADLY_COVERED_LEAGUES,
     COMPLETED_LEAGUES,
-    HistoricalBackfillService,
 )
 from .meta import (
     LADDER_SOURCE,
@@ -23,12 +22,19 @@ from .meta import (
     POE_NINJA_META_SOURCE,
     MetaService,
 )
+from .ninja_history import PoeNinjaHistoryService
 from .recommendation import (
     CURRENT_CURVE_FORECAST_WEIGHT,
     FORECAST_HORIZONS,
     HISTORICAL_FORECAST_WEIGHT,
+    HISTORICAL_MODEL_CONFIDENCE_FLOOR,
     RecommendationEngine,
     _current_curve_projection,
+)
+from .provenance import (
+    CURRENT_PRICE_SOURCES,
+    HISTORICAL_PRICE_SOURCES,
+    production_price_provenance,
 )
 from .seasonality import SeasonalModel
 from .storage import Storage
@@ -51,7 +57,7 @@ class AdvisorApplication:
     sync_service: SyncService
     recommendation_engine: RecommendationEngine
     web_dir: Path
-    history_service: HistoricalBackfillService | None = None
+    history_service: PoeNinjaHistoryService | None = None
     meta_service: MetaService | None = None
     _recommendation_cache: dict[
         tuple[str, int | None, int], dict[str, Any]
@@ -83,7 +89,7 @@ class AdvisorApplication:
                 meta_service=meta_service,
             ),
             web_dir=Path(web_dir).expanduser().resolve(),
-            history_service=HistoricalBackfillService(storage),
+            history_service=PoeNinjaHistoryService(storage),
             meta_service=meta_service,
         )
 
@@ -105,7 +111,9 @@ class AdvisorApplication:
         friendly_names = {
             "poe.ninja": "poe.ninja economy",
             STANDARD_ANCHOR_SOURCE: "poe.ninja Standard anchor",
-            "poe.watch-history": "poe.watch current-league history",
+            "poe.ninja-history": "poe.ninja completed-league archive",
+            "poe.ninja-current-history": "poe.ninja current-league curves",
+            "poe.watch-history": "Legacy poe.watch history (quarantined)",
             POE_NINJA_META_SOURCE: "poe.ninja build composition",
             "ggg-currency-exchange": "Official Currency Exchange",
             "poe.watch": "poe.watch market catalog",
@@ -141,7 +149,9 @@ class AdvisorApplication:
                     "required": source["source"]
                     not in {
                         "poe.watch",
+                        "poe.watch-history",
                         "ggg-skilltree-export",
+                        "poe.ninja-current-history",
                         STANDARD_ANCHOR_SOURCE,
                         POE_NINJA_META_SOURCE,
                         LADDER_SOURCE,
@@ -345,8 +355,16 @@ class AdvisorApplication:
             }
         return {
             "league": {"id": league.id, "name": league.name},
-            "item": self.storage.item_metadata(league.id, item_key),
-            "history": self.storage.all_time_item_history(league.id, item_key),
+            "item": self.storage.item_metadata(
+                league.id,
+                item_key,
+                sources=None if league.is_demo else CURRENT_PRICE_SOURCES,
+            ),
+            "history": self.storage.all_time_item_history(
+                league.id,
+                item_key,
+                sources=None if league.is_demo else CURRENT_PRICE_SOURCES,
+            ),
             "seasonal_comparison": self._seasonal_comparison(
                 league=league,
                 item_key=item_key,
@@ -359,10 +377,10 @@ class AdvisorApplication:
         league: Any,
         item_key: str,
     ) -> dict[str, Any]:
-        # The comparison chart must use the same ungated historical
-        # observations as the forecast. Confidence remains visible as audit
-        # metadata, but it does not remove a point from either calculation.
-        confidence_floor = 0.0
+        # The comparison chart must use the same provider-grade floor as the
+        # forecast. poe.ninja's Low observations remain in SQLite for audit,
+        # but cannot enter the displayed weighted curve or a target price.
+        confidence_floor = HISTORICAL_MODEL_CONFIDENCE_FLOOR
         display_grade_floor = 0.5
         decay = SeasonalModel.RECENCY_DECAY_PER_LEAGUE
         current_rows = self.storage.daily_item_history(
@@ -370,12 +388,14 @@ class AdvisorApplication:
             item_key,
             league.start_at,
             minimum_confidence=0.0,
+            sources=None if league.is_demo else CURRENT_PRICE_SOURCES,
         )
         calendar = list(reversed(BROADLY_COVERED_LEAGUES))
         historical_rows = self.storage.seasonal_price_curve_rows(
             item_key,
             [spec.league_id for spec in calendar],
             minimum_confidence=confidence_floor,
+            sources=None if league.is_demo else HISTORICAL_PRICE_SOURCES,
         )
         rows_by_league: dict[str, list[dict[str, Any]]] = {}
         for row in historical_rows:
@@ -650,6 +670,9 @@ class AdvisorApplication:
             )
 
         return {
+            "price_provenance": (
+                None if league.is_demo else production_price_provenance()
+            ),
             "current_league": {
                 "league_id": league.id,
                 "league_name": league.name,
@@ -706,7 +729,8 @@ class AdvisorApplication:
                 ),
                 "historical_aggregation": (
                     "Per-day recency-weighted arithmetic mean, normalized over "
-                    "completed leagues with an exact qualifying observation."
+                    "completed leagues with an exact poe.ninja Medium/High "
+                    "observation. Low observations remain audit-only."
                 ),
                 "current_point_selection": (
                     "Newest positive-price observation within each league day; "

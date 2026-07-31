@@ -222,13 +222,13 @@ def _skill_gem_parts(
 
 
 def league_day(observed_at: str | datetime, league_start: str | datetime) -> int:
-    """Return the one-based league day for a UTC observation."""
+    """Return poe.ninja's one-based UTC calendar-day bucket."""
 
     observed = _as_datetime(observed_at)
     start = _as_datetime(league_start)
     if observed is None or start is None:
         raise ValueError("observed_at and league_start must be valid timestamps")
-    return math.floor((observed - start).total_seconds() / 86400.0) + 1
+    return (observed.date() - start.date()).days + 1
 
 
 def _as_datetime(value: Any) -> datetime | None:
@@ -469,6 +469,7 @@ def _validate_divine_curve(
     curve: dict[int, float],
     *,
     minimum_points: int = MIN_USABLE_DIVINE_POINTS,
+    reject_adjacent_jumps: bool = True,
 ) -> DivineCurveQuality:
     """Reject implausible anchor days instead of poisoning derived prices.
 
@@ -499,18 +500,21 @@ def _validate_divine_curve(
             rejected.add(day)
 
     jump_days: set[int] = set()
-    ordered = sorted(prices.items())
-    for (left_day, left_price), (right_day, right_price) in zip(
-        ordered, ordered[1:]
-    ):
-        if right_day != left_day + 1:
-            continue
-        ratio = max(left_price, right_price) / min(left_price, right_price)
-        if ratio > MAX_ADJACENT_DIVINE_RATIO:
-            # It is impossible to know which side of a provider discontinuity
-            # is wrong without a second source, so fail closed on both.
-            jump_days.update((left_day, right_day))
-            rejected.update((left_day, right_day))
+    if reject_adjacent_jumps:
+        ordered = sorted(prices.items())
+        for (left_day, left_price), (right_day, right_price) in zip(
+            ordered, ordered[1:]
+        ):
+            if right_day != left_day + 1:
+                continue
+            ratio = max(left_price, right_price) / min(left_price, right_price)
+            if ratio > MAX_ADJACENT_DIVINE_RATIO:
+                # It is impossible to know which side of an untrusted
+                # provider discontinuity is wrong without a second source, so
+                # fail closed on both. Official poe.ninja direct pairs opt out
+                # because that provider is the golden source for this model.
+                jump_days.update((left_day, right_day))
+                rejected.update((left_day, right_day))
 
     usable = {
         day: price for day, price in prices.items() if day not in rejected

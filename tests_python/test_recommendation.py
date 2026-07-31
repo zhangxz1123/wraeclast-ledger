@@ -143,6 +143,106 @@ class RecommendationTests(unittest.TestCase):
         self.assertIsNone(payload["reserve"])
         self.assertIsNone(payload["invested"])
 
+    def test_partial_sync_membership_cutoff_rejects_stale_current_rows(
+        self,
+    ) -> None:
+        now = utc_now()
+        live = League(
+            id="Partial Membership Fixture",
+            name="Partial Membership Fixture",
+            start_at=iso_utc(now - timedelta(days=7)),
+        )
+        self.storage.upsert_league(live, current=True)
+        self.storage.insert_price_points(
+            [
+                PricePoint(
+                    league_id=live.id,
+                    item_key="unique:stale-variant",
+                    name="Stale Variant",
+                    category="UniqueAccessory",
+                    source="poe.ninja",
+                    observed_at=iso_utc(now - timedelta(minutes=30)),
+                    chaos_value=200.0,
+                    divine_value=1.0,
+                    listing_count=10,
+                    volume=10.0,
+                    confidence=0.95,
+                ),
+                PricePoint(
+                    league_id=live.id,
+                    item_key="unique:refreshed-variant",
+                    name="Refreshed Variant",
+                    category="UniqueAccessory",
+                    source="poe.ninja",
+                    observed_at=iso_utc(now),
+                    chaos_value=200.0,
+                    divine_value=1.0,
+                    listing_count=10,
+                    volume=10.0,
+                    confidence=0.95,
+                ),
+            ]
+        )
+        successful_run = self.storage.start_sync_run(live.id)
+        self.storage.finish_sync_run(
+            successful_run,
+            status="success",
+            rows_written=2,
+            snapshots_written=1,
+            message="older complete fixture sync",
+            warnings=[],
+        )
+        partial_run = self.storage.start_sync_run(live.id)
+        self.storage.finish_sync_run(
+            partial_run,
+            status="partial",
+            rows_written=1,
+            snapshots_written=1,
+            message="newer partial fixture sync",
+            warnings=["one category failed"],
+        )
+        with self.storage.transaction() as connection:
+            connection.execute(
+                """
+                UPDATE sync_runs
+                SET started_at = ?, finished_at = ?
+                WHERE id = ?
+                """,
+                (
+                    iso_utc(now - timedelta(minutes=60)),
+                    iso_utc(now - timedelta(minutes=50)),
+                    successful_run,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE sync_runs
+                SET started_at = ?, finished_at = ?
+                WHERE id = ?
+                """,
+                (
+                    iso_utc(now - timedelta(minutes=10)),
+                    iso_utc(now - timedelta(minutes=5)),
+                    partial_run,
+                ),
+            )
+
+        payload = RecommendationEngine(self.storage).generate(
+            live,
+            budget=100,
+            horizon=7,
+            persist=False,
+        )
+
+        self.assertEqual(
+            [row["key"] for row in payload["rankings"]],
+            ["unique:refreshed-variant"],
+        )
+        self.assertEqual(
+            payload["investment_scope"]["excluded_stale_current_items"],
+            1,
+        )
+
     def test_budget_does_not_filter_or_rerank_candidates(self) -> None:
         engine = RecommendationEngine(self.storage)
         small_budget = engine.generate(
@@ -232,7 +332,7 @@ class RecommendationTests(unittest.TestCase):
         self.storage.upsert_historical_assets(
             [
                 {
-                    "source": "poe.watch",
+                    "source": "poe.ninja-history",
                     "source_item_id": "fixture-1",
                     "item_key": item_key,
                     "name": "Mirror Shard",
@@ -253,7 +353,7 @@ class RecommendationTests(unittest.TestCase):
                     {
                         "league_id": historical.id,
                         "item_key": item_key,
-                        "source": "poe.watch",
+                        "source": "poe.ninja-history",
                         "source_item_id": "fixture-1",
                         "league_day": target_day,
                         "observed_at": f"202{index + 1}-02-01T20:00:00Z",
@@ -265,7 +365,7 @@ class RecommendationTests(unittest.TestCase):
                     {
                         "league_id": historical.id,
                         "item_key": item_key,
-                        "source": "poe.watch",
+                        "source": "poe.ninja-history",
                         "source_item_id": "fixture-1",
                         "league_day": target_day + 7,
                         "observed_at": f"202{index + 1}-02-08T20:00:00Z",
@@ -277,7 +377,7 @@ class RecommendationTests(unittest.TestCase):
                     {
                         "league_id": historical.id,
                         "item_key": item_key,
-                        "source": "poe.watch",
+                        "source": "poe.ninja-history",
                         "source_item_id": "fixture-1",
                         "league_day": target_day + 21,
                         "observed_at": f"202{index + 1}-02-22T20:00:00Z",
@@ -373,7 +473,7 @@ class RecommendationTests(unittest.TestCase):
         self.storage.upsert_historical_assets(
             [
                 {
-                    "source": "poe.watch",
+                    "source": "poe.ninja-history",
                     "source_item_id": source_id,
                     "item_key": item_key,
                     "name": name,
@@ -396,7 +496,7 @@ class RecommendationTests(unittest.TestCase):
                         {
                             "league_id": historical.id,
                             "item_key": item_key,
-                            "source": "poe.watch",
+                            "source": "poe.ninja-history",
                             "source_item_id": source_id,
                             "league_day": target_day,
                             "observed_at": (
@@ -410,7 +510,7 @@ class RecommendationTests(unittest.TestCase):
                         {
                             "league_id": historical.id,
                             "item_key": item_key,
-                            "source": "poe.watch",
+                            "source": "poe.ninja-history",
                             "source_item_id": source_id,
                             "league_day": target_day + 7,
                             "observed_at": (
@@ -424,7 +524,7 @@ class RecommendationTests(unittest.TestCase):
                         {
                             "league_id": historical.id,
                             "item_key": item_key,
-                            "source": "poe.watch",
+                            "source": "poe.ninja-history",
                             "source_item_id": source_id,
                             "league_day": target_day + 21,
                             "observed_at": (
@@ -496,7 +596,7 @@ class RecommendationTests(unittest.TestCase):
         self.storage.upsert_historical_assets(
             [
                 {
-                    "source": "poe.watch",
+                    "source": "poe.ninja-history",
                     "source_item_id": "negative-forward",
                     "item_key": item_key,
                     "name": "Early Entry Trap",
@@ -516,7 +616,7 @@ class RecommendationTests(unittest.TestCase):
                     {
                         "league_id": past.id,
                         "item_key": item_key,
-                        "source": "poe.watch",
+                        "source": "poe.ninja-history",
                         "source_item_id": "negative-forward",
                         "league_day": target_day,
                         "observed_at": f"202{index + 1}-02-01T20:00:00Z",
@@ -528,7 +628,7 @@ class RecommendationTests(unittest.TestCase):
                     {
                         "league_id": past.id,
                         "item_key": item_key,
-                        "source": "poe.watch",
+                        "source": "poe.ninja-history",
                         "source_item_id": "negative-forward",
                         "league_day": target_day + 7,
                         "observed_at": f"202{index + 1}-02-08T20:00:00Z",
@@ -540,7 +640,7 @@ class RecommendationTests(unittest.TestCase):
                     {
                         "league_id": past.id,
                         "item_key": item_key,
-                        "source": "poe.watch",
+                        "source": "poe.ninja-history",
                         "source_item_id": "negative-forward",
                         "league_day": target_day + 21,
                         "observed_at": f"202{index + 1}-02-22T20:00:00Z",
@@ -767,7 +867,7 @@ class RecommendationTests(unittest.TestCase):
             all(idea["allocation_divine"] is None for idea in recommendations)
         )
 
-    def test_forbidden_jewel_uses_same_forecast_formula_without_meta_gate(
+    def test_forbidden_jewel_applies_current_meta_multiplier_to_targets(
         self,
     ) -> None:
         now = utc_now()
@@ -809,7 +909,7 @@ class RecommendationTests(unittest.TestCase):
         self.storage.upsert_historical_assets(
             [
                 {
-                    "source": "poe.watch",
+                    "source": "poe.ninja-history",
                     "source_item_id": "forbidden-fixture",
                     "item_key": item_key,
                     "name": "Mastermind of Discord",
@@ -829,7 +929,7 @@ class RecommendationTests(unittest.TestCase):
                     {
                         "league_id": past.id,
                         "item_key": item_key,
-                        "source": "poe.watch",
+                        "source": "poe.ninja-history",
                         "source_item_id": "forbidden-fixture",
                         "league_day": target_day,
                         "observed_at": f"202{index + 1}-02-01T20:00:00Z",
@@ -841,7 +941,7 @@ class RecommendationTests(unittest.TestCase):
                     {
                         "league_id": past.id,
                         "item_key": item_key,
-                        "source": "poe.watch",
+                        "source": "poe.ninja-history",
                         "source_item_id": "forbidden-fixture",
                         "league_day": target_day + 7,
                         "observed_at": f"202{index + 1}-02-08T20:00:00Z",
@@ -853,7 +953,7 @@ class RecommendationTests(unittest.TestCase):
                     {
                         "league_id": past.id,
                         "item_key": item_key,
-                        "source": "poe.watch",
+                        "source": "poe.ninja-history",
                         "source_item_id": "forbidden-fixture",
                         "league_day": target_day + 21,
                         "observed_at": f"202{index + 1}-02-22T20:00:00Z",
@@ -895,7 +995,7 @@ class RecommendationTests(unittest.TestCase):
             meta_service=meta_service,
         ).generate(live, budget=100, horizon=7, persist=False)
 
-        self.assertFalse(hasattr(meta_service, "ascendancy"))
+        self.assertEqual(meta_service.ascendancy, "Elementalist")
         self.assertEqual(len(payload["recommendations"]), 1)
         idea = payload["recommendations"][0]
         self.assertAlmostEqual(
@@ -904,11 +1004,24 @@ class RecommendationTests(unittest.TestCase):
         )
         self.assertAlmostEqual(
             idea["historical_target_price_divine"],
+            1.5,
+        )
+        self.assertAlmostEqual(
+            idea["forecast_7d"]["raw_historical_target_divine"],
             1.2,
         )
-        expected = math.exp(0.7 * math.log(1.5)) - 1.0
+        self.assertAlmostEqual(
+            idea["meta_adjusted_same_day_price_divine"],
+            1.25,
+        )
+        self.assertAlmostEqual(
+            idea["forecast_7d"]["meta_adjusted_historical_target_divine"],
+            1.5,
+        )
+        expected = math.exp(0.7 * math.log(1.875)) - 1.0
         self.assertAlmostEqual(idea["expected_gain"], expected)
-        self.assertNotIn("meta_multiplier", idea)
+        self.assertEqual(idea["meta_multiplier"], 1.25)
+        self.assertEqual(idea["meta_signal"]["status"], "ok")
 
 
 if __name__ == "__main__":

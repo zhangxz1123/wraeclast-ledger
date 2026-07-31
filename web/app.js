@@ -18,8 +18,12 @@ const runtime = {
   mode: "local",
   manifest: null,
   catalogPromise: null,
+  rankingIndexPromise: null,
+  rankingPagePromises: new Map(),
   catalogRows: null,
   normalizedRecommendations: null,
+  pageRenderSignature: null,
+  pageRenderSequence: 0,
   historyShardPromises: new Map(),
 };
 
@@ -112,10 +116,18 @@ async function discoverRuntime() {
   }
   const manifest = await response.json();
   if (
-    manifest?.schema_version !== 1
+    ![1, 2].includes(manifest?.schema_version)
     || manifest?.mode !== "github-pages"
     || !manifest?.status
     || !manifest?.catalog
+    || (
+      manifest?.schema_version >= 2
+      && (
+        !manifest?.ranking_index
+        || !manifest?.ranking_pages?.page_size
+        || !manifest?.ranking_pages?.horizons
+      )
+    )
   ) {
     runtime.mode = "static";
     throw new Error("Published data manifest is invalid or unsupported.");
@@ -132,6 +144,92 @@ async function staticCatalog() {
     );
   }
   return runtime.catalogPromise;
+}
+
+function decodeStaticRankingIndex(payload) {
+  if (!Array.isArray(payload?.fields) || !Array.isArray(payload?.items)) {
+    throw new Error("Published ranking index is invalid.");
+  }
+  const positions = Object.fromEntries(
+    payload.fields.map((field, index) => [String(field), index]),
+  );
+  const value = (entry, field) => entry[positions[field]];
+  return payload.items.map((entry) => {
+    if (!Array.isArray(entry)) {
+      throw new Error("Published ranking index row is invalid.");
+    }
+    return {
+      key: String(value(entry, "key") || ""),
+      name: String(value(entry, "name") || "Unknown item"),
+      category: String(value(entry, "category") || "Other"),
+      search_text: String(value(entry, "search_text") || "").toLowerCase(),
+      price_divine: value(entry, "price_divine"),
+      price_chaos: value(entry, "price_chaos"),
+      static_ranks: {
+        "3": value(entry, "rank_3d"),
+        "7": value(entry, "rank_7d"),
+        "14": value(entry, "rank_14d"),
+      },
+    };
+  });
+}
+
+async function staticRankingIndex() {
+  if (!runtime.rankingIndexPromise) {
+    runtime.rankingIndexPromise = fetchJson(
+      staticAssetUrl(runtime.manifest.ranking_index),
+      { cache: "force-cache" },
+    ).then(decodeStaticRankingIndex);
+  }
+  return runtime.rankingIndexPromise;
+}
+
+async function staticRankingPage(horizon, pageNumber) {
+  const paths = runtime.manifest?.ranking_pages?.horizons?.[String(horizon)];
+  const shardPath = Array.isArray(paths) ? paths[pageNumber - 1] : null;
+  if (!shardPath) {
+    throw new Error(`Published ${horizon}-day ranking page ${pageNumber} is missing.`);
+  }
+  if (!runtime.rankingPagePromises.has(shardPath)) {
+    runtime.rankingPagePromises.set(
+      shardPath,
+      fetchJson(staticAssetUrl(shardPath), { cache: "force-cache" }),
+    );
+  }
+  return runtime.rankingPagePromises.get(shardPath);
+}
+
+async function loadStaticPageDetails(items, horizon) {
+  if (runtime.manifest?.schema_version < 2 || !items.length) return items;
+  const shardSize = Math.max(
+    1,
+    toNumber(runtime.manifest?.ranking_pages?.page_size, 100),
+  );
+  const pageNumbers = [...new Set(items.map((item) => (
+    Math.floor((Math.max(1, toNumber(item.rank, 1)) - 1) / shardSize) + 1
+  )))];
+  const pages = await Promise.all(
+    pageNumbers.map((pageNumber) => staticRankingPage(horizon, pageNumber)),
+  );
+  const rowByKey = new Map();
+  for (const page of pages) {
+    for (const row of Array.isArray(page?.items) ? page.items : []) {
+      const itemKey = String(row?.key || row?.item_key || row?.curve_key || "");
+      if (itemKey) rowByKey.set(itemKey, row);
+    }
+  }
+  for (const item of items) {
+    const row = rowByKey.get(item.itemKey);
+    if (!row) {
+      throw new Error(`Published ranking row is missing for ${item.itemKey}.`);
+    }
+    const preservedRank = item.rank;
+    const preservedSearch = item.searchText;
+    Object.assign(item, normalizeRecommendation(row, preservedRank - 1));
+    item.rank = preservedRank;
+    item.searchText = preservedSearch;
+  }
+  return items;
 }
 
 async function staticHistory(itemKey) {
@@ -176,6 +274,13 @@ async function api(path, options = {}) {
   }
   if (parsed.pathname === "/api/recommendations") {
     const horizon = toNumber(parsed.searchParams.get("horizon"), 7);
+    if (runtime.manifest?.schema_version >= 2) {
+      const [catalog, rankings] = await Promise.all([
+        staticCatalog(),
+        staticRankingIndex(),
+      ]);
+      return { ...catalog, rankings, horizon };
+    }
     const catalog = await staticCatalog();
     return { ...catalog, horizon };
   }
@@ -635,6 +740,15 @@ function normalizeForecast(item, days) {
     selectedFallback ? item.expected_return_pct : null,
     selectedFallback ? item.expected_return : null,
   );
+  const expectedPriceDivine = nullableNumber(
+    nested.expected_price_divine,
+    nested.expectedPriceDivine,
+    firstField(item, [
+      `expected_price_${days}d_divine`,
+      `expected_price_${days}_divine`,
+      `expected_price_divine_${days}d`,
+    ]),
+  );
   const historicalTargetDivine = nullableNumber(
     nested.historical_target_divine,
     nested.historical_target_price_divine,
@@ -648,6 +762,16 @@ function normalizeForecast(item, days) {
       `historical_target_price_divine_${days}d`,
     ]),
   );
+  const rawHistoricalTargetDivine = nullableNumber(
+    nested.raw_historical_target_divine,
+    nested.rawHistoricalTargetDivine,
+  );
+  const metaMultiplier = nullableNumber(
+    nested.meta_multiplier,
+    nested.metaMultiplier,
+    item.meta_multiplier,
+    item.metaMultiplier,
+  ) ?? 1;
   const historicalTargetGainPct = nullableNumber(
     nested.historical_target_gain_pct,
     nested.historicalTargetGainPct,
@@ -709,7 +833,10 @@ function normalizeForecast(item, days) {
   return {
     days,
     expectedGainPct,
+    expectedPriceDivine,
     historicalTargetDivine,
+    rawHistoricalTargetDivine,
+    metaMultiplier,
     historicalTargetGainPct,
     currentCurveGainPct,
     sampleLeagues,
@@ -772,7 +899,10 @@ function normalizeRecommendation(item, index) {
     tradeIdentity,
     variantLabel,
     displayName,
-    searchText: `${displayName} ${category} ${tradeIdentity.passiveName || ""}`.toLowerCase(),
+    searchText: String(
+      item.search_text
+      || `${displayName} ${category} ${tradeIdentity.passiveName || ""}`,
+    ).toLowerCase(),
     priceDivine: nullableNumber(
       item.price_divine,
       item.current_price_divine,
@@ -842,7 +972,7 @@ function renderRankingSummary() {
     ? ` ${compact(hiddenCount)} hidden on this device.`
     : "";
   els.modelNote.textContent = returned
-    ? `${showing}, sorted by gross ${horizon}-day expected gain.${hiddenNote} Forecasts use only Mirage, Keepers, Mercenaries, and Settlers.${excludedItems ? ` ${compact(excludedItems)} archived markets are omitted by category, the 1c floor, or the persistent-decline rule.` : ""}`
+    ? `${showing}, sorted by gross ${horizon}-day expected gain.${hiddenNote} Forecasts use poe.ninja Medium/High observations from Mirage, Keepers, Mercenaries, and Settlers; Low observations remain in the local archive for audit only.${excludedItems ? ` ${compact(excludedItems)} archived markets are omitted by category, the 1c floor, or the persistent-decline rule.` : ""}`
     : `No item forecast is available yet. Build the broad-league archive, then sync again.`;
 }
 
@@ -931,9 +1061,10 @@ function seasonalComparisonMarkup(rawComparison, itemName) {
     : fullHistoricalCurve.filter(
       (point) => point.leagueDay <= chartDayCeiling,
     );
-  const omittedHistoricalPoints = (
-    fullHistoricalCurve.length - historicalCurve.length
-  );
+  const omittedHistoricalPoints = nullableNumber(
+    weightedHistorical.omitted_points,
+    weightedHistorical.omittedPoints,
+  ) ?? (fullHistoricalCurve.length - historicalCurve.length);
 
   if (!currentCurve.length && !historicalCurve.length) {
     return `
@@ -1262,7 +1393,8 @@ function forecastCellMarkup(forecast, days, selectedHorizon) {
     : expected < 0
       ? "negative"
       : "positive";
-  const target = forecast?.historicalTargetDivine;
+  const target = forecast?.expectedPriceDivine
+    ?? forecast?.historicalTargetDivine;
   return `
     <span class="forecast-cell horizon-${days} ${selected ? "selected-horizon" : ""} ${tone}">
       <strong>${forecastPercent(expected)}</strong>
@@ -1270,7 +1402,7 @@ function forecastCellMarkup(forecast, days, selectedHorizon) {
         ? "no broad future-day price"
         : target == null
           ? `${days}-day gross`
-          : `target ${money(target, 2)}`}</span>
+          : `expected ${money(target, 2)}`}</span>
     </span>`;
 }
 
@@ -1286,6 +1418,42 @@ function renderRecommendations() {
     header.classList.toggle("selected-horizon", selected);
     header.textContent = `EXPECTED ${header.dataset.forecastHeader}D${selected ? " · SORT" : ""}`;
   });
+  if (
+    runtime.mode === "static"
+    && runtime.manifest?.schema_version >= 2
+    && items.length
+  ) {
+    const signature = `${horizon}:${state.page}:${state.pageSize}:${items
+      .map((item) => item.itemKey)
+      .join("|")}`;
+    if (runtime.pageRenderSignature !== `ready:${signature}`) {
+      if (runtime.pageRenderSignature === `loading:${signature}`) return;
+      runtime.pageRenderSignature = `loading:${signature}`;
+      const sequence = ++runtime.pageRenderSequence;
+      els.recommendationList.innerHTML = `
+        <div class="loading-state">
+          <span class="loading-rune" aria-hidden="true"></span>
+          <strong>Loading this ranking page</strong>
+          <p>Fetching only the visible forecast rows from the published snapshot.</p>
+        </div>`;
+      loadStaticPageDetails(items, horizon)
+        .then(() => {
+          if (sequence !== runtime.pageRenderSequence) return;
+          runtime.pageRenderSignature = `ready:${signature}`;
+          renderRecommendations();
+        })
+        .catch((error) => {
+          if (sequence !== runtime.pageRenderSequence) return;
+          runtime.pageRenderSignature = `error:${signature}`;
+          els.recommendationList.innerHTML = `
+            <div class="empty-state">
+              <strong>This ranking page could not be loaded</strong>
+              <p>${escapeHtml(error.message)}</p>
+            </div>`;
+        });
+      return;
+    }
+  }
   if (!state.recommendations.length) {
     els.recommendationList.innerHTML = `
       <div class="empty-state">
@@ -1432,6 +1600,15 @@ function forecastDetailMarkup(forecast, selectedHorizon) {
     : hasHistoricalSamples
       ? `${forecast.sampleLeagues} of ${BROAD_LEAGUES.join(", ")}`
       : "no exact broad-league future-day price";
+  const metaAdjusted = Math.abs((forecast.metaMultiplier || 1) - 1) > 1e-9;
+  const targetLabel = metaAdjusted
+    ? "META-ADJUSTED FUTURE TARGET"
+    : "HISTORICAL FUTURE TARGET";
+  const targetNote = forecast.historicalTargetGainPct == null
+    ? "—"
+    : metaAdjusted && forecast.rawHistoricalTargetDivine != null
+      ? `${forecastPercent(forecast.historicalTargetGainPct)} from today; raw ${money(forecast.rawHistoricalTargetDivine, 2)} × ${forecast.metaMultiplier.toFixed(2)}`
+      : `${forecastPercent(forecast.historicalTargetGainPct)} from today`;
   return `
     <section class="forecast-detail-card ${forecast.days === selectedHorizon ? "selected-horizon" : ""}">
       <header>
@@ -1448,9 +1625,9 @@ function forecastDetailMarkup(forecast, selectedHorizon) {
           <small>${forecast.currentCurveUsed ? "70/30 log-price blend" : "historical target only"}</small>
         </article>
         <article>
-          <span>HISTORICAL FUTURE TARGET</span>
+          <span>${targetLabel}</span>
           <strong>${forecast.historicalTargetDivine == null ? "—" : money(forecast.historicalTargetDivine, 2)}</strong>
-          <small>${forecast.historicalTargetGainPct == null ? "—" : `${forecastPercent(forecast.historicalTargetGainPct)} from today`}</small>
+          <small>${targetNote}</small>
         </article>
         <article>
           <span>CURRENT-CURVE TREND</span>
@@ -1484,7 +1661,7 @@ function openDetail(rank) {
     <div class="detail-metrics">
       <div><span>CURRENT PRICE</span><strong>${item.priceDivine == null ? "—" : money(item.priceDivine, 2)}</strong></div>
       <div><span>${horizon}D EXPECTED GAIN</span><strong>${forecastPercent(selectedForecast?.expectedGainPct)}</strong></div>
-      <div><span>${horizon}D HISTORICAL TARGET</span><strong>${selectedForecast?.historicalTargetDivine == null ? "—" : money(selectedForecast.historicalTargetDivine, 2)}</strong></div>
+      <div><span>${horizon}D EXPECTED PRICE</span><strong>${selectedForecast?.expectedPriceDivine == null ? "—" : money(selectedForecast.expectedPriceDivine, 2)}</strong></div>
       <div><span>${horizon}D RANK</span><strong>#${item.rank}</strong></div>
     </div>
     <div class="forecast-detail-grid">
@@ -1498,6 +1675,11 @@ function openDetail(rank) {
     </div>
     <p class="detail-caveat forecast-method-note">
       Historical targets use only Mirage, Keepers, Mercenaries, and Settlers.
+      Only poe.ninja Medium/High observations enter forecasts and the weighted
+      curve; Low observations remain in the local archive for audit only.
+      For Forbidden Jewels, a displayed meta-adjusted target multiplies that
+      raw curve target by the current-versus-past ascendancy-share signal; the
+      chart itself always shows the unadjusted poe.ninja observations.
       The expected price is a 70% historical-target / 30% capped current-trend
       blend in log-price space when the current curve is usable; otherwise the
       historical target stands alone. Missing estimates mean no exact

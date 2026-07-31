@@ -4,6 +4,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -204,6 +205,56 @@ class StorageTests(unittest.TestCase):
         self.assertIsNotNone(self.storage.last_sync_at(replacement.id))
         self.assertTrue(self.storage.healthcheck())
 
+    def test_latest_live_sync_window_prefers_newer_partial_run(self) -> None:
+        successful_run = self.storage.start_sync_run(self.league.id)
+        self.storage.finish_sync_run(
+            successful_run,
+            status="success",
+            rows_written=10,
+            snapshots_written=1,
+            message="complete fixture sync",
+            warnings=[],
+        )
+        partial_run = self.storage.start_sync_run(self.league.id)
+        self.storage.finish_sync_run(
+            partial_run,
+            status="partial",
+            rows_written=5,
+            snapshots_written=1,
+            message="partial fixture sync",
+            warnings=["SkillGem failed"],
+        )
+        with self.storage.transaction() as connection:
+            connection.execute(
+                """
+                UPDATE sync_runs
+                SET started_at = '2026-07-30T10:00:00Z',
+                    finished_at = '2026-07-30T10:05:00Z'
+                WHERE id = ?
+                """,
+                (successful_run,),
+            )
+            connection.execute(
+                """
+                UPDATE sync_runs
+                SET started_at = '2026-07-30T11:00:00Z',
+                    finished_at = '2026-07-30T11:05:00Z'
+                WHERE id = ?
+                """,
+                (partial_run,),
+            )
+
+        window = self.storage.latest_successful_sync_window(self.league.id)
+
+        self.assertEqual(
+            window,
+            {
+                "started_at": "2026-07-30T11:00:00Z",
+                "finished_at": "2026-07-30T11:05:00Z",
+                "status": "partial",
+            },
+        )
+
     def test_history_limit_keeps_the_newest_observations(self) -> None:
         start = datetime(2026, 1, 1, tzinfo=timezone.utc)
         points = [
@@ -279,6 +330,137 @@ class StorageTests(unittest.TestCase):
             "2026-07-30T12:00:00Z",
         )
 
+    def test_source_filters_are_applied_before_price_selection(self) -> None:
+        item_key = "currency:golden-fixture"
+        self.storage.insert_price_points(
+            [
+                PricePoint(
+                    league_id=self.league.id,
+                    item_key=item_key,
+                    name="Golden Fixture",
+                    category="Currency",
+                    source="poe.ninja",
+                    observed_at="2026-07-25T12:00:00Z",
+                    chaos_value=100.0,
+                    divine_value=1.0,
+                ),
+                PricePoint(
+                    league_id=self.league.id,
+                    item_key=item_key,
+                    name="Golden Fixture",
+                    category="Currency",
+                    source="untrusted",
+                    observed_at="2026-07-25T13:00:00Z",
+                    chaos_value=9900.0,
+                    divine_value=99.0,
+                ),
+            ]
+        )
+
+        histories = self.storage.item_histories(
+            self.league.id,
+            item_key=item_key,
+            sources=("poe.ninja",),
+        )
+        self.assertEqual(
+            [row["source"] for row in histories[item_key]],
+            ["poe.ninja"],
+        )
+        daily = self.storage.daily_item_history(
+            self.league.id,
+            item_key,
+            self.league.start_at,
+            minimum_confidence=0.0,
+            sources=("poe.ninja",),
+        )
+        self.assertEqual(daily[0]["divine_value"], 1.0)
+        latest = self.storage.latest_item_prices(
+            self.league.id,
+            sources=("poe.ninja",),
+        )
+        self.assertEqual(latest[item_key]["divine_value"], 1.0)
+
+        historical_league = League(
+            id="Golden History",
+            name="Golden History",
+            start_at="2025-01-01T20:00:00Z",
+        )
+        self.storage.upsert_league(historical_league, current=False)
+        self.storage.upsert_historical_assets(
+            [
+                {
+                    "source": source,
+                    "source_item_id": item_key,
+                    "item_key": item_key,
+                    "name": "Golden Fixture",
+                    "category": "Currency",
+                }
+                for source in ("poe.ninja-history", "poe.watch")
+            ]
+        )
+        seasonal_rows = []
+        for source, entry, exit_value in (
+            ("poe.ninja-history", 2.0, 3.0),
+            ("poe.watch", 200.0, 300.0),
+        ):
+            for league_day, value in ((1, entry), (8, exit_value)):
+                seasonal_rows.append(
+                    {
+                        "league_id": historical_league.id,
+                        "item_key": item_key,
+                        "source": source,
+                        "source_item_id": item_key,
+                        "league_day": league_day,
+                        "observed_at": historical_league.start_at,
+                        "divine_value": value,
+                        "confidence": 0.9,
+                    }
+                )
+        self.storage.upsert_seasonal_prices(seasonal_rows)
+
+        allowed = ("poe.ninja-history",)
+        curve = self.storage.seasonal_price_curve_rows(
+            item_key,
+            [historical_league.id],
+            sources=allowed,
+        )
+        self.assertEqual(
+            [row["divine_value"] for row in curve],
+            [2.0, 3.0],
+        )
+        lifecycle = self.storage.seasonal_lifecycle_rows(
+            [item_key],
+            [historical_league.id],
+            sources=allowed,
+        )
+        self.assertEqual(
+            [row["source"] for row in lifecycle],
+            ["poe.ninja-history", "poe.ninja-history"],
+        )
+        entry_rows = self.storage.seasonal_entry_rows(
+            1,
+            item_keys=[item_key],
+            sources=allowed,
+        )
+        self.assertEqual(entry_rows[0]["entry_divine"], 2.0)
+        return_rows = self.storage.seasonal_return_rows(
+            1,
+            7,
+            item_keys=[item_key],
+            sources=allowed,
+        )
+        self.assertEqual(len(return_rows), 1)
+        self.assertAlmostEqual(return_rows[0]["forward_return"], 0.5)
+
+        self.assertEqual(
+            self.storage.item_histories(self.league.id, sources=()),
+            {},
+        )
+        self.assertEqual(
+            self.storage.seasonal_entry_rows(1, sources=()),
+            [],
+        )
+
     def test_daily_and_seasonal_curves_are_exact_confident_daily_points(
         self,
     ) -> None:
@@ -338,7 +520,7 @@ class StorageTests(unittest.TestCase):
         )
         self.assertEqual(
             [(row["league_day"], row["divine_value"]) for row in daily],
-            [(1, 32.0), (2, 35.0)],
+            [(1, 30.0), (2, 35.0)],
         )
         unfiltered_daily = self.storage.daily_item_history(
             self.league.id,
@@ -355,7 +537,7 @@ class StorageTests(unittest.TestCase):
                 )
                 for row in unfiltered_daily
             ],
-            [(1, 99.0, 0.49), (2, 35.0, 0.7)],
+            [(1, 30.0, 0.8), (2, 35.0, 0.7)],
         )
 
         self.storage.upsert_league(
@@ -455,7 +637,7 @@ class StorageTests(unittest.TestCase):
             ],
         )
 
-    def test_v3_schema_migrates_an_existing_database_idempotently(self) -> None:
+    def test_v4_schema_migrates_an_existing_database_idempotently(self) -> None:
         legacy_path = Path(self.temporary_directory.name) / "legacy-v1.sqlite3"
         connection = sqlite3.connect(legacy_path)
         try:
@@ -486,13 +668,15 @@ class StorageTests(unittest.TestCase):
         finally:
             connection.close()
 
-        self.assertEqual(version, 3)
+        self.assertEqual(version, 4)
         self.assertEqual(marker, "preserved")
         self.assertTrue(
             {
                 "historical_assets",
                 "historical_fetch_state",
                 "seasonal_prices",
+                "compact_seasonal_prices",
+                "compact_seasonal_prices_staging",
                 "meta_class_snapshots",
             }.issubset(tables)
         )
@@ -788,6 +972,173 @@ class StorageTests(unittest.TestCase):
         filtered_status = self.storage.status_counts(self.league.id)
         self.assertEqual(filtered_status["seasonal_prices"], 5)
         self.assertEqual(filtered_status["historical_leagues"], 2)
+
+    def test_compact_conversion_is_exact_additive_and_uses_item_day_index(
+        self,
+    ) -> None:
+        historical = League(
+            id="Golden Compact",
+            name="Golden Compact",
+            start_at="2025-01-01T00:00:00Z",
+        )
+        self.storage.upsert_league(historical, current=False)
+        assets = [
+            {
+                "source": "poe.ninja-history",
+                "source_item_id": "golden-1",
+                "item_key": "currency:golden-orb",
+                "name": "Golden Orb",
+                "category": "Currency",
+                "eligible": True,
+            },
+            {
+                "source": "poe.ninja-history",
+                "source_item_id": "archive-1",
+                "item_key": "currency:archive-only-orb",
+                "name": "Archive-only Orb",
+                "category": "Currency",
+                "eligible": False,
+            },
+        ]
+        self.storage.upsert_historical_assets(assets)
+        rows = [
+            {
+                "league_id": historical.id,
+                "item_key": "currency:golden-orb",
+                "source": "poe.ninja-history",
+                "source_item_id": "golden-1",
+                "league_day": day,
+                "observed_at": f"2025-01-{day:02d}T00:00:00Z",
+                "chaos_value": chaos,
+                "divine_value": divine,
+                "confidence": confidence,
+            }
+            for day, chaos, divine, confidence in (
+                (1, 100.0, 1.0, 0.9),
+                (8, 150.0, 1.5, 0.8),
+            )
+        ]
+        rows.append(
+            {
+                "league_id": historical.id,
+                "item_key": "currency:archive-only-orb",
+                "source": "poe.ninja-history",
+                "source_item_id": "archive-1",
+                "league_day": 1,
+                "observed_at": "2025-01-01T00:00:00Z",
+                "chaos_value": 10.0,
+                "divine_value": 0.1,
+                "confidence": 0.7,
+            }
+        )
+        self.storage.upsert_seasonal_prices(rows)
+
+        allowed = ("poe.ninja-history",)
+        before_curve = self.storage.seasonal_price_curve_rows(
+            "currency:golden-orb",
+            [historical.id],
+            minimum_confidence=0.0,
+            sources=allowed,
+        )
+        before_lifecycle = self.storage.seasonal_lifecycle_rows(
+            ["currency:golden-orb"],
+            [historical.id],
+            minimum_confidence=0.0,
+            sources=allowed,
+        )
+        before_entry = self.storage.seasonal_entry_rows(
+            1,
+            item_keys=["currency:golden-orb"],
+            minimum_confidence=0.0,
+            sources=allowed,
+        )
+        before_return = self.storage.seasonal_return_rows(
+            1,
+            7,
+            item_keys=["currency:golden-orb"],
+            sources=allowed,
+        )
+
+        converted = self.storage.compact_official_history_from_full()
+
+        self.assertEqual(converted["leagues_converted"], 1)
+        self.assertEqual(converted["source_rows_read"], 2)
+        self.assertEqual(converted["stored_rows"], 2)
+        counts = self.storage.seasonal_price_storage_counts(historical.id)
+        self.assertEqual(counts["full"], 3)
+        self.assertEqual(counts["compact"], 2)
+        self.assertEqual(counts["effective"], 2)
+        self.assertEqual(counts["storage_mode"], "compact")
+
+        self.assertEqual(
+            self.storage.seasonal_price_curve_rows(
+                "currency:golden-orb",
+                [historical.id],
+                minimum_confidence=0.0,
+                sources=allowed,
+            ),
+            before_curve,
+        )
+        self.assertEqual(
+            self.storage.seasonal_lifecycle_rows(
+                ["currency:golden-orb"],
+                [historical.id],
+                minimum_confidence=0.0,
+                sources=allowed,
+            ),
+            before_lifecycle,
+        )
+        self.assertEqual(
+            self.storage.seasonal_entry_rows(
+                1,
+                item_keys=["currency:golden-orb"],
+                minimum_confidence=0.0,
+                sources=allowed,
+            ),
+            before_entry,
+        )
+        self.assertEqual(
+            self.storage.seasonal_return_rows(
+                1,
+                7,
+                item_keys=["currency:golden-orb"],
+                sources=allowed,
+            ),
+            before_return,
+        )
+        self.assertEqual(
+            self.storage.seasonal_price_curve_rows(
+                "currency:archive-only-orb",
+                [historical.id],
+                minimum_confidence=0.0,
+                sources=allowed,
+            ),
+            [],
+        )
+        status = self.storage.seasonal_status_counts()
+        self.assertEqual(status["seasonal_prices"], 2)
+        self.assertEqual(status["compact_seasonal_prices"], 2)
+
+        with closing(self.storage.connect()) as connection:
+            plan = connection.execute(
+                """
+                EXPLAIN QUERY PLAN
+                SELECT divine_value
+                FROM seasonal_price_rows
+                WHERE item_key = ? AND league_day = ? AND source = ?
+                """,
+                (
+                    "currency:golden-orb",
+                    1,
+                    "poe.ninja-history",
+                ),
+            ).fetchall()
+        details = " ".join(str(row[3]) for row in plan)
+        self.assertIn("ix_compact_seasonal_item_day_league", details)
+
+        rerun = self.storage.compact_official_history_from_full()
+        self.assertEqual(rerun["leagues_skipped"], 1)
+        self.assertEqual(rerun["leagues_converted"], 0)
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 from .historical import COMPLETED_LEAGUES
+from .provenance import HISTORICAL_PRICE_SOURCES
 from .storage import Storage
 
 
@@ -217,12 +218,14 @@ class SeasonalModel:
             # poe.ninja universe is larger than that, the indexed day/horizon
             # join is cheaper and safer than a giant IN clause.
             item_keys=query_keys,
+            sources=HISTORICAL_PRICE_SOURCES,
         )
         grouped = _group_return_rows(rows)
         level_grouped = _group_entry_rows(
             self.storage.seasonal_entry_rows(
                 day,
                 item_keys=query_keys,
+                sources=HISTORICAL_PRICE_SOURCES,
             )
         )
         if hold == self.APPRECIATION_HORIZON_DAYS:
@@ -233,6 +236,7 @@ class SeasonalModel:
                     day,
                     self.APPRECIATION_HORIZON_DAYS,
                     item_keys=query_keys,
+                    sources=HISTORICAL_PRICE_SOURCES,
                 )
             )
 

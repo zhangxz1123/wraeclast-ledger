@@ -4,12 +4,15 @@ import gzip
 import hashlib
 import json
 import math
+import os
 import sqlite3
 from contextlib import closing, contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
 from .models import League, PricePoint, iso_utc
+from .provenance import normalize_source_filter
 
 
 SCHEMA = """
@@ -190,6 +193,106 @@ ON seasonal_prices(league_id, league_day, item_key);
 CREATE INDEX IF NOT EXISTS ix_seasonal_source_item_day
 ON seasonal_prices(source, source_item_id, league_day);
 
+-- GitHub-hosted updates use this integer-keyed representation for immutable
+-- poe.ninja completed-league rows.  The normal local importer continues to
+-- populate seasonal_prices, which intentionally remains the richer research
+-- archive.  Keeping strings in three small dictionaries makes the hosted
+-- price table practical on GitHub's standard 14 GB runner.
+CREATE TABLE IF NOT EXISTS compact_seasonal_leagues (
+    id INTEGER PRIMARY KEY,
+    league_id TEXT NOT NULL UNIQUE
+);
+
+CREATE TABLE IF NOT EXISTS compact_seasonal_items (
+    id INTEGER PRIMARY KEY,
+    item_key TEXT NOT NULL UNIQUE
+);
+
+CREATE TABLE IF NOT EXISTS compact_seasonal_source_items (
+    id INTEGER PRIMARY KEY,
+    source_item_id TEXT NOT NULL UNIQUE
+);
+
+CREATE TABLE IF NOT EXISTS compact_seasonal_prices (
+    league_key INTEGER NOT NULL,
+    item_key INTEGER NOT NULL,
+    source_item_key INTEGER NOT NULL,
+    league_day INTEGER NOT NULL CHECK(league_day >= 1),
+    observed_epoch INTEGER NOT NULL CHECK(observed_epoch >= 0),
+    chaos_value REAL,
+    divine_value REAL NOT NULL CHECK(divine_value > 0),
+    confidence REAL NOT NULL DEFAULT 0.5,
+    PRIMARY KEY(league_key, item_key, league_day),
+    FOREIGN KEY (league_key) REFERENCES compact_seasonal_leagues(id),
+    FOREIGN KEY (item_key) REFERENCES compact_seasonal_items(id),
+    FOREIGN KEY (source_item_key)
+        REFERENCES compact_seasonal_source_items(id)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS ix_compact_seasonal_item_day_league
+ON compact_seasonal_prices(item_key, league_day, league_key);
+
+-- One league is staged at a time and promoted atomically.  A failed or
+-- cancelled dump import therefore cannot replace the last good compact curve.
+CREATE TABLE IF NOT EXISTS compact_seasonal_prices_staging (
+    league_key INTEGER NOT NULL,
+    item_key INTEGER NOT NULL,
+    source_item_key INTEGER NOT NULL,
+    league_day INTEGER NOT NULL CHECK(league_day >= 1),
+    observed_epoch INTEGER NOT NULL CHECK(observed_epoch >= 0),
+    chaos_value REAL,
+    divine_value REAL NOT NULL CHECK(divine_value > 0),
+    confidence REAL NOT NULL DEFAULT 0.5,
+    PRIMARY KEY(league_key, item_key, league_day),
+    FOREIGN KEY (league_key) REFERENCES compact_seasonal_leagues(id),
+    FOREIGN KEY (item_key) REFERENCES compact_seasonal_items(id),
+    FOREIGN KEY (source_item_key)
+        REFERENCES compact_seasonal_source_items(id)
+) WITHOUT ROWID;
+
+-- Query code reads one relation in either storage mode.  If compact rows are
+-- present for an official-history league they are authoritative for that
+-- league; unrelated legacy providers and full local leagues remain visible.
+CREATE VIEW IF NOT EXISTS seasonal_price_rows AS
+SELECT league_id, item_key, source, source_item_id, league_day, observed_at,
+       chaos_value, divine_value, volume, confidence, snapshot_id,
+       details_json, updated_at
+FROM seasonal_prices AS full_price
+WHERE full_price.source <> 'poe.ninja-history'
+   OR NOT EXISTS (
+       SELECT 1
+       FROM compact_seasonal_prices AS compact_price
+       JOIN compact_seasonal_leagues AS compact_league
+         ON compact_league.id = compact_price.league_key
+       WHERE compact_league.league_id = full_price.league_id
+       LIMIT 1
+   )
+UNION ALL
+SELECT compact_league.league_id,
+       compact_item.item_key,
+       'poe.ninja-history' AS source,
+       compact_source.source_item_id,
+       compact_price.league_day,
+       strftime(
+           '%Y-%m-%dT%H:%M:%SZ', compact_price.observed_epoch, 'unixepoch'
+       ) AS observed_at,
+       compact_price.chaos_value,
+       compact_price.divine_value,
+       NULL AS volume,
+       compact_price.confidence,
+       NULL AS snapshot_id,
+       '{}' AS details_json,
+       strftime(
+           '%Y-%m-%dT%H:%M:%SZ', compact_price.observed_epoch, 'unixepoch'
+       ) AS updated_at
+FROM compact_seasonal_prices AS compact_price
+JOIN compact_seasonal_leagues AS compact_league
+  ON compact_league.id = compact_price.league_key
+JOIN compact_seasonal_items AS compact_item
+  ON compact_item.id = compact_price.item_key
+JOIN compact_seasonal_source_items AS compact_source
+  ON compact_source.id = compact_price.source_item_key;
+
 CREATE TABLE IF NOT EXISTS meta_class_snapshots (
     league_id TEXT NOT NULL,
     observed_at TEXT NOT NULL,
@@ -208,7 +311,7 @@ CREATE TABLE IF NOT EXISTS meta_class_snapshots (
 CREATE INDEX IF NOT EXISTS ix_meta_class_latest
 ON meta_class_snapshots(league_id, source, observed_at DESC);
 
-PRAGMA user_version = 3;
+PRAGMA user_version = 4;
 """
 
 
@@ -219,8 +322,23 @@ class Storage:
     HTTP server. SQLite WAL mode keeps reads responsive while a sync writes.
     """
 
-    def __init__(self, path: str | Path):
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        compact_history: bool | None = None,
+    ):
         self.path = Path(path).expanduser().resolve()
+        if compact_history is None:
+            compact_history = str(
+                os.environ.get("POE_ADVISOR_COMPACT_HISTORY", "")
+            ).strip().casefold() in {"1", "true", "yes", "on"}
+        self.compact_history_mode = bool(compact_history)
+        self._compact_dimension_cache: dict[str, dict[str, int]] = {
+            "league": {},
+            "item": {},
+            "source_item": {},
+        }
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.initialize()
 
@@ -600,6 +718,25 @@ class Storage:
             ).fetchone()
         return dict(row) if row else None
 
+    def latest_source_success_at(
+        self,
+        source: str,
+        league_id: str,
+    ) -> str | None:
+        """Return the newest successful endpoint verification for a source."""
+
+        with closing(self.connect()) as connection:
+            row = connection.execute(
+                """
+                SELECT MAX(last_success_at) AS last_success_at
+                FROM source_state
+                WHERE source = ? AND league_id = ?
+                  AND last_success_at IS NOT NULL
+                """,
+                (str(source), str(league_id)),
+            ).fetchone()
+        return str(row["last_success_at"]) if row and row["last_success_at"] else None
+
     def list_source_summaries(self) -> list[dict[str, Any]]:
         with closing(self.connect()) as connection:
             rows = connection.execute(
@@ -666,12 +803,21 @@ class Storage:
         *,
         days: int = 90,
         item_key: str | None = None,
+        sources: Iterable[str] | str | None = None,
     ) -> dict[str, list[dict[str, Any]]]:
         parameters: list[Any] = [league_id, f"-{max(1, days)} days"]
         key_clause = ""
         if item_key:
             key_clause = "AND item_key = ?"
             parameters.append(item_key)
+        allowed_sources = normalize_source_filter(sources)
+        if allowed_sources == ():
+            return {}
+        source_clause = ""
+        if allowed_sources is not None:
+            placeholders = ",".join("?" for _ in allowed_sources)
+            source_clause = f"AND source IN ({placeholders})"
+            parameters.extend(allowed_sources)
         query = f"""
             SELECT item_key, name, category, observed_at, chaos_value,
                    divine_value, listing_count, volume, confidence, source,
@@ -680,6 +826,7 @@ class Storage:
             WHERE league_id = ?
               AND observed_at >= datetime('now', ?)
               {key_clause}
+              {source_clause}
             ORDER BY item_key, observed_at ASC,
                      CASE source
                          WHEN 'poe.ninja' THEN 0
@@ -707,22 +854,38 @@ class Storage:
         return grouped
 
     def all_time_item_history(
-        self, league_id: str, item_key: str, limit: int = 1000
+        self,
+        league_id: str,
+        item_key: str,
+        limit: int = 1000,
+        *,
+        sources: Iterable[str] | str | None = None,
     ) -> list[dict[str, Any]]:
+        allowed_sources = normalize_source_filter(sources)
+        if allowed_sources == ():
+            return []
+        source_clause = ""
+        parameters: list[Any] = [league_id, item_key]
+        if allowed_sources is not None:
+            placeholders = ",".join("?" for _ in allowed_sources)
+            source_clause = f"AND source IN ({placeholders})"
+            parameters.extend(allowed_sources)
+        parameters.append(max(1, min(limit, 10000)))
         with closing(self.connect()) as connection:
             rows = connection.execute(
-                """
+                f"""
                 SELECT * FROM (
                     SELECT observed_at, divine_value, chaos_value,
                            listing_count, volume, source, confidence
                     FROM price_points
                     WHERE league_id = ? AND item_key = ?
+                      {source_clause}
                     ORDER BY observed_at DESC
                     LIMIT ?
                 )
                 ORDER BY observed_at ASC
                 """,
-                (league_id, item_key, max(1, min(limit, 10000))),
+                parameters,
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -733,6 +896,7 @@ class Storage:
         league_start_at: str | None,
         *,
         minimum_confidence: float = 0.5,
+        sources: Iterable[str] | str | None = None,
     ) -> list[dict[str, Any]]:
         """Return one exact observed current-league price per league day.
 
@@ -745,20 +909,29 @@ class Storage:
         if not league_start_at:
             return []
         confidence_floor = max(0.0, min(1.0, float(minimum_confidence)))
+        allowed_sources = normalize_source_filter(sources)
+        if allowed_sources == ():
+            return []
+        source_clause = ""
+        source_parameters: list[Any] = []
+        if allowed_sources is not None:
+            placeholders = ",".join("?" for _ in allowed_sources)
+            source_clause = f"AND source IN ({placeholders})"
+            source_parameters.extend(allowed_sources)
         with closing(self.connect()) as connection:
             rows = connection.execute(
-                """
+                f"""
                 WITH eligible AS (
                     SELECT observed_at, divine_value, chaos_value,
                            listing_count, volume, source, confidence,
                            CAST(
-                               julianday(observed_at)
-                               - julianday(?) AS INTEGER
+                               julianday(date(observed_at))
+                               - julianday(date(?)) AS INTEGER
                            ) + 1 AS league_day,
                            ROW_NUMBER() OVER (
                                PARTITION BY CAST(
-                                   julianday(observed_at)
-                                   - julianday(?) AS INTEGER
+                                   julianday(date(observed_at))
+                                   - julianday(date(?)) AS INTEGER
                                )
                                ORDER BY observed_at DESC,
                                         CASE source
@@ -773,7 +946,8 @@ class Storage:
                       AND item_key = ?
                       AND confidence >= ?
                       AND divine_value > 0
-                      AND julianday(observed_at) >= julianday(?)
+                      AND date(observed_at) >= date(?)
+                      {source_clause}
                 )
                 SELECT league_day, observed_at, divine_value, chaos_value,
                        listing_count, volume, source, confidence
@@ -789,6 +963,7 @@ class Storage:
                     item_key,
                     confidence_floor,
                     league_start_at,
+                    *source_parameters,
                 ),
             ).fetchall()
         return [dict(row) for row in rows]
@@ -799,6 +974,7 @@ class Storage:
         league_ids: Iterable[str],
         *,
         minimum_confidence: float = 0.5,
+        sources: Iterable[str] | str | None = None,
     ) -> list[dict[str, Any]]:
         """Return exact daily completed-league prices for one item.
 
@@ -816,6 +992,9 @@ class Storage:
         )
         if not leagues:
             return []
+        allowed_sources = normalize_source_filter(sources)
+        if allowed_sources == ():
+            return []
         confidence_floor = max(0.0, min(1.0, float(minimum_confidence)))
         placeholders = ",".join("?" for _ in leagues)
         parameters: list[Any] = [
@@ -823,6 +1002,11 @@ class Storage:
             confidence_floor,
             *leagues,
         ]
+        source_clause = ""
+        if allowed_sources is not None:
+            source_placeholders = ",".join("?" for _ in allowed_sources)
+            source_clause = f"AND price.source IN ({source_placeholders})"
+            parameters.extend(allowed_sources)
         with closing(self.connect()) as connection:
             rows = connection.execute(
                 f"""
@@ -846,13 +1030,14 @@ class Storage:
                                         price.source,
                                         price.source_item_id
                            ) AS preference_rank
-                    FROM seasonal_prices AS price
+                    FROM seasonal_price_rows AS price
                     LEFT JOIN leagues
                       ON leagues.id = price.league_id
                     WHERE price.item_key = ?
                       AND price.confidence >= ?
                       AND price.divine_value > 0
                       AND price.league_id IN ({placeholders})
+                      {source_clause}
                 )
                 SELECT league_id, league_name, league_start_at, league_day,
                        observed_at, divine_value, chaos_value, volume, source,
@@ -873,20 +1058,21 @@ class Storage:
         minimum_league_day: int = 1,
         maximum_league_day: int = 120,
         minimum_confidence: float = 0.0,
+        sources: Iterable[str] | str | None = None,
     ) -> list[dict[str, Any]]:
         """Return one preferred daily bar per item and completed league.
 
         Lifecycle classification needs the whole curve for many current items.
-        Querying all requested leagues once is substantially faster than one
-        SQLite query per item. The result is filtered to ``item_keys`` in
-        Python so a large live catalog cannot exceed SQLite's parameter limit.
+        Item keys are pushed into SQLite in bounded batches so archive-only
+        rows never enter Python memory and a large live catalog cannot exceed
+        SQLite's parameter limit.
         """
 
-        keys = {
+        keys = sorted({
             str(item_key).strip()
             for item_key in item_keys
             if str(item_key).strip()
-        }
+        })
         leagues = list(
             dict.fromkeys(
                 str(league_id).strip()
@@ -896,63 +1082,80 @@ class Storage:
         )
         if not keys or not leagues:
             return []
+        allowed_sources = normalize_source_filter(sources)
+        if allowed_sources == ():
+            return []
         first_day = max(1, int(minimum_league_day))
         last_day = max(first_day, int(maximum_league_day))
         confidence_floor = max(0.0, min(1.0, float(minimum_confidence)))
-        placeholders = ",".join("?" for _ in leagues)
-        parameters: list[Any] = [
-            first_day,
-            last_day,
-            confidence_floor,
-            *leagues,
-        ]
+        league_placeholders = ",".join("?" for _ in leagues)
+        source_clause = ""
+        if allowed_sources is not None:
+            source_placeholders = ",".join("?" for _ in allowed_sources)
+            source_clause = f"AND price.source IN ({source_placeholders})"
+        rows: list[sqlite3.Row] = []
         with closing(self.connect()) as connection:
-            rows = connection.execute(
-                f"""
-                WITH ranked AS (
-                    SELECT price.item_key,
-                           price.league_id,
-                           COALESCE(leagues.name, price.league_id)
-                               AS league_name,
-                           leagues.start_at AS league_start_at,
-                           price.league_day,
-                           price.observed_at,
-                           price.divine_value,
-                           price.chaos_value,
-                           price.volume,
-                           price.source,
-                           price.source_item_id,
-                           price.confidence,
-                           ROW_NUMBER() OVER (
-                               PARTITION BY price.item_key, price.league_id,
-                                            price.league_day
-                               ORDER BY price.confidence DESC,
-                                        price.updated_at DESC,
-                                        price.source,
-                                        price.source_item_id
-                           ) AS preference_rank
-                    FROM seasonal_prices AS price
-                    LEFT JOIN leagues
-                      ON leagues.id = price.league_id
-                    WHERE price.league_day BETWEEN ? AND ?
-                      AND price.confidence >= ?
-                      AND price.divine_value > 0
-                      AND price.league_id IN ({placeholders})
+            for offset in range(0, len(keys), 400):
+                key_batch = keys[offset : offset + 400]
+                key_placeholders = ",".join("?" for _ in key_batch)
+                parameters: list[Any] = [
+                    first_day,
+                    last_day,
+                    confidence_floor,
+                    *key_batch,
+                    *leagues,
+                ]
+                if allowed_sources is not None:
+                    parameters.extend(allowed_sources)
+                rows.extend(
+                    connection.execute(
+                        f"""
+                        WITH ranked AS (
+                            SELECT price.item_key,
+                                   price.league_id,
+                                   COALESCE(leagues.name, price.league_id)
+                                       AS league_name,
+                                   leagues.start_at AS league_start_at,
+                                   price.league_day,
+                                   price.observed_at,
+                                   price.divine_value,
+                                   price.chaos_value,
+                                   price.volume,
+                                   price.source,
+                                   price.source_item_id,
+                                   price.confidence,
+                                   ROW_NUMBER() OVER (
+                                       PARTITION BY price.item_key,
+                                                    price.league_id,
+                                                    price.league_day
+                                       ORDER BY price.confidence DESC,
+                                                price.updated_at DESC,
+                                                price.source,
+                                                price.source_item_id
+                                   ) AS preference_rank
+                            FROM seasonal_price_rows AS price
+                            LEFT JOIN leagues
+                              ON leagues.id = price.league_id
+                            WHERE price.league_day BETWEEN ? AND ?
+                              AND price.confidence >= ?
+                              AND price.divine_value > 0
+                              AND price.item_key IN ({key_placeholders})
+                              AND price.league_id IN ({league_placeholders})
+                              {source_clause}
+                        )
+                        SELECT item_key, league_id, league_name,
+                               league_start_at, league_day, observed_at,
+                               divine_value, chaos_value, volume, source,
+                               source_item_id, confidence
+                        FROM ranked
+                        WHERE preference_rank = 1
+                        ORDER BY item_key, league_start_at, league_id,
+                                 league_day
+                        """,
+                        parameters,
+                    ).fetchall()
                 )
-                SELECT item_key, league_id, league_name, league_start_at,
-                       league_day, observed_at, divine_value, chaos_value,
-                       volume, source, source_item_id, confidence
-                FROM ranked
-                WHERE preference_rank = 1
-                ORDER BY item_key, league_start_at, league_id, league_day
-                """,
-                parameters,
-            ).fetchall()
-        return [
-            dict(row)
-            for row in rows
-            if str(row["item_key"]) in keys
-        ]
+        return [dict(row) for row in rows]
 
     def current_item_history_archive(
         self,
@@ -972,7 +1175,7 @@ class Storage:
                 """
                 SELECT id, fetched_at, endpoint, metadata_json
                 FROM raw_snapshots
-                WHERE source = 'poe.watch'
+                WHERE source = 'poe.ninja'
                   AND league_id = ?
                   AND category = 'current-item-history'
                 ORDER BY fetched_at DESC, id DESC
@@ -995,23 +1198,41 @@ class Storage:
             }
         return None
 
-    def item_metadata(self, league_id: str, item_key: str) -> dict[str, Any] | None:
+    def item_metadata(
+        self,
+        league_id: str,
+        item_key: str,
+        *,
+        sources: Iterable[str] | str | None = None,
+    ) -> dict[str, Any] | None:
+        allowed_sources = normalize_source_filter(sources)
+        if allowed_sources == ():
+            return None
+        source_clause = ""
+        parameters: list[Any] = [league_id, item_key]
+        if allowed_sources is not None:
+            placeholders = ",".join("?" for _ in allowed_sources)
+            source_clause = f"AND source IN ({placeholders})"
+            parameters.extend(allowed_sources)
         with closing(self.connect()) as connection:
             row = connection.execute(
-                """
+                f"""
                 SELECT item_key, name, category
                 FROM price_points
                 WHERE league_id = ? AND item_key = ?
+                  {source_clause}
                 ORDER BY observed_at DESC
                 LIMIT 1
                 """,
-                (league_id, item_key),
+                parameters,
             ).fetchone()
         return dict(row) if row else None
 
     def latest_item_prices(
         self,
         league_id: str,
+        *,
+        sources: Iterable[str] | str | None = None,
     ) -> dict[str, dict[str, Any]]:
         """Return the newest exact-key price for every item in one league.
 
@@ -1020,13 +1241,27 @@ class Storage:
         Standard without fuzzy-name joins that could mix variants.
         """
 
+        allowed_sources = normalize_source_filter(sources)
+        if allowed_sources == ():
+            return {}
+        newest_source_clause = ""
+        point_source_clause = ""
+        newest_source_parameters: list[Any] = []
+        point_source_parameters: list[Any] = []
+        if allowed_sources is not None:
+            placeholders = ",".join("?" for _ in allowed_sources)
+            newest_source_clause = f"AND source IN ({placeholders})"
+            point_source_clause = f"AND point.source IN ({placeholders})"
+            newest_source_parameters.extend(allowed_sources)
+            point_source_parameters.extend(allowed_sources)
         with closing(self.connect()) as connection:
             rows = connection.execute(
-                """
+                f"""
                 WITH newest AS (
                     SELECT item_key, MAX(observed_at) AS observed_at
                     FROM price_points
                     WHERE league_id = ?
+                      {newest_source_clause}
                     GROUP BY item_key
                 )
                 SELECT point.item_key, point.name, point.category,
@@ -1038,6 +1273,7 @@ class Storage:
                   ON newest.item_key = point.item_key
                  AND newest.observed_at = point.observed_at
                 WHERE point.league_id = ?
+                  {point_source_clause}
                 ORDER BY point.item_key,
                          CASE point.source
                              WHEN 'poe.ninja' THEN 0
@@ -1046,7 +1282,12 @@ class Storage:
                          END,
                          point.id DESC
                 """,
-                (league_id, league_id),
+                (
+                    league_id,
+                    *newest_source_parameters,
+                    league_id,
+                    *point_source_parameters,
+                ),
             ).fetchall()
         latest: dict[str, dict[str, Any]] = {}
         for row in rows:
@@ -1288,16 +1529,400 @@ class Storage:
                     snapshot_id = excluded.snapshot_id,
                     details_json = excluded.details_json,
                     updated_at = excluded.updated_at
+                WHERE excluded.confidence >= seasonal_prices.confidence
                 """,
                 rows,
             )
             return connection.total_changes - before
+
+    @staticmethod
+    def _compact_epoch(value: Any) -> int:
+        text = str(value or "").strip()
+        if not text:
+            raise ValueError("Compact seasonal price observed_at must be non-empty")
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError as error:
+            raise ValueError(
+                f"Invalid compact seasonal observed_at {text!r}"
+            ) from error
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return int(parsed.astimezone(timezone.utc).timestamp())
+
+    def _compact_dimension_ids(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        table: str,
+        column: str,
+        cache_name: str,
+        values: Iterable[str],
+    ) -> dict[str, int]:
+        """Resolve compact dictionary IDs without one query per price row."""
+
+        cache = self._compact_dimension_cache[cache_name]
+        requested = list(dict.fromkeys(str(value) for value in values))
+        missing = [value for value in requested if value not in cache]
+        for offset in range(0, len(missing), 400):
+            batch = missing[offset : offset + 400]
+            placeholders = ",".join("?" for _ in batch)
+            for row in connection.execute(
+                f"SELECT id, {column} FROM {table} "
+                f"WHERE {column} IN ({placeholders})",
+                batch,
+            ):
+                cache[str(row[column])] = int(row["id"])
+        missing = [value for value in requested if value not in cache]
+        if missing:
+            connection.executemany(
+                f"INSERT OR IGNORE INTO {table}({column}) VALUES (?)",
+                ((value,) for value in missing),
+            )
+            for offset in range(0, len(missing), 400):
+                batch = missing[offset : offset + 400]
+                placeholders = ",".join("?" for _ in batch)
+                for row in connection.execute(
+                    f"SELECT id, {column} FROM {table} "
+                    f"WHERE {column} IN ({placeholders})",
+                    batch,
+                ):
+                    cache[str(row[column])] = int(row["id"])
+        unresolved = [value for value in requested if value not in cache]
+        if unresolved:
+            raise RuntimeError(
+                f"Could not resolve compact {cache_name} IDs: {unresolved[:3]}"
+            )
+        return {value: cache[value] for value in requested}
+
+    def upsert_compact_seasonal_prices(
+        self,
+        prices: Iterable[dict[str, Any]],
+        *,
+        staging: bool = True,
+    ) -> int:
+        """Store golden completed-league rows in the hosted compact format.
+
+        Only official poe.ninja history (or its private staging source) is
+        accepted because the physical row deliberately omits a repeated source
+        string.  Callers must omit archive-only identities; the full local
+        importer remains responsible for retaining those research rows.
+        """
+
+        normalized: list[dict[str, Any]] = []
+        for raw in prices:
+            source = str(raw.get("source") or "").strip()
+            if source != "poe.ninja-history" and not source.startswith(
+                "poe.ninja-history-staging-"
+            ):
+                raise ValueError(
+                    "Compact seasonal storage accepts only poe.ninja-history"
+                )
+            league_id = str(raw.get("league_id") or "").strip()
+            item_key = str(raw.get("item_key") or "").strip()
+            source_item_id = str(raw.get("source_item_id") or "").strip()
+            if not league_id or not item_key or not source_item_id:
+                raise ValueError(
+                    "Compact seasonal league/item/source-item IDs are required"
+                )
+            league_day = int(raw.get("league_day") or 0)
+            divine_value = float(raw["divine_value"])
+            if league_day < 1 or divine_value <= 0:
+                raise ValueError(
+                    "Compact seasonal day and Divine value must be positive"
+                )
+            chaos = raw.get("chaos_value")
+            normalized.append(
+                {
+                    "league_id": league_id,
+                    "item_key": item_key,
+                    "source_item_id": source_item_id,
+                    "league_day": league_day,
+                    "observed_epoch": self._compact_epoch(raw.get("observed_at")),
+                    "chaos_value": float(chaos) if chaos is not None else None,
+                    "divine_value": divine_value,
+                    "confidence": max(
+                        0.0, min(1.0, float(raw.get("confidence", 0.5)))
+                    ),
+                }
+            )
+        if not normalized:
+            return 0
+
+        target = (
+            "compact_seasonal_prices_staging"
+            if staging
+            else "compact_seasonal_prices"
+        )
+        with self.transaction() as connection:
+            leagues = self._compact_dimension_ids(
+                connection,
+                table="compact_seasonal_leagues",
+                column="league_id",
+                cache_name="league",
+                values=(row["league_id"] for row in normalized),
+            )
+            items = self._compact_dimension_ids(
+                connection,
+                table="compact_seasonal_items",
+                column="item_key",
+                cache_name="item",
+                values=(row["item_key"] for row in normalized),
+            )
+            source_items = self._compact_dimension_ids(
+                connection,
+                table="compact_seasonal_source_items",
+                column="source_item_id",
+                cache_name="source_item",
+                values=(row["source_item_id"] for row in normalized),
+            )
+            before = connection.total_changes
+            connection.executemany(
+                f"""
+                INSERT INTO {target}(
+                    league_key, item_key, source_item_key, league_day,
+                    observed_epoch, chaos_value, divine_value, confidence
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(league_key, item_key, league_day) DO UPDATE SET
+                    source_item_key = excluded.source_item_key,
+                    observed_epoch = excluded.observed_epoch,
+                    chaos_value = excluded.chaos_value,
+                    divine_value = excluded.divine_value,
+                    confidence = excluded.confidence
+                WHERE excluded.confidence >= {target}.confidence
+                """,
+                (
+                    (
+                        leagues[row["league_id"]],
+                        items[row["item_key"]],
+                        source_items[row["source_item_id"]],
+                        row["league_day"],
+                        row["observed_epoch"],
+                        row["chaos_value"],
+                        row["divine_value"],
+                        row["confidence"],
+                    )
+                    for row in normalized
+                ),
+            )
+            return connection.total_changes - before
+
+    def clear_compact_seasonal_staging(self, league_id: str) -> int:
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                """
+                DELETE FROM compact_seasonal_prices_staging
+                WHERE league_key = (
+                    SELECT id FROM compact_seasonal_leagues
+                    WHERE league_id = ?
+                )
+                """,
+                (str(league_id),),
+            )
+            return max(0, int(cursor.rowcount))
+
+    def promote_compact_seasonal_prices(self, league_id: str) -> int:
+        """Atomically replace one compact production league from staging."""
+
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT id FROM compact_seasonal_leagues WHERE league_id = ?",
+                (str(league_id),),
+            ).fetchone()
+            if row is None:
+                return 0
+            league_key = int(row[0])
+            staged = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM compact_seasonal_prices_staging
+                    WHERE league_key = ?
+                    """,
+                    (league_key,),
+                ).fetchone()[0]
+            )
+            if staged <= 0:
+                return 0
+            connection.execute(
+                "DELETE FROM compact_seasonal_prices WHERE league_key = ?",
+                (league_key,),
+            )
+            connection.execute(
+                """
+                INSERT INTO compact_seasonal_prices(
+                    league_key, item_key, source_item_key, league_day,
+                    observed_epoch, chaos_value, divine_value, confidence
+                )
+                SELECT league_key, item_key, source_item_key, league_day,
+                       observed_epoch, chaos_value, divine_value, confidence
+                FROM compact_seasonal_prices_staging
+                WHERE league_key = ?
+                """,
+                (league_key,),
+            )
+            connection.execute(
+                """
+                DELETE FROM compact_seasonal_prices_staging
+                WHERE league_key = ?
+                """,
+                (league_key,),
+            )
+            return staged
+
+    def seasonal_price_storage_counts(
+        self,
+        league_id: str,
+        *,
+        source: str = "poe.ninja-history",
+    ) -> dict[str, Any]:
+        """Return exact full, compact, and effective row counts for a league."""
+
+        with closing(self.connect()) as connection:
+            full = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM seasonal_prices
+                    WHERE league_id = ? AND source = ?
+                    """,
+                    (str(league_id), str(source)),
+                ).fetchone()[0]
+            )
+            compact = 0
+            if source == "poe.ninja-history":
+                compact = int(
+                    connection.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM compact_seasonal_prices AS price
+                        JOIN compact_seasonal_leagues AS league
+                          ON league.id = price.league_key
+                        WHERE league.league_id = ?
+                        """,
+                        (str(league_id),),
+                    ).fetchone()[0]
+                )
+        mode = "compact" if compact > 0 else "full"
+        return {
+            "full": full,
+            "compact": compact,
+            "effective": compact if compact > 0 else full,
+            "storage_mode": mode,
+        }
+
+    def compact_official_history_from_full(
+        self,
+        league_ids: Iterable[str] | None = None,
+        *,
+        force: bool = False,
+        batch_size: int = 50_000,
+    ) -> dict[str, Any]:
+        """Additively convert eligible full rows to compact hosted storage.
+
+        Conversion is streaming and commits one league atomically.  Completed
+        leagues are skipped on rerun unless ``force`` is requested, making a
+        multi-league conversion resumable without modifying the full archive.
+        """
+
+        requested = None
+        if league_ids is not None:
+            requested = list(
+                dict.fromkeys(
+                    str(value).strip()
+                    for value in league_ids
+                    if str(value).strip()
+                )
+            )
+        with closing(self.connect()) as connection:
+            if requested is None:
+                leagues = [
+                    str(row[0])
+                    for row in connection.execute(
+                        """
+                        SELECT DISTINCT league_id FROM seasonal_prices
+                        WHERE source = 'poe.ninja-history'
+                        ORDER BY league_id
+                        """
+                    )
+                ]
+            else:
+                leagues = requested
+
+        summary: dict[str, Any] = {
+            "status": "success",
+            "storage_mode": "compact",
+            "leagues_converted": 0,
+            "leagues_skipped": 0,
+            "source_rows_read": 0,
+            "stored_rows": 0,
+            "leagues": [],
+        }
+        fetch_size = max(100, int(batch_size))
+        for league_id in leagues:
+            counts = self.seasonal_price_storage_counts(league_id)
+            if counts["compact"] > 0 and not force:
+                summary["leagues_skipped"] += 1
+                summary["leagues"].append(
+                    {
+                        "league_id": league_id,
+                        "status": "skipped",
+                        "stored_rows": counts["compact"],
+                    }
+                )
+                continue
+            self.clear_compact_seasonal_staging(league_id)
+            source_rows = 0
+            with closing(self.connect()) as reader:
+                cursor = reader.execute(
+                    """
+                    SELECT price.league_id, price.item_key, price.source,
+                           price.source_item_id, price.league_day,
+                           price.observed_at, price.chaos_value,
+                           price.divine_value, price.confidence
+                    FROM seasonal_prices AS price
+                    JOIN historical_assets AS asset
+                      ON asset.source = price.source
+                     AND asset.source_item_id = price.source_item_id
+                    WHERE price.league_id = ?
+                      AND price.source = 'poe.ninja-history'
+                      AND asset.eligible = 1
+                    """,
+                    (league_id,),
+                )
+                while True:
+                    batch = cursor.fetchmany(fetch_size)
+                    if not batch:
+                        break
+                    payload = [dict(row) for row in batch]
+                    source_rows += len(payload)
+                    self.upsert_compact_seasonal_prices(
+                        payload,
+                        staging=True,
+                    )
+            stored = self.promote_compact_seasonal_prices(league_id)
+            if source_rows > 0 and stored <= 0:
+                raise RuntimeError(
+                    f"Compact conversion produced no rows for {league_id}"
+                )
+            summary["leagues_converted"] += 1
+            summary["source_rows_read"] += source_rows
+            summary["stored_rows"] += stored
+            summary["leagues"].append(
+                {
+                    "league_id": league_id,
+                    "status": "success",
+                    "source_rows_read": source_rows,
+                    "stored_rows": stored,
+                }
+            )
+        return summary
 
     def seasonal_return_rows(
         self,
         league_day: int,
         horizon: int,
         item_keys: Iterable[str] | None = None,
+        *,
+        sources: Iterable[str] | str | None = None,
     ) -> list[dict[str, Any]]:
         league_day = int(league_day)
         horizon = int(horizon)
@@ -1306,6 +1931,14 @@ class Storage:
 
         key_clause = ""
         parameters: list[Any] = [horizon, league_day]
+        allowed_sources = normalize_source_filter(sources)
+        if allowed_sources == ():
+            return []
+        source_clause = ""
+        if allowed_sources is not None:
+            placeholders = ",".join("?" for _ in allowed_sources)
+            source_clause = f"AND entry.source IN ({placeholders})"
+            parameters.extend(allowed_sources)
         if item_keys is not None:
             if isinstance(item_keys, str):
                 keys = [item_keys]
@@ -1343,8 +1976,8 @@ class Storage:
                        MIN(entry.confidence, exit.confidence) AS confidence,
                        (exit.divine_value / entry.divine_value) - 1.0
                            AS forward_return
-                FROM seasonal_prices AS entry
-                JOIN seasonal_prices AS exit
+                FROM seasonal_price_rows AS entry
+                JOIN seasonal_price_rows AS exit
                   ON exit.league_id = entry.league_id
                  AND exit.item_key = entry.item_key
                  AND exit.source = entry.source
@@ -1356,6 +1989,7 @@ class Storage:
                   ON assets.source = entry.source
                  AND assets.source_item_id = entry.source_item_id
                 WHERE entry.league_day = ?
+                  {source_clause}
                   {key_clause}
                 ORDER BY entry.item_key, leagues.start_at, entry.league_id,
                          entry.source, entry.source_item_id
@@ -1370,6 +2004,7 @@ class Storage:
         item_keys: Iterable[str] | None = None,
         *,
         minimum_confidence: float = 0.5,
+        sources: Iterable[str] | str | None = None,
     ) -> list[dict[str, Any]]:
         """Return exact same-day price levels without requiring a future row.
 
@@ -1385,6 +2020,14 @@ class Storage:
 
         key_clause = ""
         parameters: list[Any] = [league_day, confidence_floor]
+        allowed_sources = normalize_source_filter(sources)
+        if allowed_sources == ():
+            return []
+        source_clause = ""
+        if allowed_sources is not None:
+            placeholders = ",".join("?" for _ in allowed_sources)
+            source_clause = f"AND price.source IN ({placeholders})"
+            parameters.extend(allowed_sources)
         if item_keys is not None:
             if isinstance(item_keys, str):
                 keys = [item_keys]
@@ -1419,12 +2062,13 @@ class Storage:
                                         price.source,
                                         price.source_item_id
                            ) AS preference_rank
-                    FROM seasonal_prices AS price
+                    FROM seasonal_price_rows AS price
                     JOIN leagues
                       ON leagues.id = price.league_id
                     WHERE price.league_day = ?
                       AND price.confidence >= ?
                       AND price.divine_value > 0
+                      {source_clause}
                       {key_clause}
                 )
                 SELECT league_id, league_name, league_start_at, item_key,
@@ -1449,10 +2093,13 @@ class Storage:
                     (SELECT COUNT(*) FROM historical_assets
                      WHERE eligible = 1)
                         AS eligible_assets,
-                    (SELECT COUNT(*) FROM seasonal_prices)
+                    (SELECT COUNT(*) FROM seasonal_price_rows)
                         AS seasonal_prices,
-                    (SELECT COUNT(DISTINCT league_id) FROM seasonal_prices)
+                    (SELECT COUNT(DISTINCT league_id)
+                     FROM seasonal_price_rows)
                         AS historical_leagues,
+                    (SELECT COUNT(*) FROM compact_seasonal_prices)
+                        AS compact_seasonal_prices,
                     (SELECT COUNT(*) FROM historical_fetch_state
                      WHERE LOWER(status) IN (
                          'success', 'succeeded', 'complete', 'completed'
@@ -1857,6 +2504,40 @@ class Storage:
                 parameters,
             ).fetchone()
         return row["finished_at"] if row else None
+
+    def latest_successful_sync_window(
+        self,
+        league_id: str,
+    ) -> dict[str, str] | None:
+        """Return the exact window of the newest usable live sync.
+
+        Current overview rows absent from that window are no longer members
+        of poe.ninja's current catalog. Keeping the start timestamp lets the
+        recommendation layer reject a variant that disappeared upstream even
+        when its previous observation is from the same UTC league day.
+
+        A partial run is deliberately usable here: at least one current
+        poe.ninja endpoint succeeded, and rows from failed endpoints were not
+        refreshed. Using the partial run's start as the membership cutoff
+        therefore keeps refreshed categories while failing closed for every
+        stale category and variant. Falling back to an older all-success run
+        would make those stale rows appear live again.
+        """
+
+        with closing(self.connect()) as connection:
+            row = connection.execute(
+                """
+                SELECT started_at, finished_at, status
+                FROM sync_runs
+                WHERE league_id = ?
+                  AND status IN ('success', 'partial')
+                  AND finished_at IS NOT NULL
+                ORDER BY finished_at DESC, id DESC
+                LIMIT 1
+                """,
+                (str(league_id),),
+            ).fetchone()
+        return dict(row) if row else None
 
     def healthcheck(self) -> bool:
         try:

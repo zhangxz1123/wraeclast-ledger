@@ -163,7 +163,7 @@ class HistoricalNormalizationTests(unittest.TestCase):
     def test_league_day_uses_launch_time_not_utc_date(self) -> None:
         start = "2026-07-24T20:00:00Z"
         self.assertEqual(league_day("2026-07-24T20:00:00Z", start), 1)
-        self.assertEqual(league_day("2026-07-25T19:59:59Z", start), 1)
+        self.assertEqual(league_day("2026-07-25T19:59:59Z", start), 2)
         self.assertEqual(league_day("2026-07-25T20:00:00Z", start), 2)
 
     def test_active_league_open_end_sentinel_keeps_dated_history(self) -> None:
@@ -245,6 +245,30 @@ class HistoricalNormalizationTests(unittest.TestCase):
         self.assertIn(8, quality.prices)
         self.assertTrue(any("outside" in issue for issue in quality.issues))
         self.assertTrue(any("adjacent jump" in issue for issue in quality.issues))
+
+    def test_official_poe_ninja_divine_curve_keeps_real_launch_jumps(
+        self,
+    ) -> None:
+        curve = {
+            1: 38.0,
+            2: 82.95,
+            3: 104.3,
+            4: 115.8,
+            5: 125.0,
+            6: 163.3,
+            7: 174.2,
+            8: 173.5,
+        }
+
+        quality = _validate_divine_curve(
+            curve,
+            minimum_points=1,
+            reject_adjacent_jumps=False,
+        )
+
+        self.assertEqual(quality.prices, curve)
+        self.assertEqual(quality.rejected_days, frozenset())
+        self.assertEqual(quality.issues, ())
 
     def test_cross_league_fallback_is_exact_day_median_and_not_chained(
         self,

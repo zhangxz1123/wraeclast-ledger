@@ -55,8 +55,8 @@ env:
   DATABASE_PATH: data/poe_advisor.sqlite3
   PAGES_OUTPUT: pages-dist
   ARCHIVE_RELEASE: market-archive
-  ARCHIVE_ASSET: poe_market_history.sqlite3.gz
-  PREVIOUS_ARCHIVE_ASSET: poe_market_history.previous.sqlite3.gz
+  ARCHIVE_ASSET: poe_market_compact_history.sqlite3.gz
+  PREVIOUS_ARCHIVE_ASSET: poe_market_compact_history.previous.sqlite3.gz
   POE_ADVISOR_CONTACT: https://github.com/${{ github.repository }}
   POE_ADVISOR_TIMEOUT: "30"
   POE_ADVISOR_RETRIES: "3"
@@ -96,6 +96,15 @@ jobs:
             echo "No archive release exists yet; the live sync will bootstrap it."
             exit 0
           fi
+          ASSET_NAMES="$(
+            gh release view "$ARCHIVE_RELEASE" \
+              --json assets --jq '.assets[].name'
+          )"
+          if ! grep -Fxq "$ARCHIVE_ASSET" <<<"$ASSET_NAMES" \
+            && ! grep -Fxq "$PREVIOUS_ARCHIVE_ASSET" <<<"$ASSET_NAMES"; then
+            echo "No compact archive exists yet; bootstrapping compact history."
+            exit 0
+          fi
           if gh release download "$ARCHIVE_RELEASE" \
             --pattern "$ARCHIVE_ASSET" \
             --dir build/archive \
@@ -122,6 +131,9 @@ jobs:
 
       - name: Refresh market data and model
         env:
+          # Keep regression tests in the full local default; only the hosted
+          # updater opts in to compact completed-league storage.
+          POE_ADVISOR_COMPACT_HISTORY: "1"
           HISTORY_HOURS: ${{ inputs.history_hours || '168' }}
           SEASONAL_ITEMS: ${{ inputs.seasonal_items || '20' }}
           CURRENT_HISTORY_ITEMS: ${{ inputs.current_history_items || '100' }}

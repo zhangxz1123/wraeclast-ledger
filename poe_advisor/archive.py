@@ -3,6 +3,7 @@ from __future__ import annotations
 import gzip
 import json
 import os
+import re
 import shutil
 import sqlite3
 import tempfile
@@ -12,6 +13,7 @@ from typing import Any, Callable
 
 
 _PUBLIC_CURSOR_PREFIX = "ggg_currency_cursor:"
+_PUBLIC_NINJA_DUMP_PREFIX = "poe_ninja_dump:"
 _PROHIBITED_PUBLIC_TEXT = (
     "github_pat_",
     "ghp_",
@@ -223,6 +225,8 @@ def _sanitize_public_market_database(
         "snapshot_references_cleared": 0,
         "meta_snapshot_references_cleared": 0,
         "historical_errors_cleared": 0,
+        "compact_leagues_validated": 0,
+        "verbose_seasonal_rows_removed": 0,
         "raw_snapshots_removed": 0,
         "source_state_rows_removed": 0,
         "sync_runs_removed": 0,
@@ -294,6 +298,36 @@ def _sanitize_public_market_database(
             )
             counts["historical_errors_cleared"] = max(int(cursor.rowcount), 0)
 
+        if {
+            "seasonal_prices",
+            "compact_seasonal_prices",
+            "compact_seasonal_leagues",
+            "settings",
+        }.issubset(tables):
+            # Local conversion is intentionally additive.  The public backup
+            # can discard redundant verbose golden rows only when the durable
+            # checkpoint explicitly says "compact" and its stored-row count
+            # exactly matches the compact table.  Merely finding compact rows
+            # is insufficient: an additive local conversion may still have a
+            # truthful legacy/full marker, which must remain paired with its
+            # full rows in an updater-compatible public snapshot.
+            compact_leagues = _validated_compact_archive_leagues(connection)
+            counts["compact_leagues_validated"] = len(compact_leagues)
+            if compact_leagues:
+                placeholders = ",".join("?" for _ in compact_leagues)
+                cursor = connection.execute(
+                    f"""
+                    DELETE FROM seasonal_prices
+                    WHERE source = 'poe.ninja-history'
+                      AND league_id IN ({placeholders})
+                    """,
+                    compact_leagues,
+                )
+                counts["verbose_seasonal_rows_removed"] = max(
+                    int(cursor.rowcount),
+                    0,
+                )
+
         if "source_state" in tables:
             cursor = connection.execute("DELETE FROM source_state")
             counts["source_state_rows_removed"] = max(int(cursor.rowcount), 0)
@@ -316,7 +350,7 @@ def _sanitize_public_market_database(
                     and isinstance(value, int)
                     and not isinstance(value, bool)
                     and value > 0
-                )
+                ) or _is_public_ninja_dump_marker(key, value)
                 if not keep:
                     connection.execute(
                         "DELETE FROM settings WHERE key = ?",
@@ -346,6 +380,138 @@ def _sanitize_public_market_database(
         connection.rollback()
         raise
     return counts
+
+
+def _validated_compact_archive_leagues(
+    connection: sqlite3.Connection,
+) -> list[str]:
+    """Return only leagues with an exact, publishable compact checkpoint."""
+
+    counts = connection.execute(
+        """
+        SELECT league.league_id, COUNT(*) AS stored_rows
+        FROM compact_seasonal_prices AS price
+        JOIN compact_seasonal_leagues AS league
+          ON league.id = price.league_key
+        GROUP BY league.league_id
+        ORDER BY league.league_id
+        """
+    ).fetchall()
+    validated: list[str] = []
+    for league_id, stored_rows in counts:
+        league = str(league_id)
+        key = f"{_PUBLIC_NINJA_DUMP_PREFIX}{league}"
+        row = connection.execute(
+            "SELECT value_json FROM settings WHERE key = ?",
+            (key,),
+        ).fetchone()
+        if row is None:
+            continue
+        try:
+            marker = json.loads(str(row[0]))
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if (
+            not _is_public_ninja_dump_marker(key, marker)
+            or marker.get("storage_mode") != "compact"
+            or marker.get("stored_seasonal_rows") != int(stored_rows)
+            or marker.get("seasonal_rows_written") != int(stored_rows)
+        ):
+            continue
+        validated.append(league)
+    return validated
+
+
+def _is_public_ninja_dump_marker(key: str, value: Any) -> bool:
+    """Allow only the inert checkpoint fields written by the dump importer.
+
+    These markers let the next GitHub Actions run skip immutable completed-
+    league downloads.  The strict shape prevents arbitrary local settings or
+    path-like values from being smuggled into the public archive.
+    """
+
+    if not key.startswith(_PUBLIC_NINJA_DUMP_PREFIX) or not isinstance(value, dict):
+        return False
+    league_name = key.removeprefix(_PUBLIC_NINJA_DUMP_PREFIX)
+    required = {
+        "import_version",
+        "league_name",
+        "min_date",
+        "max_date",
+        "zip_name",
+        "status",
+        "sha256",
+        "download_bytes",
+        "seasonal_rows_written",
+        "imported_at",
+    }
+    compact_fields = {
+        "stored_seasonal_rows",
+        "raw_source_rows_seen",
+        "normalized_source_rows",
+        "eligible_source_rows",
+        "storage_mode",
+    }
+    if not required.issubset(value) or not set(value).issubset(
+        required | compact_fields
+    ):
+        return False
+    if (
+        not league_name
+        or len(league_name) > 80
+        or re.fullmatch(r"[A-Za-z0-9 .'-]+", league_name) is None
+        or value.get("league_name") != league_name
+        or value.get("zip_name") != f"{league_name}.zip"
+        or value.get("status") != "success"
+    ):
+        return False
+    import_version = value.get("import_version")
+    download_bytes = value.get("download_bytes")
+    seasonal_rows = value.get("seasonal_rows_written")
+    if (
+        not isinstance(import_version, int)
+        or isinstance(import_version, bool)
+        or import_version <= 0
+        or not isinstance(download_bytes, int)
+        or isinstance(download_bytes, bool)
+        or download_bytes <= 0
+        or not isinstance(seasonal_rows, int)
+        or isinstance(seasonal_rows, bool)
+        or seasonal_rows < 0
+    ):
+        return False
+    if compact_fields.intersection(value):
+        if not compact_fields.issubset(value):
+            return False
+        stored = value.get("stored_seasonal_rows")
+        raw_seen = value.get("raw_source_rows_seen")
+        normalized = value.get("normalized_source_rows")
+        eligible = value.get("eligible_source_rows")
+        if (
+            value.get("storage_mode") not in {"full", "compact"}
+            or any(
+                not isinstance(field, int) or isinstance(field, bool)
+                for field in (stored, raw_seen, normalized, eligible)
+            )
+            or int(stored) != int(seasonal_rows)
+            or not (int(raw_seen) >= int(normalized) >= int(eligible) >= 0)
+            or (
+                value.get("storage_mode") == "compact"
+                and not int(eligible) >= int(stored) >= 0
+            )
+            or (
+                value.get("storage_mode") == "full"
+                and not int(normalized) >= int(stored) >= 0
+            )
+        ):
+            return False
+    if re.fullmatch(r"[0-9a-f]{64}", str(value.get("sha256") or "")) is None:
+        return False
+    timestamp = re.compile(r"[0-9TZ:+.-]{10,40}")
+    return all(
+        timestamp.fullmatch(str(value.get(field) or "")) is not None
+        for field in ("min_date", "max_date", "imported_at")
+    )
 
 
 def _quote_identifier(value: str) -> str:

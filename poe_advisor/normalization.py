@@ -84,7 +84,7 @@ def _find_reference_value(
 ) -> float | None:
     target = slugify(target_name)
     for line in lines:
-        line_id = str(line.get("id", line.get("detailsId", "")))
+        line_id = str(line.get("id") or line.get("detailsId") or "")
         meta = metadata.get(line_id, {})
         name = str(
             line.get("currencyTypeName")
@@ -166,7 +166,7 @@ def normalize_poe_ninja(
 
     points: list[PricePoint] = []
     for line in raw_lines:
-        line_id = str(line.get("id", line.get("detailsId", "")))
+        line_id = str(line.get("id") or line.get("detailsId") or "")
         meta = metadata.get(line_id, {})
         name = str(
             line.get("currencyTypeName")
@@ -228,6 +228,12 @@ def normalize_poe_ninja(
             )
             if line.get(key) is not None
         }
+        # ``id`` is poe.ninja's stable row identity and is also the ``Id``
+        # carried by its completed-league CSV dumps.  Keep both identities so
+        # a historical importer can make an exact join instead of guessing by
+        # display name (which is unsafe for gems and other variants).
+        details["poe_ninja_id"] = line_id
+        details["detailsId"] = details_id
         line_metadata = line.get("metadata")
         if not isinstance(line_metadata, dict):
             line_metadata = meta.get("metadata")
@@ -275,6 +281,62 @@ def normalize_poe_ninja(
         )
         points.append(point)
     return points
+
+
+def assert_poe_ninja_chaos_parity(
+    payload: Any,
+    points: list[PricePoint],
+) -> int:
+    """Verify normalized Chaos prices against poe.ninja's direct fields.
+
+    This deliberately re-reads the provider payload after normalization.  A
+    direct ``chaosValue``/``chaosEquivalent`` is authoritative; when the
+    response declares Chaos as its primary unit, ``primaryValue`` is equally
+    direct.  A mismatch is fatal so a unit-conversion regression cannot be
+    stored or published as a plausible-looking market price.
+    """
+
+    if not isinstance(payload, dict) or not isinstance(payload.get("lines"), list):
+        raise ValueError("poe.ninja response must contain a lines array")
+    raw_by_id = {
+        str(line.get("id") or line.get("detailsId") or ""): line
+        for line in payload["lines"]
+        if isinstance(line, dict)
+        and (line.get("id") is not None or line.get("detailsId") is not None)
+    }
+    primary_is_chaos = slugify(_reference_id(payload) or "") in {
+        "chaos",
+        "chaos-orb",
+    }
+    checked = 0
+    for point in points:
+        source_id = str(point.details.get("poe_ninja_id") or "")
+        line = raw_by_id.get(source_id)
+        if line is None:
+            raise ValueError(
+                f"Normalized poe.ninja row {source_id!r} has no source line"
+            )
+        expected = _finite_positive(
+            line.get("chaosValue") or line.get("chaosEquivalent")
+        )
+        if expected is None and primary_is_chaos:
+            expected = _finite_positive(line.get("primaryValue"))
+        if expected is None:
+            continue
+        actual = _finite_positive(point.chaos_value)
+        if actual is None or not math.isclose(
+            actual,
+            expected,
+            rel_tol=1e-9,
+            abs_tol=1e-9,
+        ):
+            raise ValueError(
+                "poe.ninja Chaos-price parity failed for "
+                f"{point.name} ({source_id}): source={expected}, "
+                f"normalized={point.chaos_value}"
+            )
+        checked += 1
+    return checked
 
 
 _CURRENCY_NAMES = {

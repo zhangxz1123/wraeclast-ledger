@@ -289,7 +289,7 @@ class HTTPServerTests(unittest.TestCase):
         storage.upsert_historical_assets(
             [
                 {
-                    "source": "poe.watch",
+                    "source": "poe.ninja-history",
                     "source_item_id": "veiled-orb-history",
                     "item_key": item_key,
                     "name": "Veiled Orb",
@@ -311,7 +311,7 @@ class HTTPServerTests(unittest.TestCase):
                     {
                         "league_id": spec.league_id,
                         "item_key": item_key,
-                        "source": "poe.watch",
+                        "source": "poe.ninja-history",
                         "source_item_id": "veiled-orb-history",
                         "league_day": league_day,
                         "observed_at": spec.start_at,
@@ -323,7 +323,7 @@ class HTTPServerTests(unittest.TestCase):
             {
                 "league_id": "Settlers",
                 "item_key": item_key,
-                "source": "poe.watch",
+                "source": "poe.ninja-history",
                 "source_item_id": "veiled-orb-history",
                 "league_day": 1,
                 "observed_at": "2024-07-26T20:00:00Z",
@@ -372,8 +372,7 @@ class HTTPServerTests(unittest.TestCase):
             40.0
             + 20.0 * 0.72
             + 10.0 * 0.72**2
-            + 1000.0 * 0.72**3
-        ) / (1.0 + 0.72 + 0.72**2 + 0.72**3)
+        ) / (1.0 + 0.72 + 0.72**2)
         self.assertAlmostEqual(
             comparison["weighted_historical"]["points"][0]["divine_value"],
             expected_day_one,
@@ -382,14 +381,14 @@ class HTTPServerTests(unittest.TestCase):
             comparison["weighted_historical"]["points"][0][
                 "contributing_leagues"
             ],
-            4,
+            3,
         )
         self.assertEqual(
             [
                 curve["league_id"]
                 for curve in comparison["past_leagues"]
             ],
-            ["Mirage", "Keepers", "Mercenaries", "Settlers"],
+            ["Mirage", "Keepers", "Mercenaries"],
         )
         self.assertEqual(
             comparison["calculation"]["recency_decay_per_league"],
@@ -397,7 +396,7 @@ class HTTPServerTests(unittest.TestCase):
         )
         self.assertEqual(
             comparison["calculation"]["confidence_floor"],
-            0.0,
+            0.5,
         )
         self.assertEqual(
             comparison["calculation"]["current_confidence_floor"],
@@ -405,7 +404,7 @@ class HTTPServerTests(unittest.TestCase):
         )
         self.assertEqual(
             comparison["calculation"]["historical_confidence_floor"],
-            0.0,
+            0.5,
         )
         self.assertEqual(
             comparison["calculation"]["display_grade_floor"],
