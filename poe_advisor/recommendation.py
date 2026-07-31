@@ -218,6 +218,18 @@ _EXCLUDED_INVESTMENT_CATEGORY_KEYS = frozenset(
     for value in EXCLUDED_INVESTMENT_CATEGORIES
 )
 
+# These are exact low-end currency markets, not whole categories: valuable
+# Currency entries such as Divine or Fracturing Orbs must remain investable.
+# The observations are still collected and retained in SQLite; this set only
+# controls the published investment universe.
+EXCLUDED_LOW_END_CURRENCIES = (
+    "Chromatic Orb",
+)
+_EXCLUDED_LOW_END_CURRENCY_KEYS = frozenset(
+    re.sub(r"[^a-z0-9]+", "", value.casefold())
+    for value in EXCLUDED_LOW_END_CURRENCIES
+)
+
 # Structural priors are explicit and auditable. They override a noisy
 # point-in-time historical sample when the asset's economic lifecycle is
 # known to be unsuitable for appreciation investing.
@@ -253,6 +265,14 @@ def _normalized_asset_token(value: str) -> str:
 def _category_is_excluded(category: str) -> bool:
     return _normalized_asset_token(category) in (
         _EXCLUDED_INVESTMENT_CATEGORY_KEYS
+    )
+
+
+def _low_end_currency_is_excluded(category: str, name: str) -> bool:
+    return (
+        _normalized_asset_token(category) == "currency"
+        and _normalized_asset_token(name)
+        in _EXCLUDED_LOW_END_CURRENCY_KEYS
     )
 
 
@@ -1790,6 +1810,9 @@ class RecommendationEngine:
             for index, spec in enumerate(newest_first)
         }
         excluded_category_counts: defaultdict[str, int] = defaultdict(int)
+        excluded_low_end_currency_counts: defaultdict[str, int] = (
+            defaultdict(int)
+        )
         excluded_below_one_chaos_items = 0
         excluded_unknown_chaos_items = 0
         excluded_stale_current_items = 0
@@ -1835,6 +1858,10 @@ class RecommendationEngine:
             category = str(latest["category"])
             if _category_is_excluded(category):
                 excluded_category_counts[category] += 1
+                continue
+            name = str(latest["name"])
+            if _low_end_currency_is_excluded(category, name):
+                excluded_low_end_currency_counts[name] += 1
                 continue
             current = float(latest.get("divine_value") or 0.0)
             if not math.isfinite(current) or current <= 0:
@@ -2609,6 +2636,7 @@ class RecommendationEngine:
                 "eligibility_gates": [],
                 "universe_filters": [
                     "excluded small-consumable categories",
+                    "explicit low-end currencies such as Chromatic Orb",
                     "current price below one Chaos Orb",
                     "current poe.ninja observation older than one league day",
                     "current item absent from the latest successful or partial poe.ninja sync",
@@ -2626,6 +2654,15 @@ class RecommendationEngine:
                 ),
                 "excluded_category_counts": dict(
                     sorted(excluded_category_counts.items())
+                ),
+                "excluded_low_end_currencies": list(
+                    EXCLUDED_LOW_END_CURRENCIES
+                ),
+                "excluded_low_end_currency_items": sum(
+                    excluded_low_end_currency_counts.values()
+                ),
+                "excluded_low_end_currency_counts": dict(
+                    sorted(excluded_low_end_currency_counts.items())
                 ),
                 "minimum_price_chaos": MINIMUM_INVESTMENT_PRICE_CHAOS,
                 "excluded_below_one_chaos_items": (
@@ -2646,6 +2683,7 @@ class RecommendationEngine:
                 ),
                 "excluded_item_count": (
                     sum(excluded_category_counts.values())
+                    + sum(excluded_low_end_currency_counts.values())
                     + excluded_below_one_chaos_items
                     + excluded_unknown_chaos_items
                     + excluded_stale_current_items

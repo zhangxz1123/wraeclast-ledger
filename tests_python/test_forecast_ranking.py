@@ -385,6 +385,41 @@ class ForecastRankingTests(unittest.TestCase):
             1,
         )
 
+    def test_chromatic_orb_is_archived_but_not_ranked(self) -> None:
+        key = "currency:chrome"
+        self.add_current(key, "Chromatic Orb", [0.02])
+        self.add_target(key, "Chromatic Orb", "Mirage", 7, 0.04)
+        self.add_current(
+            "currency:fracturing-orb",
+            "Fracturing Orb",
+            [1.0],
+        )
+
+        payload = RecommendationEngine(self.storage).generate(
+            self.live,
+            horizon=7,
+            persist=False,
+        )
+
+        names = {row["name"] for row in payload["rankings"]}
+        self.assertNotIn("Chromatic Orb", names)
+        self.assertIn("Fracturing Orb", names)
+        scope = payload["investment_scope"]
+        self.assertEqual(scope["excluded_low_end_currency_items"], 1)
+        self.assertEqual(
+            scope["excluded_low_end_currency_counts"],
+            {"Chromatic Orb": 1},
+        )
+        self.assertEqual(scope["excluded_item_count"], 1)
+
+        archived = self.storage.item_histories(
+            self.live.id,
+            days=30,
+            sources=("poe.ninja",),
+        )
+        self.assertIn(key, archived)
+        self.assertEqual(archived[key][-1]["name"], "Chromatic Orb")
+
     def test_log_blend_uses_actual_curve_and_caps_projection(self) -> None:
         self.add_current("currency:blend", "Blend", [1.0, 2.0, 4.0])
         self.add_target("currency:blend", "Blend", "Mirage", 3, 8.0)
