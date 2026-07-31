@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wraeclast-ledger"
+version = "0.1.0"
+description = "Local-first Path of Exile softcore-trade investment research"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Wraeclast Ledger contributors" }]
+dependencies = []
+
+[project.scripts]
+poe-advisor = "poe_advisor.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["poe_advisor*"]
+
+[tool.unittest]
+start-directory = "tests_python"

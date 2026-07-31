@@ -1,0 +1,354 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="A local-first Path of Exile market desk with 3, 7, and 14-day seasonal price forecasts."
+    />
+    <meta name="theme-color" content="#09100f" />
+    <meta property="og:title" content="Wraeclast Ledger" />
+    <meta
+      property="og:description"
+      content="Compare the current league with broad past leagues and rank gross expected gains."
+    />
+    <meta property="og:type" content="website" />
+    <meta property="og:image" content="./og.png" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <title>Wraeclast Ledger</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#recommendations">Skip to recommendations</a>
+
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="Wraeclast Ledger home">
+        <span class="brand-mark" aria-hidden="true">WL</span>
+        <span>
+          <strong>Wraeclast Ledger</strong>
+          <small>LOCAL MARKET DESK</small>
+        </span>
+      </a>
+
+      <div class="topbar-actions">
+        <div class="league-pill" id="leaguePill">
+          <span class="status-dot" id="statusDot" aria-hidden="true"></span>
+          <span id="leagueName">Finding league…</span>
+          <span class="pill-divider" aria-hidden="true"></span>
+          <span id="leagueDay">Day —</span>
+        </div>
+        <button class="icon-button" id="settingsButton" type="button" aria-label="Open data settings">
+          <span aria-hidden="true">⚙</span>
+        </button>
+      </div>
+    </header>
+
+    <main>
+      <section class="hero">
+        <div class="hero-copy">
+          <p class="eyebrow"><span>01</span> TODAY’S PRIORITY LIST</p>
+          <h1>Buy the gap.<br /><em>Not the spike.</em></h1>
+          <p class="hero-intro">
+            A forecast-first view of the trade league. Every in-scope item is
+            compared with its same-day and future prices in the four broadly
+            covered leagues—Mirage, Keepers, Mercenaries, and Settlers—then
+            blended with its current-league curve to estimate gross 3, 7, and
+            14-day gains.
+          </p>
+        </div>
+
+        <div class="command-card" aria-labelledby="commandTitle">
+          <div class="command-heading">
+            <div>
+              <p class="micro-label" id="commandTitle">RANKING MODE</p>
+              <strong class="ranking-mode">Gross gain forecast</strong>
+              <small class="ranking-mode-note">The hold-window choice sets the ranking order</small>
+            </div>
+            <label class="horizon-field">
+              <span class="micro-label">HOLD WINDOW</span>
+              <select id="horizonSelect">
+                <option value="3">3 days</option>
+                <option value="7" selected>7 days</option>
+                <option value="14">14 days</option>
+              </select>
+            </label>
+          </div>
+
+          <button class="sync-button" id="syncButton" type="button">
+            <span class="sync-icon" aria-hidden="true">↻</span>
+            <span>
+              <strong id="syncButtonLabel">Sync market &amp; run model</strong>
+              <small>poe.ninja prices/builds + official exchange</small>
+            </span>
+            <span class="button-arrow" aria-hidden="true">→</span>
+          </button>
+
+          <div class="sync-meta">
+            <span id="lastSync">No local snapshot yet</span>
+            <span id="databaseMeta">Local database · checking…</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="trust-strip" id="trustStrip" aria-live="polite">
+        <div class="trust-icon" aria-hidden="true">i</div>
+        <p id="trustMessage">
+          Checking your local price history and source health…
+        </p>
+        <button id="trustAction" type="button" hidden>See details</button>
+      </section>
+
+      <section class="recommendations-section" id="recommendations" aria-labelledby="recommendationsTitle">
+        <div class="section-heading recommendations-heading">
+          <div>
+            <p class="eyebrow"><span>02</span> INVESTMENT RANKING</p>
+            <h2 id="recommendationsTitle">All expected-gain rankings</h2>
+            <p class="ranking-summary" id="modelNote">
+              Ranked by the selected forecast horizon. Missing broad-league
+              future-day observations remain blank rather than becoming zero.
+            </p>
+          </div>
+          <div class="table-tools">
+            <label class="search-field">
+              <span aria-hidden="true">⌕</span>
+              <span class="sr-only">Search recommendations</span>
+              <input id="searchInput" type="search" placeholder="Search items" />
+            </label>
+            <label class="filter-field">
+              <span class="sr-only">Filter by category</span>
+              <select id="categoryFilter">
+                <option value="all">All markets</option>
+              </select>
+            </label>
+            <label class="filter-field price-filter-field">
+              <span class="sr-only">Filter by minimum current price</span>
+              <select id="priceRangeFilter">
+                <option value="all">All prices</option>
+                <option value="10c-plus">10c+</option>
+                <option value="1d-plus">1d+</option>
+                <option value="5d-plus">5d+</option>
+                <option value="10d-plus">10d+</option>
+                <option value="20d-plus">20d+</option>
+                <option value="50d-plus">50d+</option>
+                <option value="100d-plus">100d+</option>
+              </select>
+            </label>
+            <button
+              id="resetHiddenItemsButton"
+              class="secondary-button reset-hidden-button"
+              type="button"
+              hidden
+            >
+              Reset hidden (<span id="hiddenItemCount">0</span>)
+            </button>
+          </div>
+        </div>
+
+        <div class="table-shell">
+          <div class="table-header" aria-hidden="true">
+            <span>HIDE</span>
+            <span>RANK / ITEM</span>
+            <span>CURRENT</span>
+            <span id="forecastHeader3" data-forecast-header="3">EXPECTED 3D</span>
+            <span id="forecastHeader7" data-forecast-header="7">EXPECTED 7D</span>
+            <span id="forecastHeader14" data-forecast-header="14">EXPECTED 14D</span>
+            <span>BROAD-LEAGUE SAMPLES</span>
+            <span>CURVES</span>
+            <span class="trade-header">TRADE</span>
+          </div>
+          <div id="recommendationList" class="recommendation-list" aria-live="polite">
+            <div class="loading-state">
+              <span class="loading-rune" aria-hidden="true"></span>
+              <strong>Opening the local ledger</strong>
+              <p>Reading snapshots and checking the current league.</p>
+            </div>
+          </div>
+        </div>
+        <nav
+          id="paginationControls"
+          class="pagination-controls"
+          aria-label="Investment ranking pages"
+          hidden
+        >
+          <div class="pagination-actions">
+            <button id="previousPageButton" class="secondary-button" type="button">
+              Previous
+            </button>
+            <span id="paginationSummary" role="status" aria-live="polite"></span>
+            <button id="nextPageButton" class="secondary-button" type="button">
+              Next
+            </button>
+          </div>
+          <label class="page-size-field">
+            <span>Rows per page</span>
+            <select id="pageSizeSelect">
+              <option value="25">25</option>
+              <option value="50" selected>50</option>
+              <option value="100">100</option>
+            </select>
+          </label>
+        </nav>
+      </section>
+
+      <section class="method-section" aria-labelledby="methodTitle">
+        <div class="method-intro">
+          <p class="eyebrow"><span>03</span> FORECAST METHOD</p>
+          <h2 id="methodTitle">One comparable forecast for every item.</h2>
+          <p>
+            There are no per-item screening gates. The output is a gross
+            price forecast, not a promise of executable profit. Routine
+            low-value consumable categories and base currencies remain
+            outside this investment universe.
+          </p>
+        </div>
+        <ol class="method-grid">
+          <li>
+            <span>01</span>
+            <strong>Broad-league target</strong>
+            <p>For each horizon, estimate the future Divine price from Mirage, Keepers, Mercenaries, and Settlers at the matching league day, with newer leagues weighted more heavily.</p>
+          </li>
+          <li>
+            <span>02</span>
+            <strong>Current-curve trend</strong>
+            <p>Measure the item’s robust current-league log-price trend and cap it so a brief spike or drop cannot dominate the forecast.</p>
+          </li>
+          <li>
+            <span>03</span>
+            <strong>70 / 30 log blend</strong>
+            <p>When the current curve is usable, blend 70% of the historical future price level with 30% of its capped projection in log-price space. Otherwise use the historical target alone.</p>
+          </li>
+          <li>
+            <span>04</span>
+            <strong>Horizon ranking</strong>
+            <p>Rank by gross expected gain for the selected 3, 7, or 14-day window. Friction, liquidity, confidence, falling-knife rules, and structural item vetoes do not alter the order.</p>
+          </li>
+        </ol>
+      </section>
+
+      <section class="data-section" aria-labelledby="dataTitle">
+        <div>
+          <p class="eyebrow" id="archiveEyebrow"><span>04</span> LOCAL ARCHIVE</p>
+          <h2 id="dataTitle">Your history stays on this machine.</h2>
+          <p id="archiveDescription">
+            Raw source responses, normalized daily prices, sync logs, and model
+            outputs are retained in a local SQLite database for reproducible
+            forecasts. Excluded markets such as essences, fossils, and
+            oils—and routine base currencies such as Jeweller's Orbs—stay
+            archived for fast research; they are simply outside the investment
+            shortlist.
+          </p>
+        </div>
+        <dl class="archive-stats">
+          <div>
+            <dt>Snapshots</dt>
+            <dd id="snapshotCount">—</dd>
+          </div>
+          <div>
+            <dt>Price points</dt>
+            <dd id="pricePointCount">—</dd>
+          </div>
+          <div>
+            <dt>Exchange hours</dt>
+            <dd id="exchangeHourCount">—</dd>
+          </div>
+          <div>
+            <dt>Historical assets</dt>
+            <dd id="historicalAssetCount">—</dd>
+          </div>
+          <div>
+            <dt>Seasonal daily bars</dt>
+            <dd id="seasonalPriceCount">—</dd>
+          </div>
+          <div>
+            <dt>Archive size</dt>
+            <dd id="archiveSize">—</dd>
+          </div>
+        </dl>
+      </section>
+    </main>
+
+    <footer>
+      <div>
+        <span class="brand-mark footer-mark" aria-hidden="true">WL</span>
+        <p>
+          Decision support for Path of Exile’s virtual economy. Verify live
+          listings before trading; no order is placed automatically. Not
+          affiliated with or endorsed by Grinding Gear Games.
+        </p>
+      </div>
+      <p>Prices expressed in Divine Orbs to avoid mistaking currency drift for alpha.</p>
+    </footer>
+
+    <dialog class="detail-dialog" id="detailDialog">
+      <button class="dialog-close" id="dialogClose" type="button" aria-label="Close forecast details">×</button>
+      <div id="detailContent"></div>
+    </dialog>
+
+    <dialog class="settings-dialog" id="settingsDialog">
+      <button class="dialog-close" id="settingsClose" type="button" aria-label="Close data settings">×</button>
+      <div class="dialog-kicker">DATA SETTINGS</div>
+      <h2 id="settingsTitle">Local market archive</h2>
+      <p id="settingsIntro">
+        Sync stores supported poe.ninja snapshots and official Currency Exchange
+        aggregates locally across all 18 exchange and 25 item-overview categories
+        configured by the app. Storage is deliberately broader than the investment
+        universe: low-end consumables such as essences, fossils, oils, resonators,
+        scarabs, Delirium Orbs, and routine base currencies remain in the local
+        archive but cannot enter the forecast ranking. Exact Forbidden Jewel prices come from the
+        archived poe.watch catalog, while GGG’s official passive-tree export
+        supplies their ascendancy ownership. The app also samples the official
+        top-experience ladder as archived market context. Seasonal backfill stores exactly
+        matched common markets across six reviewed completed leagues; each pass is
+        resumable and can take several minutes.
+      </p>
+      <p>
+        Forecasts use only the broadly covered leagues: Mirage, Keepers,
+        Mercenaries, and Settlers. Their future price levels are recency
+        weighted, then blended 70/30 in log-price space with a capped robust
+        projection of the current-league curve. A missing exact future-day
+        observation stays missing. No friction, liquidity, confidence, falling-knife, or
+        structural-item rule changes the forecast or rank.
+      </p>
+      <label>
+        <span>Exchange history on next sync</span>
+        <select id="backfillSelect">
+          <option value="24">Last 24 hours</option>
+          <option value="168" selected>Last 7 days</option>
+          <option value="336">Last 14 days</option>
+        </select>
+      </label>
+      <label>
+        <span>Common assets per seasonal pass</span>
+        <select id="historyBatchSelect">
+          <option value="20">20 assets (quick)</option>
+          <option value="80" selected>80 assets (recommended)</option>
+          <option value="160">160 assets (long)</option>
+        </select>
+      </label>
+      <button class="secondary-button history-button" id="historyButton" type="button">
+        Build / continue past-league archive
+      </button>
+      <p class="history-meta" id="historyMeta">
+        Uses exact league-day prices from completed softcore trade leagues and
+        locally archived poe.ninja build-composition snapshots.
+      </p>
+      <p class="history-meta">
+        Divine conversion anchors are sanity-checked. Implausible source days
+        are removed from derived prices while raw responses remain local; a
+        sparse direct outlier also needs two tightly agreeing peer leagues
+        before rejection. A missing day is filled only by a low-confidence
+        same-day median from at least two other validated leagues.
+      </p>
+      <div class="source-list" id="sourceList"></div>
+      <button class="secondary-button" id="refreshStatusButton" type="button">Refresh source status</button>
+    </dialog>
+
+    <div class="toast-region" id="toastRegion" aria-live="polite" aria-atomic="true"></div>
+
+    <noscript>
+      <div class="noscript">JavaScript is required to run the market desk.</div>
+    </noscript>
+    <script src="./app.js" defer></script>
+  </body>
+</html>
