@@ -59,18 +59,20 @@ backfill is resumable, so later passes skip successful item/league histories.
 ## GitHub Pages and automatic daily updates
 
 The same dashboard can run as a read-only GitHub Pages site without exposing
-the local API or SQLite database. The included
+the local API or a raw copy of the local SQLite database. The included
 `.github/workflows/daily-pages.yml` workflow:
 
-1. Restores the most recent compressed database from the `market-archive`
-   GitHub Release.
+1. Restores the most recent sanitized, compressed market database from the
+   `market-archive` GitHub Release.
 2. Runs the full unattended refresh: current prices, optional build
    composition, top-ranked current-league curves, a resumable completed-league
    batch, and the recommendation model.
 3. Exports one all-item catalog with exact 3/7/14-day ranks plus 256 lazily
    loaded, content-hashed curve shards.
-4. Creates an integrity-checked compressed SQLite backup and rotates the prior
-   good backup as `poe_advisor.previous.sqlite3.gz`.
+4. Creates an integrity-checked, public-market-only SQLite backup and rotates
+   the prior good backup as `poe_market_history.previous.sqlite3.gz`. Raw HTTP
+   payloads, local diagnostics, and settings outside a narrow crawl allowlist
+   are removed before compression.
 5. Deploys only the static dashboard data to GitHub Pages.
 
 The scheduled run starts daily at 09:23 in `America/Los_Angeles`. It can also
@@ -94,19 +96,21 @@ python -m poe_advisor --db data/poe_advisor.sqlite3 export-pages `
   --output pages-dist --repository OWNER/REPOSITORY
 ```
 
-To create the durable release asset safely even while the local server is
-open:
+To create the sanitized durable release asset safely even while the local
+server is open:
 
 ```powershell
 python -m poe_advisor --db data/poe_advisor.sqlite3 archive-snapshot `
-  --output build/archive/poe_advisor.sqlite3.gz
+  --output build/archive/poe_market_history.sqlite3.gz `
+  --public-market-only
 ```
 
 Generated Pages files and database backups are ignored by Git. The full
 database is never part of the Pages artifact or normal repository history.
-For a public repository, its GitHub Release database assets are also public;
-they contain archived market-source responses, not local browser preferences
-or GitHub credentials.
+For a public repository, its GitHub Release database assets are also public.
+The workflow therefore uploads only normalized public market/model data. It
+does not upload stored raw API response bodies, arbitrary local settings,
+browser preferences, diagnostic error text, filesystem paths, or credentials.
 
 ## What is stored locally
 

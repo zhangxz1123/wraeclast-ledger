@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import gzip
 import json
+import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 
-from poe_advisor.archive import create_compressed_database_snapshot
+from poe_advisor.archive import (
+    create_compressed_database_snapshot,
+    create_public_market_snapshot,
+)
 from poe_advisor.demo import seed_demo
 from poe_advisor.static_export import export_github_pages
 from poe_advisor.storage import Storage
@@ -61,6 +66,11 @@ class StaticExportTests(unittest.TestCase):
             manifest["status"],
             r"^data/status\.[0-9a-f]{16}\.json$",
         )
+        self.assertEqual(
+            manifest["archive"]["asset"],
+            "poe_market_history.sqlite3.gz",
+        )
+        self.assertTrue(manifest["archive"]["public_market_only"])
 
         catalog = json.loads(
             (output / manifest["catalog"]).read_text(encoding="utf-8")
@@ -111,6 +121,162 @@ class StaticExportTests(unittest.TestCase):
             restored_storage.status_counts()["price_points"],
             Storage(self.database).status_counts()["price_points"],
         )
+
+    def test_public_market_snapshot_strips_private_and_raw_state(self) -> None:
+        original_price_points = Storage(self.database).status_counts()[
+            "price_points"
+        ]
+        with closing(sqlite3.connect(self.database)) as connection:
+            league_id = connection.execute(
+                "SELECT id FROM leagues WHERE is_current = 1"
+            ).fetchone()[0]
+            cursor = connection.execute(
+                """
+                INSERT INTO raw_snapshots(
+                    source, endpoint, league_id, category, fetched_at,
+                    status_code, sha256, payload_gzip, payload_bytes,
+                    metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "private-test",
+                    "https://example.invalid/private",
+                    league_id,
+                    "test",
+                    "2026-01-01T00:00:00Z",
+                    200,
+                    "a" * 64,
+                    b"private raw response",
+                    20,
+                    '{"authorization":"Bearer private"}',
+                ),
+            )
+            snapshot_id = int(cursor.lastrowid)
+            connection.execute(
+                """
+                UPDATE price_points
+                SET snapshot_id = ?
+                WHERE id = (SELECT MIN(id) FROM price_points)
+                """,
+                (snapshot_id,),
+            )
+            connection.execute(
+                """
+                INSERT INTO settings(key, value_json, updated_at)
+                VALUES ('oauth_token', '"private"', '2026-01-01T00:00:00Z')
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO settings(key, value_json, updated_at)
+                VALUES (
+                    'ggg_currency_cursor:test',
+                    '1785000000',
+                    '2026-01-01T00:00:00Z'
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO source_state(
+                    source, endpoint, league_id, category, status, detail
+                ) VALUES (
+                    'private-test', 'https://example.invalid/private',
+                    ?, 'test', 'failed', 'C:\\Users\\Someone\\secret.txt'
+                )
+                """,
+                (league_id,),
+            )
+            connection.execute(
+                """
+                INSERT INTO sync_runs(
+                    started_at, status, league_id, message, warnings_json
+                ) VALUES (
+                    '2026-01-01T00:00:00Z', 'failed', ?,
+                    'Authorization: Bearer private',
+                    '["client_secret"]'
+                )
+                """,
+                (league_id,),
+            )
+            connection.commit()
+
+        compressed = self.root / "archive" / "poe_market_history.sqlite3.gz"
+        summary = create_public_market_snapshot(
+            self.database,
+            compressed,
+            compression_level=1,
+        )
+        self.assertEqual(summary["archive_kind"], "public-market")
+        self.assertTrue(summary["sanitized"])
+        self.assertGreater(summary["sanitization"]["text_values_scanned"], 0)
+
+        restored = self.root / "public.sqlite3"
+        with gzip.open(compressed, "rb") as source:
+            restored.write_bytes(source.read())
+        with closing(sqlite3.connect(restored)) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM price_points"
+                ).fetchone()[0],
+                original_price_points,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM raw_snapshots"
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM price_points "
+                    "WHERE snapshot_id IS NOT NULL"
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM source_state"
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM sync_runs"
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT key, value_json FROM settings"
+                ).fetchall(),
+                [("ggg_currency_cursor:test", "1785000000")],
+            )
+            self.assertEqual(
+                connection.execute("PRAGMA foreign_key_check").fetchall(),
+                [],
+            )
+
+    def test_public_market_snapshot_rejects_private_text_in_kept_rows(
+        self,
+    ) -> None:
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                """
+                UPDATE price_points
+                SET details_json = '{"client_secret":"must-not-publish"}'
+                WHERE id = (SELECT MIN(id) FROM price_points)
+                """
+            )
+            connection.commit()
+        output = self.root / "archive" / "blocked.sqlite3.gz"
+        with self.assertRaisesRegex(RuntimeError, "prohibited private text"):
+            create_public_market_snapshot(
+                self.database,
+                output,
+                compression_level=1,
+            )
+        self.assertFalse(output.exists())
 
 
 if __name__ == "__main__":

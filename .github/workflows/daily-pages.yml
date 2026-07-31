@@ -1,0 +1,222 @@
+name: Update market data and deploy Pages
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/daily-pages.yml"
+      - "poe_advisor/**"
+      - "tests_python/**"
+      - "tests/**"
+      - "web/**"
+      - "pyproject.toml"
+      - "requirements.txt"
+  workflow_dispatch:
+    inputs:
+      history_hours:
+        description: Official exchange recovery window
+        required: true
+        default: "168"
+        type: choice
+        options:
+          - "24"
+          - "168"
+          - "336"
+      seasonal_items:
+        description: Completed-league assets to advance
+        required: true
+        default: "20"
+        type: choice
+        options:
+          - "0"
+          - "10"
+          - "20"
+          - "80"
+      current_history_items:
+        description: Current-league item curves to refresh
+        required: true
+        default: "100"
+        type: choice
+        options:
+          - "0"
+          - "50"
+          - "100"
+          - "200"
+  schedule:
+    - cron: "23 9 * * *"
+      timezone: "America/Los_Angeles"
+
+concurrency:
+  group: wraeclast-market-state-and-pages
+  cancel-in-progress: false
+
+env:
+  DATABASE_PATH: data/poe_advisor.sqlite3
+  PAGES_OUTPUT: pages-dist
+  ARCHIVE_RELEASE: market-archive
+  ARCHIVE_ASSET: poe_market_history.sqlite3.gz
+  PREVIOUS_ARCHIVE_ASSET: poe_market_history.previous.sqlite3.gz
+  POE_ADVISOR_CONTACT: https://github.com/${{ github.repository }}
+  POE_ADVISOR_TIMEOUT: "30"
+  POE_ADVISOR_RETRIES: "3"
+  POE_ADVISOR_MAX_RETRY_AFTER: "120"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Restore durable market archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p data build/archive
+          if ! gh release view "$ARCHIVE_RELEASE" >/dev/null 2>&1; then
+            echo "No archive release exists yet; the live sync will bootstrap it."
+            exit 0
+          fi
+          if gh release download "$ARCHIVE_RELEASE" \
+            --pattern "$ARCHIVE_ASSET" \
+            --dir build/archive \
+            --clobber \
+            && gzip -t "build/archive/$ARCHIVE_ASSET"; then
+            gzip -dc "build/archive/$ARCHIVE_ASSET" > "$DATABASE_PATH"
+            cp "build/archive/$ARCHIVE_ASSET" \
+              "build/archive/$PREVIOUS_ARCHIVE_ASSET"
+            exit 0
+          fi
+          echo "::warning::Latest archive failed validation; trying rollback asset."
+          gh release download "$ARCHIVE_RELEASE" \
+            --pattern "$PREVIOUS_ARCHIVE_ASSET" \
+            --dir build/archive \
+            --clobber
+          gzip -t "build/archive/$PREVIOUS_ARCHIVE_ASSET"
+          gzip -dc "build/archive/$PREVIOUS_ARCHIVE_ASSET" > "$DATABASE_PATH"
+
+      - name: Run regression tests
+        run: |
+          python -B -m unittest discover -s tests_python
+          node --check web/app.js
+          node --test tests/web-app-logic.test.mjs
+
+      - name: Refresh market data and model
+        env:
+          HISTORY_HOURS: ${{ inputs.history_hours || '168' }}
+          SEASONAL_ITEMS: ${{ inputs.seasonal_items || '20' }}
+          CURRENT_HISTORY_ITEMS: ${{ inputs.current_history_items || '100' }}
+          POE_OAUTH_TOKEN: ${{ secrets.POE_OAUTH_TOKEN }}
+        run: >-
+          python -B -m poe_advisor
+          --db "$DATABASE_PATH"
+          daily-update
+          --history-hours "$HISTORY_HOURS"
+          --seasonal-items "$SEASONAL_ITEMS"
+          --current-history-items "$CURRENT_HISTORY_ITEMS"
+
+      - name: Export static dashboard
+        run: >-
+          python -B -m poe_advisor
+          --db "$DATABASE_PATH"
+          export-pages
+          --output "$PAGES_OUTPUT"
+          --repository "${{ github.repository }}"
+
+      - name: Create validated archive snapshot
+        run: >-
+          python -B -m poe_advisor
+          --db "$DATABASE_PATH"
+          archive-snapshot
+          --output "build/archive/$ARCHIVE_ASSET"
+          --compression-level 6
+          --public-market-only
+
+      - name: Save durable market archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! gh release view "$ARCHIVE_RELEASE" >/dev/null 2>&1; then
+            gh release create "$ARCHIVE_RELEASE" \
+              --title "Wraeclast Ledger market archive" \
+              --notes "Durable application state used by the scheduled Pages build." \
+              --prerelease
+          fi
+          if [ -f "build/archive/$PREVIOUS_ARCHIVE_ASSET" ]; then
+            gh release upload "$ARCHIVE_RELEASE" \
+              "build/archive/$PREVIOUS_ARCHIVE_ASSET" \
+              --clobber
+          elif [ -f "build/archive/$ARCHIVE_ASSET" ]; then
+            cp "build/archive/$ARCHIVE_ASSET" \
+              "build/archive/$PREVIOUS_ARCHIVE_ASSET"
+            gh release upload "$ARCHIVE_RELEASE" \
+              "build/archive/$PREVIOUS_ARCHIVE_ASSET" \
+              --clobber
+          fi
+          gh release upload "$ARCHIVE_RELEASE" \
+            "build/archive/$ARCHIVE_ASSET" \
+            --clobber
+
+      - name: Record successful daily refresh
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tools/write_pages_heartbeat.py \
+            --manifest "$PAGES_OUTPUT/data/manifest.json" \
+            --output automation/last-success.json \
+            --run-id "${{ github.run_id }}" \
+            --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add automation/last-success.json
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m "Record daily market refresh"
+          git push origin HEAD:main || \
+            echo "::warning::Heartbeat push was blocked; deployment will continue."
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: pages-dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Deploy GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

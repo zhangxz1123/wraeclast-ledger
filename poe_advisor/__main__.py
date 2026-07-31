@@ -146,6 +146,14 @@ def build_parser() -> argparse.ArgumentParser:
         choices=range(1, 10),
         default=6,
     )
+    archive_snapshot.add_argument(
+        "--public-market-only",
+        action="store_true",
+        help=(
+            "Strip raw responses, diagnostics, and non-cursor settings before "
+            "creating a public updater archive."
+        ),
+    )
 
     subparsers.add_parser(
         "seed-demo",
@@ -297,9 +305,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.command == "archive-snapshot":
-        from .archive import create_compressed_database_snapshot
+        from .archive import (
+            create_compressed_database_snapshot,
+            create_public_market_snapshot,
+        )
 
-        result = create_compressed_database_snapshot(
+        snapshot_factory = (
+            create_public_market_snapshot
+            if args.public_market_only
+            else create_compressed_database_snapshot
+        )
+        result = snapshot_factory(
             database,
             args.output,
             compression_level=args.compression_level,

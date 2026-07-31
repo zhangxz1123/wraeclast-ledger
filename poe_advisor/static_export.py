@@ -246,7 +246,8 @@ def export_github_pages(
         "archive": {
             "storage": "github-release-asset",
             "release_tag": "market-archive",
-            "asset": "poe_advisor.sqlite3.gz",
+            "asset": "poe_market_history.sqlite3.gz",
+            "public_market_only": True,
             "included_in_pages": False,
         },
     }

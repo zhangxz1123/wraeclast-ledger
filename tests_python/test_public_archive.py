@@ -1,0 +1,323 @@
+from __future__ import annotations
+
+import gzip
+import os
+import sqlite3
+import tempfile
+import unittest
+from contextlib import closing
+from pathlib import Path
+
+from poe_advisor.archive import (
+    create_compressed_database_snapshot,
+    create_public_market_snapshot,
+)
+from poe_advisor.demo import seed_demo
+from poe_advisor.storage import Storage
+
+
+class PublicArchiveTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.database = self.root / "source.sqlite3"
+        self.storage = Storage(self.database)
+        seed_demo(self.storage, make_current=True)
+        self.league = self.storage.get_current_league()
+        assert self.league is not None
+
+        self.private_payload = (
+            b"private-local-provider-payload:"
+            + os.urandom(512 * 1024)
+        )
+        self.private_snapshot_id, created = self.storage.add_snapshot(
+            source="private-fixture",
+            endpoint="https://private.invalid/secret",
+            league_id=self.league.id,
+            category="Private",
+            fetched_at="2026-07-31T12:00:00Z",
+            status_code=200,
+            raw=self.private_payload,
+            etag='"private-etag"',
+            metadata={"warning": "private diagnostic"},
+        )
+        self.assertTrue(created)
+        self._add_public_and_private_state()
+
+    def _add_public_and_private_state(self) -> None:
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute(
+                """
+                INSERT INTO historical_assets(
+                    source, source_item_id, item_key, name, category,
+                    source_category, source_group, variant_json,
+                    current_daily, current_chaos, current_divine,
+                    low_confidence, eligible, seen_at
+                ) VALUES(
+                    'fixture', '42', 'gem:fixture', 'Fixture Gem', 'Gem',
+                    'SkillGem', 'Gems', '{}', 10, 100, 1, 0, 1,
+                    '2026-07-31T12:00:00Z'
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO historical_fetch_state(
+                    source, league_id, source_item_id, status,
+                    points_written, last_error, updated_at
+                ) VALUES(
+                    'fixture', ?, '42', 'error', 1,
+                    'private local filesystem error',
+                    '2026-07-31T12:00:00Z'
+                )
+                """,
+                (self.league.id,),
+            )
+            connection.execute(
+                """
+                INSERT INTO seasonal_prices(
+                    league_id, item_key, source, source_item_id, league_day,
+                    observed_at, chaos_value, divine_value, volume,
+                    confidence, snapshot_id, details_json, updated_at
+                ) VALUES(
+                    ?, 'gem:fixture', 'fixture', '42', 1,
+                    '2026-07-31T12:00:00Z', 100, 1, 2, 0.9, ?, '{}',
+                    '2026-07-31T12:00:00Z'
+                )
+                """,
+                (self.league.id, self.private_snapshot_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO meta_class_snapshots(
+                    league_id, observed_at, source, league_day, sample_size,
+                    page_count, counts_json, shares_json, snapshot_ids_json,
+                    created_at
+                ) VALUES(
+                    ?, '2026-07-31T12:00:00Z', 'fixture', 1, 100, 1,
+                    '{"Witch":100}', '{"Witch":1}', ?,
+                    '2026-07-31T12:00:00Z'
+                )
+                """,
+                (self.league.id, f"[{self.private_snapshot_id}]"),
+            )
+            connection.execute(
+                """
+                INSERT INTO sync_runs(
+                    started_at, finished_at, status, league_id,
+                    rows_written, snapshots_written, message, warnings_json
+                ) VALUES(
+                    '2026-07-31T12:00:00Z', '2026-07-31T12:01:00Z',
+                    'partial', ?, 1, 1, 'private machine error',
+                    '["private warning"]'
+                )
+                """,
+                (self.league.id,),
+            )
+            connection.execute(
+                """
+                INSERT INTO recommendation_runs(
+                    league_id, generated_at, budget, horizon_days, payload_json
+                ) VALUES(
+                    ?, '2026-07-31T12:00:00Z', 100, 7,
+                    '{"rankings":[{"item_key":"gem:fixture"}]}'
+                )
+                """,
+                (self.league.id,),
+            )
+            settings = {
+                "exchange_categories": '["Currency"]',
+                "item_categories": '["Gem"]',
+                "ggg_currency_cursor:Currency": "1785000000",
+                "gggXcurrencyXcursor:lookalike": '"must-delete"',
+                "ggg_oauth_token": '"must-delete"',
+                "local_path": '"C:/private/path"',
+            }
+            connection.executemany(
+                """
+                INSERT INTO settings(key, value_json, updated_at)
+                VALUES(?, ?, '2026-07-31T12:00:00Z')
+                """,
+                settings.items(),
+            )
+            connection.commit()
+
+    def _restore(self, compressed: Path, name: str) -> Path:
+        restored = self.root / name
+        with gzip.open(compressed, "rb") as source:
+            restored.write_bytes(source.read())
+        return restored
+
+    def test_public_snapshot_strips_private_state_and_keeps_market_data(
+        self,
+    ) -> None:
+        with closing(sqlite3.connect(self.database)) as source:
+            preserved_counts = {
+                table: source.execute(
+                    f"SELECT COUNT(*) FROM {table}"
+                ).fetchone()[0]
+                for table in (
+                    "leagues",
+                    "price_points",
+                    "historical_assets",
+                    "historical_fetch_state",
+                    "seasonal_prices",
+                    "meta_class_snapshots",
+                    "recommendation_runs",
+                )
+            }
+            source_raw_count = source.execute(
+                "SELECT COUNT(*) FROM raw_snapshots"
+            ).fetchone()[0]
+
+        compressed = self.root / "archive" / "public.sqlite3.gz"
+        summary = create_public_market_snapshot(
+            self.database,
+            compressed,
+            compression_level=1,
+        )
+
+        self.assertEqual(summary["archive_kind"], "public-market")
+        self.assertTrue(summary["sanitized"])
+        self.assertEqual(summary["integrity"], "ok")
+        self.assertLess(
+            summary["database_bytes_after_sanitization"],
+            summary["database_bytes_before_sanitization"],
+        )
+        self.assertEqual(
+            summary["sanitization"]["raw_snapshots_removed"],
+            source_raw_count,
+        )
+        self.assertGreater(
+            summary["sanitization"]["snapshot_references_cleared"],
+            0,
+        )
+        self.assertGreater(summary["sanitization"]["settings_removed"], 0)
+
+        restored = self._restore(compressed, "public-restored.sqlite3")
+        with closing(sqlite3.connect(restored)) as archive:
+            archive.execute("PRAGMA foreign_keys = ON")
+            self.assertEqual(
+                archive.execute("PRAGMA quick_check").fetchone()[0],
+                "ok",
+            )
+            self.assertEqual(
+                archive.execute("PRAGMA foreign_key_check").fetchall(),
+                [],
+            )
+            for table, expected in preserved_counts.items():
+                self.assertEqual(
+                    archive.execute(
+                        f"SELECT COUNT(*) FROM {table}"
+                    ).fetchone()[0],
+                    expected,
+                    table,
+                )
+            self.assertEqual(
+                archive.execute(
+                    "SELECT COUNT(*) FROM raw_snapshots"
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                archive.execute(
+                    """
+                    SELECT COUNT(*) FROM price_points
+                    WHERE snapshot_id IS NOT NULL
+                    """
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                archive.execute(
+                    """
+                    SELECT COUNT(*) FROM seasonal_prices
+                    WHERE snapshot_id IS NOT NULL
+                    """
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                archive.execute(
+                    "SELECT snapshot_ids_json FROM meta_class_snapshots"
+                ).fetchone()[0],
+                "[]",
+            )
+            self.assertIsNone(
+                archive.execute(
+                    "SELECT last_error FROM historical_fetch_state"
+                ).fetchone()[0]
+            )
+            self.assertEqual(
+                archive.execute(
+                    "SELECT COUNT(*) FROM source_state"
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                archive.execute(
+                    "SELECT COUNT(*) FROM sync_runs"
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                [
+                    row[0]
+                    for row in archive.execute(
+                        "SELECT key FROM settings ORDER BY key"
+                    )
+                ],
+                ["ggg_currency_cursor:Currency"],
+            )
+
+        # VACUUM must physically remove the exact compressed private blob,
+        # not merely make it unreachable in SQLite's b-tree.
+        private_blob = gzip.compress(
+            self.private_payload,
+            compresslevel=6,
+            mtime=0,
+        )
+        self.assertNotIn(private_blob, restored.read_bytes())
+
+        # The resulting schema remains writable by the next daily update.
+        updater_storage = Storage(restored)
+        _, created = updater_storage.add_snapshot(
+            source="fixture-next-update",
+            endpoint="https://example.invalid/current",
+            league_id=self.league.id,
+            category="Currency",
+            fetched_at="2026-08-01T12:00:00Z",
+            status_code=200,
+            raw=b'{"next":"update"}',
+        )
+        self.assertTrue(created)
+        self.assertTrue(updater_storage.healthcheck())
+
+        # Sanitization is applied only to the copy.
+        self.assertEqual(
+            self.storage.read_snapshot(self.private_snapshot_id),
+            self.private_payload,
+        )
+
+    def test_full_snapshot_remains_a_full_backup(self) -> None:
+        compressed = self.root / "archive" / "full.sqlite3.gz"
+        summary = create_compressed_database_snapshot(
+            self.database,
+            compressed,
+            compression_level=1,
+        )
+        self.assertEqual(summary["archive_kind"], "full")
+        self.assertFalse(summary["sanitized"])
+
+        restored = self._restore(compressed, "full-restored.sqlite3")
+        full_storage = Storage(restored)
+        self.assertEqual(
+            full_storage.read_snapshot(self.private_snapshot_id),
+            self.private_payload,
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
