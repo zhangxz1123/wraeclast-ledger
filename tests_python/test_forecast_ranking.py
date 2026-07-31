@@ -115,6 +115,53 @@ class ForecastRankingTests(unittest.TestCase):
             ]
         )
 
+    def add_lifecycle_curve(
+        self,
+        key: str,
+        name: str,
+        league_id: str,
+        weekly_values: list[float],
+        *,
+        category: str = "Currency",
+    ) -> None:
+        spec = next(
+            value
+            for value in COMPLETED_LEAGUES
+            if value.league_id == league_id
+        )
+        self.storage.upsert_historical_assets(
+            [
+                {
+                    "source": "poe.watch",
+                    "source_item_id": key,
+                    "item_key": key,
+                    "name": name,
+                    "category": category,
+                    "eligible": True,
+                }
+            ]
+        )
+        rows = []
+        start = datetime.fromisoformat(spec.start_at.replace("Z", "+00:00"))
+        for week, value in enumerate(weekly_values):
+            for offset in (0, 1):
+                league_day = week * 7 + offset + 1
+                rows.append(
+                    {
+                        "league_id": league_id,
+                        "item_key": key,
+                        "source": "poe.watch",
+                        "source_item_id": key,
+                        "league_day": league_day,
+                        "observed_at": iso_utc(
+                            start + timedelta(days=league_day - 1)
+                        ),
+                        "divine_value": value,
+                        "confidence": 0.9,
+                    }
+                )
+        self.storage.upsert_seasonal_prices(rows)
+
     def test_only_broad_leagues_contribute_and_sparse_history_is_not_gated(
         self,
     ) -> None:
@@ -149,7 +196,7 @@ class ForecastRankingTests(unittest.TestCase):
         self.assertNotIn("eligibility_status", one)
         self.assertEqual(payload["forecast_model"]["eligibility_gates"], [])
 
-    def test_routine_base_currency_is_outside_the_requested_universe(
+    def test_sub_chaos_price_is_outside_the_requested_universe(
         self,
     ) -> None:
         self.add_current(
@@ -176,6 +223,11 @@ class ForecastRankingTests(unittest.TestCase):
             7,
             2.0,
         )
+        self.add_current(
+            "currency:one-chaos-floor",
+            "One Chaos Floor",
+            [0.01],
+        )
 
         payload = RecommendationEngine(self.storage).generate(
             self.live,
@@ -186,8 +238,11 @@ class ForecastRankingTests(unittest.TestCase):
         names = {row["name"] for row in payload["rankings"]}
         self.assertNotIn("Jeweller's Orb", names)
         self.assertIn("Fracturing Orb", names)
+        self.assertIn("One Chaos Floor", names)
         self.assertEqual(
-            payload["investment_scope"]["excluded_routine_currency_items"],
+            payload["investment_scope"][
+                "excluded_below_one_chaos_items"
+            ],
             1,
         )
         self.assertEqual(
@@ -220,7 +275,7 @@ class ForecastRankingTests(unittest.TestCase):
         self.assertEqual(forecast["blend"]["historical_weight"], 0.7)
         self.assertEqual(forecast["blend"]["current_curve_weight"], 0.3)
 
-    def test_negative_falling_maven_and_low_liquidity_remain_ranked(
+    def test_known_maven_decline_is_omitted_without_other_eligibility_gates(
         self,
     ) -> None:
         key = "fragment:the-mavens-writ"
@@ -247,16 +302,80 @@ class ForecastRankingTests(unittest.TestCase):
             horizon=7,
             persist=False,
         )
-        maven = next(
-            row
-            for row in payload["rankings"]
-            if row["name"] == "The Maven's Writ"
+        self.assertNotIn(
+            "The Maven's Writ",
+            {row["name"] for row in payload["rankings"]},
         )
-        self.assertLess(maven["expected_gain"], 0)
-        self.assertEqual(maven["historical_sample_leagues"], 1)
+        vetoes = payload["investment_scope"]["known_decline_vetoes"]
+        self.assertEqual(len(vetoes), 1)
+        self.assertEqual(vetoes[0]["name"], "The Maven's Writ")
+
+    def test_recent_league_consensus_automatically_omits_chaos_orb(
+        self,
+    ) -> None:
+        chaos_key = "currency:chaos-orb"
+        self.add_current(chaos_key, "Chaos Orb", [0.01])
+        self.add_current("currency:divine-orb", "Divine Orb", [1.0])
+        declining = [1.0 * 0.95**week for week in range(12)]
+        increasing = [0.5 * 1.03**week for week in range(12)]
+        for league_id in ("Mirage", "Keepers"):
+            self.add_lifecycle_curve(
+                chaos_key,
+                "Chaos Orb",
+                league_id,
+                declining,
+            )
+        for league_id in ("Mercenaries", "Settlers"):
+            self.add_lifecycle_curve(
+                chaos_key,
+                "Chaos Orb",
+                league_id,
+                increasing,
+            )
+
+        payload = RecommendationEngine(self.storage).generate(
+            self.live,
+            horizon=7,
+            persist=False,
+        )
+
+        names = {row["name"] for row in payload["rankings"]}
+        self.assertNotIn("Chaos Orb", names)
+        # A routine currency is not excluded merely by name anymore.
+        self.assertIn("Divine Orb", names)
+        scope = payload["investment_scope"]
+        self.assertEqual(scope["automatic_decline_items"], 1)
+        veto = scope["automatic_decline_vetoes"][0]
+        self.assertEqual(veto["name"], "Chaos Orb")
+        self.assertGreaterEqual(veto["weighted_support"], 0.65)
         self.assertEqual(
-            payload["investment_scope"]["known_decline_vetoes"],
-            [],
+            set(veto["declining_leagues"]),
+            {"Mirage", "Keepers"},
+        )
+
+    def test_one_declining_league_does_not_trigger_automatic_omission(
+        self,
+    ) -> None:
+        key = "currency:one-decline"
+        self.add_current(key, "One Decline", [0.02])
+        declining = [1.0 * 0.95**week for week in range(12)]
+        stable = [1.0 for _ in range(12)]
+        self.add_lifecycle_curve(key, "One Decline", "Mirage", declining)
+        self.add_lifecycle_curve(key, "One Decline", "Keepers", stable)
+
+        payload = RecommendationEngine(self.storage).generate(
+            self.live,
+            horizon=7,
+            persist=False,
+        )
+
+        self.assertIn(
+            "One Decline",
+            {row["name"] for row in payload["rankings"]},
+        )
+        self.assertEqual(
+            payload["investment_scope"]["automatic_decline_items"],
+            0,
         )
 
     def test_selected_horizon_changes_ranking(self) -> None:
@@ -371,6 +490,58 @@ class ForecastRankingTests(unittest.TestCase):
         self.assertNotIn("forecast_horizons", awakened[0])
         self.assertNotIn("horizons", awakened[0])
         self.assertEqual(awakened[0]["forecast_3d"], {"days": 3})
+
+    def test_item_level_variants_have_distinct_full_identity(self) -> None:
+        self.add_current(
+            "basetype:abyssal-axe-86-hunter-variant-hunter",
+            "Abyssal Axe",
+            [1.0],
+            category="BaseType",
+            details={"variant": "Hunter"},
+        )
+        self.add_current(
+            "clusterjewel:12-to-chaos-resistance-2-passives-84-variant-2-passives",
+            "+12% to Chaos Resistance",
+            [1.0],
+            category="ClusterJewel",
+            details={
+                "variant": "2 passives",
+                "baseType": "Small Cluster Jewel",
+            },
+        )
+        self.add_current(
+            "uniqueweapon:agnerod-east-imperial-staff-6l-links-6",
+            "Agnerod East",
+            [1.0],
+            category="UniqueWeapon",
+            details={"baseType": "Imperial Staff", "links": 6},
+        )
+        self.add_current(
+            "wombgift:ancient-wombgift-84",
+            "Ancient Wombgift",
+            [1.0],
+            category="Wombgift",
+        )
+
+        payload = RecommendationEngine(self.storage).generate(
+            self.live,
+            horizon=7,
+            persist=False,
+        )
+        identities = {
+            row["name"]: row["trade_identity"]
+            for row in payload["rankings"]
+        }
+        self.assertEqual(identities["Abyssal Axe"]["item_level"], 86)
+        self.assertEqual(
+            identities["+12% to Chaos Resistance"]["item_level"],
+            84,
+        )
+        self.assertEqual(identities["Agnerod East"]["links"], 6)
+        self.assertEqual(
+            identities["Ancient Wombgift"]["item_level"],
+            84,
+        )
 
     def test_history_comparison_contains_only_broad_leagues(self) -> None:
         key = "currency:curve"

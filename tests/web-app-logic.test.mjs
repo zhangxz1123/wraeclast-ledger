@@ -149,6 +149,113 @@ test("official trade links preserve league and exact Awakened gem variant", () =
   assert.equal(forbiddenQuery.query.name, "Forbidden Flame");
 });
 
+test("full item names wrap and include exact visible variant identity", () => {
+  const result = runInApp(`
+    const gem = normalizeRecommendation({
+      key: "skillgem:awakened-enlighten-support-5c",
+      name: "Awakened Enlighten Support",
+      category: "SkillGem",
+      trade_identity: {
+        variant: "5c",
+        gem_level: 5,
+        corrupted: true,
+      },
+    }, 0);
+    const jewel = normalizeRecommendation({
+      key: "forbidden:flame-instruments-of-virtue",
+      name: "Instruments of Virtue",
+      category: "ForbiddenJewel",
+      trade_identity: {
+        variant: "Forbidden Flame",
+        passive_name: "Instruments of Virtue",
+      },
+    }, 1);
+    const flesh = normalizeRecommendation({
+      key: "forbidden:flesh-instruments-of-virtue",
+      name: "Instruments of Virtue",
+      category: "ForbiddenJewel",
+      trade_identity: {
+        variant: "Forbidden Flesh",
+        passive_name: "Instruments of Virtue",
+      },
+    }, 2);
+    const base = normalizeRecommendation({
+      key: "basetype:abyssal-axe-86-hunter-variant-hunter",
+      name: "Abyssal Axe",
+      category: "BaseType",
+      trade_identity: {
+        variant: "Hunter",
+        item_level: 86,
+      },
+    }, 3);
+    const clusterLevel = normalizeRecommendation({
+      key: "clusterjewel:chaos-resistance-2-passives-84",
+      name: "+12% to Chaos Resistance",
+      category: "ClusterJewel",
+      trade_identity: {
+        variant: "2 passives",
+        item_level: 84,
+      },
+    }, 4);
+    const linkedUnique = normalizeRecommendation({
+      key: "uniqueweapon:agnerod-east-6l-links-6",
+      name: "Agnerod East",
+      category: "UniqueWeapon",
+      trade_identity: {
+        base_type: "Imperial Staff",
+        links: 6,
+      },
+    }, 5);
+    const longName = "Adds 12 Passive Skills where the complete enchantment name must remain visible instead of being shortened by the ranking table";
+    const cluster = normalizeRecommendation({
+      key: "cluster:long-name",
+      name: longName,
+      category: "ClusterJewel",
+    }, 2);
+    globalThis.__result = {
+      gem: gem.displayName,
+      jewel: jewel.displayName,
+      flesh: flesh.displayName,
+      base: base.displayName,
+      clusterLevel: clusterLevel.displayName,
+      linkedUnique: linkedUnique.displayName,
+      cluster: cluster.displayName,
+    };
+  `);
+
+  assert.equal(
+    result.gem,
+    "Awakened Enlighten Support — Level 5 · corrupted",
+  );
+  assert.equal(
+    result.jewel,
+    "Forbidden Flame (Instruments of Virtue)",
+  );
+  assert.equal(
+    result.flesh,
+    "Forbidden Flesh (Instruments of Virtue)",
+  );
+  assert.equal(result.base, "Abyssal Axe — Item level 86 · Hunter");
+  assert.equal(
+    result.clusterLevel,
+    "+12% to Chaos Resistance — Item level 84 · 2 passives",
+  );
+  assert.equal(result.linkedUnique, "Agnerod East — 6-link");
+  assert.equal(
+    result.cluster,
+    "Adds 12 Passive Skills where the complete enchantment name must remain visible instead of being shortened by the ranking table",
+  );
+
+  const styles = fs.readFileSync(
+    new URL("../web/styles.css", import.meta.url),
+    "utf8",
+  );
+  const titleRule = styles.match(/\.item-cell strong\s*\{([^}]*)\}/)?.[1] || "";
+  assert.match(titleRule, /white-space:\s*normal/);
+  assert.match(titleRule, /overflow-wrap:\s*anywhere/);
+  assert.doesNotMatch(titleRule, /text-overflow:\s*ellipsis/);
+});
+
 test("pagination and hidden-item filtering operate on the complete list", () => {
   const result = runInApp(`
     state.page = 2;

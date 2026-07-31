@@ -865,6 +865,95 @@ class Storage:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def seasonal_lifecycle_rows(
+        self,
+        item_keys: Iterable[str],
+        league_ids: Iterable[str],
+        *,
+        minimum_league_day: int = 1,
+        maximum_league_day: int = 120,
+        minimum_confidence: float = 0.0,
+    ) -> list[dict[str, Any]]:
+        """Return one preferred daily bar per item and completed league.
+
+        Lifecycle classification needs the whole curve for many current items.
+        Querying all requested leagues once is substantially faster than one
+        SQLite query per item. The result is filtered to ``item_keys`` in
+        Python so a large live catalog cannot exceed SQLite's parameter limit.
+        """
+
+        keys = {
+            str(item_key).strip()
+            for item_key in item_keys
+            if str(item_key).strip()
+        }
+        leagues = list(
+            dict.fromkeys(
+                str(league_id).strip()
+                for league_id in league_ids
+                if str(league_id).strip()
+            )
+        )
+        if not keys or not leagues:
+            return []
+        first_day = max(1, int(minimum_league_day))
+        last_day = max(first_day, int(maximum_league_day))
+        confidence_floor = max(0.0, min(1.0, float(minimum_confidence)))
+        placeholders = ",".join("?" for _ in leagues)
+        parameters: list[Any] = [
+            first_day,
+            last_day,
+            confidence_floor,
+            *leagues,
+        ]
+        with closing(self.connect()) as connection:
+            rows = connection.execute(
+                f"""
+                WITH ranked AS (
+                    SELECT price.item_key,
+                           price.league_id,
+                           COALESCE(leagues.name, price.league_id)
+                               AS league_name,
+                           leagues.start_at AS league_start_at,
+                           price.league_day,
+                           price.observed_at,
+                           price.divine_value,
+                           price.chaos_value,
+                           price.volume,
+                           price.source,
+                           price.source_item_id,
+                           price.confidence,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY price.item_key, price.league_id,
+                                            price.league_day
+                               ORDER BY price.confidence DESC,
+                                        price.updated_at DESC,
+                                        price.source,
+                                        price.source_item_id
+                           ) AS preference_rank
+                    FROM seasonal_prices AS price
+                    LEFT JOIN leagues
+                      ON leagues.id = price.league_id
+                    WHERE price.league_day BETWEEN ? AND ?
+                      AND price.confidence >= ?
+                      AND price.divine_value > 0
+                      AND price.league_id IN ({placeholders})
+                )
+                SELECT item_key, league_id, league_name, league_start_at,
+                       league_day, observed_at, divine_value, chaos_value,
+                       volume, source, source_item_id, confidence
+                FROM ranked
+                WHERE preference_rank = 1
+                ORDER BY item_key, league_start_at, league_id, league_day
+                """,
+                parameters,
+            ).fetchall()
+        return [
+            dict(row)
+            for row in rows
+            if str(row["item_key"]) in keys
+        ]
+
     def current_item_history_archive(
         self,
         league_id: str,

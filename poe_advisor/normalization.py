@@ -223,6 +223,7 @@ def normalize_poe_ninja(
                 "gemQuality",
                 "mapTier",
                 "baseType",
+                "levelRequired",
                 "icon",
             )
             if line.get(key) is not None

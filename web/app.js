@@ -448,8 +448,8 @@ function hideItem(rank) {
   renderRecommendations();
   toast(
     persisted
-      ? `${item.name} hidden on this device.`
-      : `${item.name} hidden for this session only.`,
+      ? `${item.displayName} hidden on this device.`
+      : `${item.displayName} hidden for this session only.`,
     persisted ? "success" : "error",
   );
   els.recommendationList.querySelector("[data-open-detail]")?.focus();
@@ -464,15 +464,58 @@ function recommendationVariantLabel(category, identity) {
     if (!parts.length && identity.variant) parts.push(`Variant ${identity.variant}`);
     return parts.join(" · ");
   }
+  if (category === "BaseType" || category === "ClusterJewel") {
+    const parts = [];
+    if (identity.itemLevel != null) {
+      parts.push(`Item level ${identity.itemLevel}`);
+    }
+    if (identity.variant) parts.push(String(identity.variant));
+    return parts.join(" · ");
+  }
+  const parts = [];
+  if (identity.itemLevel != null) {
+    parts.push(`Item level ${identity.itemLevel}`);
+  }
+  if (identity.mapTier != null) parts.push(`Tier ${identity.mapTier}`);
   if (
     identity.variant
     && !String(identity.variant).toLowerCase().includes(
       String(category).toLowerCase(),
     )
   ) {
-    return String(identity.variant);
+    parts.push(String(identity.variant));
   }
-  return "";
+  if (identity.links != null) parts.push(`${identity.links}-link`);
+  if (identity.corrupted === true) parts.push("corrupted");
+  return parts.join(" · ");
+}
+
+function recommendationDisplayName(name, category, identity, variantLabel) {
+  const baseName = String(name || "Unknown item").trim();
+  if (category === "ForbiddenJewel") {
+    const jewelKind = /^Forbidden (?:Flame|Flesh)$/i.test(
+      String(identity.variant || "").trim(),
+    )
+      ? String(identity.variant).trim()
+      : String(baseName).match(/^Forbidden (?:Flame|Flesh)/i)?.[0] || "";
+    const passiveName = String(identity.passiveName || "").trim();
+    if (jewelKind && passiveName) {
+      const lowerName = baseName.toLowerCase();
+      if (
+        lowerName.includes(jewelKind.toLowerCase())
+        && lowerName.includes(passiveName.toLowerCase())
+      ) {
+        return baseName;
+      }
+      return `${jewelKind} (${passiveName})`;
+    }
+    return baseName;
+  }
+  const label = String(variantLabel || "").trim();
+  if (!label || baseName.toLowerCase().includes(label.toLowerCase())) {
+    return baseName;
+  }
+  return `${baseName} — ${label}`;
 }
 
 function officialTradeSearch(item) {
@@ -695,6 +738,15 @@ function normalizeRecommendation(item, index) {
       rawTradeIdentity.gem_quality,
       rawTradeIdentity.gemQuality,
     ),
+    itemLevel: nullableNumber(
+      rawTradeIdentity.item_level,
+      rawTradeIdentity.itemLevel,
+    ),
+    links: nullableNumber(rawTradeIdentity.links),
+    mapTier: nullableNumber(
+      rawTradeIdentity.map_tier,
+      rawTradeIdentity.mapTier,
+    ),
     corrupted: rawCorrupted == null
       ? null
       : rawCorrupted === true || String(rawCorrupted).toLowerCase() === "true",
@@ -705,6 +757,12 @@ function normalizeRecommendation(item, index) {
     ),
   };
   const variantLabel = recommendationVariantLabel(category, tradeIdentity);
+  const displayName = recommendationDisplayName(
+    name,
+    category,
+    tradeIdentity,
+    variantLabel,
+  );
   return {
     ...item,
     rank: toNumber(item.rank, index + 1),
@@ -713,7 +771,8 @@ function normalizeRecommendation(item, index) {
     category,
     tradeIdentity,
     variantLabel,
-    searchText: `${name} ${category} ${variantLabel} ${tradeIdentity.passiveName || ""}`.toLowerCase(),
+    displayName,
+    searchText: `${displayName} ${category} ${tradeIdentity.passiveName || ""}`.toLowerCase(),
     priceDivine: nullableNumber(
       item.price_divine,
       item.current_price_divine,
@@ -783,7 +842,7 @@ function renderRankingSummary() {
     ? ` ${compact(hiddenCount)} hidden on this device.`
     : "";
   els.modelNote.textContent = returned
-    ? `${showing}, sorted by gross ${horizon}-day expected gain.${hiddenNote} Forecasts use only Mirage, Keepers, Mercenaries, and Settlers.${excludedItems ? ` ${compact(excludedItems)} routine low-value markets remain outside the ranking.` : ""}`
+    ? `${showing}, sorted by gross ${horizon}-day expected gain.${hiddenNote} Forecasts use only Mirage, Keepers, Mercenaries, and Settlers.${excludedItems ? ` ${compact(excludedItems)} archived markets are omitted by category, the 1c floor, or the persistent-decline rule.` : ""}`
     : `No item forecast is available yet. Build the broad-league archive, then sync again.`;
 }
 
@@ -1115,7 +1174,7 @@ async function loadSeasonalComparison(item) {
     || item.itemKey
     || item.key;
   if (!itemKey) {
-    container.innerHTML = seasonalComparisonMarkup(null, item.name);
+    container.innerHTML = seasonalComparisonMarkup(null, item.displayName);
     return;
   }
 
@@ -1124,7 +1183,7 @@ async function loadSeasonalComparison(item) {
     if (!container.isConnected) return;
     container.outerHTML = seasonalComparisonMarkup(
       payload?.seasonal_comparison || payload?.seasonalComparison,
-      item.name,
+      item.displayName,
     );
   } catch (error) {
     if (!container.isConnected) return;
@@ -1269,9 +1328,9 @@ function renderRecommendations() {
       const trade = officialTradeSearch(item);
       const tradeTitle = trade.broad
         ? `Search official trade for ${item.tradeIdentity.variant || item.name}; choose ${item.tradeIdentity.passiveName} in the Allocates filter`
-        : `Search official trade for ${item.name}${item.variantLabel ? ` (${item.variantLabel})` : ""}`;
+        : `Search official trade for ${item.displayName}`;
       const detailLabel = (
-        `Open ${item.name} forecasts and current versus broad-league price curves; `
+        `Open ${item.displayName} forecasts and current versus broad-league price curves; `
         + `${horizon}-day expected gain ${selectedForecast?.expectedGainPct == null
           ? "unavailable"
           : forecastPercent(selectedForecast.expectedGainPct)}`
@@ -1280,18 +1339,17 @@ function renderRecommendations() {
         <article class="recommendation-row" data-rank="${item.rank}">
           <div class="row-action-cell hide-cell">
             ${item.itemKey
-              ? `<button class="hide-item-button" type="button" data-hide-rank="${item.rank}" aria-label="Hide ${escapeHtml(item.name)} from recommendations">Hide</button>`
+              ? `<button class="hide-item-button" type="button" data-hide-rank="${item.rank}" aria-label="Hide ${escapeHtml(item.displayName)} from recommendations">Hide</button>`
               : ""}
           </div>
           <div class="item-cell">
             <span class="rank">#${item.rank}</span>
             <div class="item-summary">
               <button class="item-name-button" type="button" data-open-detail="${item.rank}" aria-label="${escapeHtml(detailLabel)}">
-                <strong>${escapeHtml(item.name)}</strong>
+                <strong>${escapeHtml(item.displayName)}</strong>
               </button>
               <small>
                 <span>${escapeHtml(item.category)}</span>
-                ${item.variantLabel ? `<span>${escapeHtml(item.variantLabel)}</span>` : ""}
               </small>
             </div>
           </div>
@@ -1421,7 +1479,7 @@ function openDetail(rank) {
       <span class="detail-rank">#${item.rank}</span>
       <span class="detail-category">${escapeHtml(item.category)}</span>
     </div>
-    <h2>${escapeHtml(item.name)}</h2>
+    <h2>${escapeHtml(item.displayName)}</h2>
     <p class="detail-summary">Gross price forecasts from four broadly covered leagues and the current-league curve. These estimates do not deduct trading costs or adjust for execution depth.</p>
     <div class="detail-metrics">
       <div><span>CURRENT PRICE</span><strong>${item.priceDivine == null ? "—" : money(item.priceDivine, 2)}</strong></div>

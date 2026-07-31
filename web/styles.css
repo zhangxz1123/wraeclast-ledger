@@ -670,13 +670,14 @@ main {
 
 .item-cell strong {
   display: block;
-  overflow: hidden;
+  overflow: visible;
   color: #ebe7dd;
   font-family: var(--serif);
   font-size: 17px;
   font-weight: 400;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  line-height: 1.22;
+  overflow-wrap: anywhere;
+  white-space: normal;
 }
 
 .item-name-button {

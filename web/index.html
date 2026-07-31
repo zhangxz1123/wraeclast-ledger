@@ -194,12 +194,14 @@
       <section class="method-section" aria-labelledby="methodTitle">
         <div class="method-intro">
           <p class="eyebrow"><span>03</span> FORECAST METHOD</p>
-          <h2 id="methodTitle">One comparable forecast for every item.</h2>
+          <h2 id="methodTitle">One comparable forecast for every in-scope item.</h2>
           <p>
-            There are no per-item screening gates. The output is a gross
-            price forecast, not a promise of executable profit. Routine
-            low-value consumable categories and base currencies remain
-            outside this investment universe.
+            The output is a gross price forecast, not a promise of executable
+            profit. Markets below 1 Chaos and assets with a persistent decline
+            across broadly covered past leagues remain outside this investment
+            universe, along with the excluded small-consumable categories.
+            Row titles include the exact visible variant identity, including
+            gem state, Forbidden Jewel kind/passive, item level, and links.
           </p>
         </div>
         <ol class="method-grid">
@@ -221,7 +223,7 @@
           <li>
             <span>04</span>
             <strong>Horizon ranking</strong>
-            <p>Rank by gross expected gain for the selected 3, 7, or 14-day window. Friction, liquidity, confidence, falling-knife rules, and structural item vetoes do not alter the order.</p>
+            <p>After the investment-universe filters, rank every remaining exact variant by gross expected gain for the selected 3, 7, or 14-day window. Friction, liquidity, and confidence do not alter that order.</p>
           </li>
         </ol>
       </section>
@@ -234,9 +236,9 @@
             Raw source responses, normalized daily prices, sync logs, and model
             outputs are retained in a local SQLite database for reproducible
             forecasts. Excluded markets such as essences, fossils, and
-            oils—and routine base currencies such as Jeweller's Orbs—stay
+            oils, sub-1-chaos items, and persistent historical decliners stay
             archived for fast research; they are simply outside the investment
-            shortlist.
+            ranking.
           </p>
         </div>
         <dl class="archive-stats">
@@ -294,8 +296,9 @@
         aggregates locally across all 18 exchange and 25 item-overview categories
         configured by the app. Storage is deliberately broader than the investment
         universe: low-end consumables such as essences, fossils, oils, resonators,
-        scarabs, Delirium Orbs, and routine base currencies remain in the local
-        archive but cannot enter the forecast ranking. Exact Forbidden Jewel prices come from the
+        scarabs, and Delirium Orbs remain in the local archive. Items below 1 Chaos
+        and robustly detected past-league decliners also remain archived but cannot
+        enter the forecast ranking. Exact Forbidden Jewel prices come from the
         archived poe.watch catalog, while GGG’s official passive-tree export
         supplies their ascendancy ownership. The app also samples the official
         top-experience ladder as archived market context. Seasonal backfill stores exactly
@@ -307,8 +310,10 @@
         Mercenaries, and Settlers. Their future price levels are recency
         weighted, then blended 70/30 in log-price space with a capped robust
         projection of the current-league curve. A missing exact future-day
-        observation stays missing. No friction, liquidity, confidence, falling-knife, or
-        structural-item rule changes the forecast or rank.
+        observation stays missing. The decline filter uses weekly median
+        Divine-relative curves, robust slopes, and recency-weighted agreement
+        across at least two broad leagues. No friction, liquidity, or confidence
+        adjustment changes the order within the remaining universe.
       </p>
       <label>
         <span>Exchange history on next sync</span>

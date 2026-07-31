@@ -625,21 +625,19 @@ class RecommendationTests(unittest.TestCase):
             )
         }
         self.assertNotIn("Golden Oil", visible_names)
-        self.assertIn("The Maven's Writ", visible_names)
-        maven = next(
-            row
-            for row in payload["rankings"]
-            if row["name"] == "The Maven's Writ"
-        )
-        self.assertIsNone(maven["expected_gain"])
+        self.assertNotIn("The Maven's Writ", visible_names)
         scope = payload["investment_scope"]
-        self.assertEqual(scope["strategy"], "ungated_forecast_ranking")
+        self.assertEqual(scope["strategy"], "filtered_forecast_ranking")
         self.assertEqual(scope["excluded_category_items"], 1)
         self.assertEqual(scope["excluded_category_counts"], {"Oil": 1})
-        self.assertEqual(scope["known_decline_vetoes"], [])
+        self.assertEqual(len(scope["known_decline_vetoes"]), 1)
+        self.assertEqual(
+            scope["known_decline_vetoes"][0]["name"],
+            "The Maven's Writ",
+        )
         ranked_names = {row["name"] for row in payload["rankings"]}
         self.assertNotIn("Golden Oil", ranked_names)
-        self.assertIn("The Maven's Writ", ranked_names)
+        self.assertNotIn("The Maven's Writ", ranked_names)
         self.assertEqual(
             self.storage.status_counts(live.id)["price_points"],
             2,

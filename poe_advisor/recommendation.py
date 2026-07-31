@@ -175,6 +175,21 @@ CURRENT_CURVE_FORECAST_WEIGHT = 0.30
 CURRENT_CURVE_LOOKBACK_POINTS = 7
 CURRENT_PROJECTION_GAIN_FLOOR = -0.50
 CURRENT_PROJECTION_GAIN_CEILING = 0.50
+MINIMUM_INVESTMENT_PRICE_CHAOS = 1.0
+
+# Structural decline is measured from weekly median Divine-relative prices.
+# The rule is deliberately conservative: one noisy league is never enough to
+# remove an item, and newer broadly covered leagues receive more influence.
+DECLINE_CURVE_MAXIMUM_DAY = 120
+DECLINE_WEEK_DAYS = 7
+DECLINE_MINIMUM_POINTS_PER_WEEK = 2
+DECLINE_MINIMUM_WEEKS = 12
+DECLINE_MINIMUM_DAY_SPAN = 70
+DECLINE_MAXIMUM_WEEKLY_GAIN = -0.02
+DECLINE_MINIMUM_NEGATIVE_PAIR_FRACTION = 0.70
+DECLINE_MAXIMUM_EARLY_LATE_RATIO = 0.80
+DECLINE_MINIMUM_LEAGUE_VOTES = 2
+DECLINE_MINIMUM_WEIGHTED_SUPPORT = 0.65
 
 # These markets remain in the local archive for research and fast queries, but
 # they are intentionally outside the investment ranking. Their repeatable
@@ -193,42 +208,6 @@ EXCLUDED_INVESTMENT_CATEGORIES = (
 _EXCLUDED_INVESTMENT_CATEGORY_KEYS = frozenset(
     re.sub(r"[^a-z0-9]+", "", value.casefold())
     for value in EXCLUDED_INVESTMENT_CATEGORIES
-)
-
-# Routine, low-unit base currencies were also explicitly placed outside the
-# investment list. This is a fixed market scope, not a price threshold:
-# premium currencies such as Fracturing Orbs, Sacred Orbs, Veiled Orbs,
-# Hinekora's Locks, and Mirrors remain in scope.
-EXCLUDED_INVESTMENT_ITEM_KEYS = frozenset(
-    {
-        "currency:armourers-scrap",
-        "currency:blacksmiths-whetstone",
-        "currency:blessed-orb",
-        "currency:cartographers-chisel",
-        "currency:chaos-orb",
-        "currency:chromatic-orb",
-        "currency:divine-orb",
-        "currency:exalted-orb",
-        "currency:gemcutters-prism",
-        "currency:glassblowers-bauble",
-        "currency:instilling-orb",
-        "currency:jewellers-orb",
-        "currency:orb-of-alchemy",
-        "currency:orb-of-alteration",
-        "currency:orb-of-augmentation",
-        "currency:orb-of-binding",
-        "currency:orb-of-chance",
-        "currency:orb-of-fusing",
-        "currency:orb-of-regret",
-        "currency:orb-of-scouring",
-        "currency:orb-of-transmutation",
-        "currency:orb-of-unmaking",
-        "currency:portal-scroll",
-        "currency:regal-orb",
-        "currency:rogues-marker",
-        "currency:scroll-of-wisdom",
-        "currency:vaal-orb",
-    }
 )
 
 # Structural priors are explicit and auditable. They override a noisy
@@ -258,10 +237,6 @@ def _category_is_excluded(category: str) -> bool:
     )
 
 
-def _routine_currency_is_excluded(item_key: str) -> bool:
-    return str(item_key).casefold() in EXCLUDED_INVESTMENT_ITEM_KEYS
-
-
 def _known_declining_lifecycle(
     item_key: str,
     name: str,
@@ -272,6 +247,236 @@ def _known_declining_lifecycle(
         name_token,
         KNOWN_DECLINING_LIFECYCLES.get(key_token),
     )
+
+
+def _item_level_from_identity(
+    item_key: str,
+    category: str,
+    details: dict[str, Any],
+) -> int | None:
+    """Recover the exact poe.ninja item-level variant without changing keys."""
+
+    if category not in {"BaseType", "ClusterJewel", "Wombgift"}:
+        return None
+    raw_level = details.get("itemLevel")
+    if raw_level is None:
+        raw_level = details.get("item_level")
+    if raw_level is None:
+        raw_level = details.get("levelRequired")
+    if raw_level is not None:
+        try:
+            item_level = int(raw_level)
+        except (TypeError, ValueError):
+            item_level = 0
+        if 1 <= item_level <= 100:
+            return item_level
+
+    identity = str(item_key).split(":", 1)[-1].casefold()
+    variant = str(details.get("variant") or "").strip().casefold()
+    variant_slug = re.sub(r"[^a-z0-9]+", "-", variant).strip("-")
+    variant_suffix = f"-variant-{variant_slug}" if variant_slug else ""
+    if variant_suffix and identity.endswith(variant_suffix):
+        identity = identity[: -len(variant_suffix)]
+    if variant_slug and identity.endswith(f"-{variant_slug}"):
+        identity = identity[: -(len(variant_slug) + 1)]
+    match = re.search(r"-(\d{1,3})$", identity)
+    if not match:
+        return None
+    item_level = int(match.group(1))
+    return item_level if 1 <= item_level <= 100 else None
+
+
+def _weighted_median(
+    values: list[tuple[float, float]],
+) -> float | None:
+    eligible = [
+        (float(value), float(weight))
+        for value, weight in values
+        if math.isfinite(float(value))
+        and math.isfinite(float(weight))
+        and float(weight) > 0
+    ]
+    if not eligible:
+        return None
+    eligible.sort(key=lambda pair: pair[0])
+    midpoint = sum(weight for _, weight in eligible) / 2.0
+    cumulative = 0.0
+    for value, weight in eligible:
+        cumulative += weight
+        if cumulative >= midpoint:
+            return value
+    return eligible[-1][0]
+
+
+def _historical_decline_assessments(
+    rows: list[dict[str, Any]],
+    *,
+    league_weights: dict[str, float],
+) -> dict[str, dict[str, Any]]:
+    """Classify persistent completed-league depreciation by exact item key.
+
+    Daily markets are noisy, so each league is reduced to weekly median
+    log-prices. A robust Theil-Sen slope, the share of negative pairwise
+    slopes, and the early/late price ratio must all agree. Finally, at least
+    two broadly covered leagues and 65% of their available recency weight must
+    vote for decline.
+    """
+
+    grouped: defaultdict[
+        str, defaultdict[str, list[tuple[int, float]]]
+    ] = defaultdict(lambda: defaultdict(list))
+    for row in rows:
+        item_key = str(row.get("item_key") or "").strip()
+        league_id = str(row.get("league_id") or "").strip()
+        try:
+            league_day = int(row.get("league_day") or 0)
+            price = float(row.get("divine_value") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if (
+            not item_key
+            or league_id not in league_weights
+            or league_day < 1
+            or league_day > DECLINE_CURVE_MAXIMUM_DAY
+            or not math.isfinite(price)
+            or price <= 0
+        ):
+            continue
+        grouped[item_key][league_id].append((league_day, price))
+
+    assessments: dict[str, dict[str, Any]] = {}
+    for item_key, league_points in grouped.items():
+        profiles: list[dict[str, Any]] = []
+        for league_id, points in league_points.items():
+            weekly: defaultdict[int, list[tuple[int, float]]] = defaultdict(
+                list
+            )
+            for league_day, price in points:
+                weekly[(league_day - 1) // DECLINE_WEEK_DAYS].append(
+                    (league_day, price)
+                )
+            weekly_points = []
+            for bucket in sorted(weekly):
+                bucket_points = weekly[bucket]
+                if len(bucket_points) < DECLINE_MINIMUM_POINTS_PER_WEEK:
+                    continue
+                weekly_points.append(
+                    (
+                        float(
+                            statistics.median(
+                                day for day, _ in bucket_points
+                            )
+                        ),
+                        statistics.median(
+                            _safe_log(price) for _, price in bucket_points
+                        ),
+                    )
+                )
+            span_days = (
+                weekly_points[-1][0] - weekly_points[0][0]
+                if len(weekly_points) >= 2
+                else 0.0
+            )
+            if (
+                len(weekly_points) < DECLINE_MINIMUM_WEEKS
+                or span_days < DECLINE_MINIMUM_DAY_SPAN
+            ):
+                continue
+            pairwise_slopes = [
+                (right_log - left_log) / (right_day - left_day)
+                for left_index, (left_day, left_log) in enumerate(
+                    weekly_points[:-1]
+                )
+                for right_day, right_log in weekly_points[left_index + 1 :]
+                if right_day > left_day
+            ]
+            if not pairwise_slopes:
+                continue
+            log_slope_per_day = statistics.median(pairwise_slopes)
+            weekly_gain = math.expm1(
+                log_slope_per_day * DECLINE_WEEK_DAYS
+            )
+            negative_pair_fraction = sum(
+                slope < 0 for slope in pairwise_slopes
+            ) / len(pairwise_slopes)
+            quartile_size = max(2, len(weekly_points) // 4)
+            early_log_price = statistics.median(
+                point[1] for point in weekly_points[:quartile_size]
+            )
+            late_log_price = statistics.median(
+                point[1] for point in weekly_points[-quartile_size:]
+            )
+            early_late_ratio = math.exp(late_log_price - early_log_price)
+            declines = (
+                weekly_gain <= DECLINE_MAXIMUM_WEEKLY_GAIN
+                and negative_pair_fraction
+                >= DECLINE_MINIMUM_NEGATIVE_PAIR_FRACTION
+                and early_late_ratio <= DECLINE_MAXIMUM_EARLY_LATE_RATIO
+            )
+            profiles.append(
+                {
+                    "league_id": league_id,
+                    "weekly_gain": weekly_gain,
+                    "negative_pair_fraction": negative_pair_fraction,
+                    "early_late_ratio": early_late_ratio,
+                    "weekly_points": len(weekly_points),
+                    "span_days": span_days,
+                    "declines": declines,
+                    "weight": float(league_weights[league_id]),
+                }
+            )
+
+        profiles.sort(
+            key=lambda profile: (
+                -float(profile["weight"]),
+                str(profile["league_id"]),
+            )
+        )
+        total_weight = sum(float(profile["weight"]) for profile in profiles)
+        declining_profiles = [
+            profile for profile in profiles if profile["declines"]
+        ]
+        declining_weight = sum(
+            float(profile["weight"]) for profile in declining_profiles
+        )
+        support = declining_weight / total_weight if total_weight > 0 else 0.0
+        aggregate_weekly_gain = _weighted_median(
+            [
+                (float(profile["weekly_gain"]), float(profile["weight"]))
+                for profile in profiles
+            ]
+        )
+        aggregate_early_late_ratio = _weighted_median(
+            [
+                (
+                    float(profile["early_late_ratio"]),
+                    float(profile["weight"]),
+                )
+                for profile in profiles
+            ]
+        )
+        historical_decline = (
+            len(declining_profiles) >= DECLINE_MINIMUM_LEAGUE_VOTES
+            and support >= DECLINE_MINIMUM_WEIGHTED_SUPPORT
+            and aggregate_weekly_gain is not None
+            and aggregate_weekly_gain <= DECLINE_MAXIMUM_WEEKLY_GAIN
+            and aggregate_early_late_ratio is not None
+            and aggregate_early_late_ratio
+            <= DECLINE_MAXIMUM_EARLY_LATE_RATIO
+        )
+        assessments[item_key] = {
+            "historical_decline": historical_decline,
+            "weighted_support": support,
+            "sample_leagues": len(profiles),
+            "declining_leagues": [
+                str(profile["league_id"])
+                for profile in declining_profiles
+            ],
+            "aggregate_weekly_gain": aggregate_weekly_gain,
+            "aggregate_early_late_ratio": aggregate_early_late_ratio,
+            "profiles": profiles,
+        }
+    return assessments
 
 
 def _current_curve_projection(
@@ -1508,13 +1713,13 @@ class RecommendationEngine:
         horizon: int,
         persist: bool,
     ) -> dict[str, Any]:
-        """Rank every exact current market by an ungated price forecast.
+        """Rank exact current markets after explicit universe exclusions.
 
-        This is the active live model. It intentionally has no recommendation
-        eligibility tier: low-liquidity, negative-trend, sparse-history, stale,
-        and structurally declining items stay in the forecast universe. Only
-        the user-requested small-consumable categories and unresolved source
-        identifiers are omitted.
+        This is the active live model. It has no recommendation eligibility
+        tier, liquidity gate, or price cap. Small-consumable categories,
+        sub-chaos markets, unresolved source identifiers, and assets with a
+        persistent completed-league decline lifecycle are omitted before the
+        remaining exact variants are ranked by their selected forecast.
         """
 
         selected_horizon = (
@@ -1531,11 +1736,27 @@ class RecommendationEngine:
             days=max(90, current_day + 14),
         )
         standard_prices = self.storage.latest_item_prices(STANDARD_LEAGUE_ID)
+        broad_id_set = frozenset(BROADLY_COVERED_LEAGUE_IDS)
+        newest_first = list(reversed(BROADLY_COVERED_LEAGUES))
+        age_rank = {
+            spec.league_id: index
+            for index, spec in enumerate(newest_first)
+        }
+        raw_league_weight = {
+            spec.league_id: SeasonalModel.RECENCY_DECAY_PER_LEAGUE**index
+            for index, spec in enumerate(newest_first)
+        }
         excluded_category_counts: defaultdict[str, int] = defaultdict(int)
-        excluded_routine_currency_counts: defaultdict[str, int] = defaultdict(
-            int
-        )
+        excluded_below_one_chaos_items = 0
+        excluded_unknown_chaos_items = 0
         unresolved_items = 0
+
+        chaos_unit_divine: float | None = None
+        chaos_rows = _daily_rows(histories.get("currency:chaos-orb", []))
+        if chaos_rows:
+            candidate = float(chaos_rows[-1].get("divine_value") or 0.0)
+            if math.isfinite(candidate) and candidate > 0:
+                chaos_unit_divine = candidate
 
         current_items: dict[str, dict[str, Any]] = {}
         for item_key, raw_rows in histories.items():
@@ -1547,11 +1768,8 @@ class RecommendationEngine:
             if _category_is_excluded(category):
                 excluded_category_counts[category] += 1
                 continue
-            if _routine_currency_is_excluded(item_key):
-                excluded_routine_currency_counts[str(latest["name"])] += 1
-                continue
             current = float(latest.get("divine_value") or 0.0)
-            if current <= 0:
+            if not math.isfinite(current) or current <= 0:
                 continue
             details = latest.get("details")
             if (
@@ -1562,22 +1780,86 @@ class RecommendationEngine:
             ):
                 unresolved_items += 1
                 continue
+            try:
+                direct_chaos = float(latest.get("chaos_value") or 0.0)
+            except (TypeError, ValueError):
+                direct_chaos = 0.0
+            current_chaos = (
+                direct_chaos
+                if math.isfinite(direct_chaos) and direct_chaos > 0
+                else (
+                    current / chaos_unit_divine
+                    if chaos_unit_divine is not None
+                    else None
+                )
+            )
+            if current_chaos is None or not math.isfinite(current_chaos):
+                excluded_unknown_chaos_items += 1
+                continue
+            if current_chaos < MINIMUM_INVESTMENT_PRICE_CHAOS:
+                excluded_below_one_chaos_items += 1
+                continue
             current_items[item_key] = {
                 "latest": latest,
                 "current": current,
+                "current_chaos": current_chaos,
             }
 
+        lifecycle_rows = self.storage.seasonal_lifecycle_rows(
+            current_items,
+            BROADLY_COVERED_LEAGUE_IDS,
+            minimum_league_day=1,
+            maximum_league_day=DECLINE_CURVE_MAXIMUM_DAY,
+            minimum_confidence=0.0,
+        )
+        decline_assessments = _historical_decline_assessments(
+            lifecycle_rows,
+            league_weights=raw_league_weight,
+        )
+        automatic_decline_vetoes: list[dict[str, Any]] = []
+        known_decline_vetoes: list[dict[str, Any]] = []
+        for item_key in list(current_items):
+            current_item = current_items[item_key]
+            latest = current_item["latest"]
+            assessment = decline_assessments.get(item_key)
+            if assessment and assessment["historical_decline"]:
+                automatic_decline_vetoes.append(
+                    {
+                        "key": item_key,
+                        "name": str(latest["name"]),
+                        "weighted_support": assessment[
+                            "weighted_support"
+                        ],
+                        "sample_leagues": assessment["sample_leagues"],
+                        "declining_leagues": assessment[
+                            "declining_leagues"
+                        ],
+                        "aggregate_weekly_gain": assessment[
+                            "aggregate_weekly_gain"
+                        ],
+                        "aggregate_early_late_ratio": assessment[
+                            "aggregate_early_late_ratio"
+                        ],
+                    }
+                )
+                current_items.pop(item_key)
+                continue
+            known_lifecycle = _known_declining_lifecycle(
+                item_key,
+                str(latest["name"]),
+            )
+            if known_lifecycle is not None:
+                known_decline_vetoes.append(
+                    {
+                        "key": item_key,
+                        "name": str(latest["name"]),
+                        "code": known_lifecycle["code"],
+                        "reason": known_lifecycle["reason"],
+                    }
+                )
+                current_items.pop(item_key)
+
         item_keys = list(current_items)
-        broad_id_set = frozenset(BROADLY_COVERED_LEAGUE_IDS)
-        newest_first = list(reversed(BROADLY_COVERED_LEAGUES))
-        age_rank = {
-            spec.league_id: index
-            for index, spec in enumerate(newest_first)
-        }
-        raw_league_weight = {
-            spec.league_id: SeasonalModel.RECENCY_DECAY_PER_LEAGUE**index
-            for index, spec in enumerate(newest_first)
-        }
 
         historical_rows_by_horizon: dict[
             int, dict[str, list[dict[str, Any]]]
@@ -1609,7 +1891,7 @@ class RecommendationEngine:
         # historical future target at one of the three forecast horizons.
         # Loading daily curves for every current market caused thousands of
         # individual SQLite queries and made the initial dashboard request take
-        # more than a minute. Null-forecast rows still remain in the ungated
+        # more than a minute. Null-forecast rows still remain in the filtered
         # universe; their full curve is loaded on demand by /api/history.
         forecastable_keys = {
             item_key
@@ -1673,11 +1955,17 @@ class RecommendationEngine:
         for item_key, current_item in current_items.items():
             latest = current_item["latest"]
             current = float(current_item["current"])
+            current_chaos = float(current_item["current_chaos"])
             curve = current_curves.get(item_key, [])
             details = (
                 latest.get("details")
                 if isinstance(latest.get("details"), dict)
                 else {}
+            )
+            item_level = _item_level_from_identity(
+                item_key,
+                str(latest["category"]),
+                details,
             )
             metadata = (
                 details.get("metadata")
@@ -1858,6 +2146,13 @@ class RecommendationEngine:
                         if details.get("gemQuality") is not None
                         else details.get("gem_quality")
                     ),
+                    "item_level": item_level,
+                    "links": details.get("links"),
+                    "map_tier": (
+                        details.get("mapTier")
+                        if details.get("mapTier") is not None
+                        else details.get("map_tier")
+                    ),
                     "corrupted": details.get("corrupted"),
                     "passive_name": (
                         details.get("passiveName")
@@ -1867,11 +2162,7 @@ class RecommendationEngine:
                 },
                 "price_divine": current,
                 "current_price_divine": current,
-                "price_chaos": (
-                    float(latest["chaos_value"])
-                    if latest.get("chaos_value") is not None
-                    else None
-                ),
+                "price_chaos": current_chaos,
                 "current_observed_at": latest.get("observed_at"),
                 "current_source": latest.get("source"),
                 "market_volume": latest.get("volume"),
@@ -2110,13 +2401,15 @@ class RecommendationEngine:
             "reserve": None,
             "invested": None,
             "confidence_note": (
-                "This is an ungated gross-price forecast, not a pass/fail "
-                "recommendation. For each horizon, the model compares today's "
-                "current-league price with the recency-weighted target-day "
-                "price in Settlers, Mercenaries, Keepers, and Mirage. When at "
-                "least two current-league days exist, it blends 70% historical "
-                "target and 30% robust current-curve projection in log-return "
-                "space. Missing historical target days remain null."
+                "Within the investment universe, this is a gross-price "
+                "forecast rather than a pass/fail recommendation. Sub-chaos "
+                "markets and persistent completed-league decliners are omitted. "
+                "For each horizon, the model compares today's current-league "
+                "price with the recency-weighted target-day price in Settlers, "
+                "Mercenaries, Keepers, and Mirage. When at least two "
+                "current-league days exist, it blends 70% historical target "
+                "and 30% robust current-curve projection in log-return space. "
+                "Missing historical target days remain null."
             ),
             "forecast_model": {
                 "historical_leagues": list(
@@ -2156,9 +2449,15 @@ class RecommendationEngine:
                 "gross_gain": True,
                 "friction_deducted": False,
                 "eligibility_gates": [],
+                "universe_filters": [
+                    "excluded small-consumable categories",
+                    "current price below one Chaos Orb",
+                    "persistent broad-league structural decline",
+                    "unresolved source identity",
+                ],
             },
             "investment_scope": {
-                "strategy": "ungated_forecast_ranking",
+                "strategy": "filtered_forecast_ranking",
                 "excluded_categories": list(
                     EXCLUDED_INVESTMENT_CATEGORIES
                 ),
@@ -2168,18 +2467,60 @@ class RecommendationEngine:
                 "excluded_category_counts": dict(
                     sorted(excluded_category_counts.items())
                 ),
-                "excluded_routine_currency_items": sum(
-                    excluded_routine_currency_counts.values()
+                "minimum_price_chaos": MINIMUM_INVESTMENT_PRICE_CHAOS,
+                "excluded_below_one_chaos_items": (
+                    excluded_below_one_chaos_items
                 ),
-                "excluded_routine_currency_counts": dict(
-                    sorted(excluded_routine_currency_counts.items())
+                "excluded_unknown_chaos_items": (
+                    excluded_unknown_chaos_items
+                ),
+                "automatic_decline_items": len(automatic_decline_vetoes),
+                "automatic_decline_vetoes": sorted(
+                    automatic_decline_vetoes,
+                    key=lambda item: (
+                        str(item["name"]).casefold(),
+                        str(item["key"]),
+                    ),
                 ),
                 "excluded_item_count": (
                     sum(excluded_category_counts.values())
-                    + sum(excluded_routine_currency_counts.values())
+                    + excluded_below_one_chaos_items
+                    + excluded_unknown_chaos_items
+                    + len(automatic_decline_vetoes)
+                    + len(known_decline_vetoes)
+                    + unresolved_items
                 ),
                 "unresolved_identity_items": unresolved_items,
-                "known_decline_vetoes": [],
+                "known_decline_vetoes": known_decline_vetoes,
+                "decline_model": {
+                    "currency": "Divine Orb",
+                    "historical_leagues": list(
+                        BROADLY_COVERED_LEAGUE_IDS
+                    ),
+                    "maximum_league_day": DECLINE_CURVE_MAXIMUM_DAY,
+                    "weekly_median": True,
+                    "minimum_points_per_week": (
+                        DECLINE_MINIMUM_POINTS_PER_WEEK
+                    ),
+                    "minimum_weeks_per_league": DECLINE_MINIMUM_WEEKS,
+                    "minimum_day_span": DECLINE_MINIMUM_DAY_SPAN,
+                    "maximum_weekly_gain": DECLINE_MAXIMUM_WEEKLY_GAIN,
+                    "minimum_negative_pair_fraction": (
+                        DECLINE_MINIMUM_NEGATIVE_PAIR_FRACTION
+                    ),
+                    "maximum_early_late_ratio": (
+                        DECLINE_MAXIMUM_EARLY_LATE_RATIO
+                    ),
+                    "minimum_declining_leagues": (
+                        DECLINE_MINIMUM_LEAGUE_VOTES
+                    ),
+                    "minimum_recency_weighted_support": (
+                        DECLINE_MINIMUM_WEIGHTED_SUPPORT
+                    ),
+                    "recency_decay_per_league": (
+                        SeasonalModel.RECENCY_DECAY_PER_LEAGUE
+                    ),
+                },
             },
             "ranking_summary": {
                 "limit": None,

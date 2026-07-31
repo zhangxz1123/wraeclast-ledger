@@ -7,9 +7,9 @@ across completed leagues, compares today's price with a recency-weighted
 future historical level, blends it with the current-league price curve, and
 produces gross 3, 7, and 14-day gain forecasts. The selected horizon determines
 the global order shown across paginated results. The archive is intentionally
-broad, while routine low-end
-consumable categories and base currencies remain outside the displayed
-investment universe.
+broad, while excluded small-consumable categories, sub-1-chaos markets, and
+persistent completed-league decliners remain outside the displayed investment
+universe.
 
 The application does not place trades. Recommendations are probabilistic
 research signals, not guarantees of profit.
@@ -252,14 +252,19 @@ archive for separate market research. They do not alter the forecast ranking.
 ### Investment universe
 
 Essence, Fossil, Oil, Resonator, Scarab, Delirium Orb, Artifact, and Incubator
-categories remain outside the displayed ranking, as requested. Routine base
-currencies—scrolls, scraps, quality currency, and common crafting orbs such as
-Jeweller's, Fusing, Alteration, Chromatic, Regret, Vaal, Chaos, and Exalted
-Orbs—are also outside the ranking. This is an explicit investment-universe
-choice, not a price or budget cap. Premium currencies such as Fracturing,
-Sacred, and Veiled Orbs, Hinekora's Locks, and Mirrors remain in scope. All
-excluded prices are still archived locally for research and fast queries. No
-individual-item lifecycle rule removes an otherwise in-scope item.
+categories remain outside the displayed ranking, as requested. Any current
+market below 1 Chaos is also omitted; this is a minimum unit-price floor, not an
+upper price or budget cap. The model additionally removes an exact item when
+its weekly median Divine-relative curve robustly declines across at least two
+broadly covered past leagues with at least 65% of the available recency weight.
+All excluded prices are still archived locally for research and fast queries.
+
+The automatic lifecycle rule requires at least 12 usable weekly buckets over a
+70-day span in each contributing league. A league must show a Theil-Sen trend
+of at most -2% per week, at least 70% negative pairwise slopes, and a late/early
+price ratio no greater than 0.80. These conditions resist daily noise and old
+mapping anomalies while detecting currencies such as Chaos Orb that reliably
+lose Divine-relative value as a league matures.
 
 ### Broad-league evidence
 
@@ -303,11 +308,10 @@ In compact form:
 
 `expected gain = expected price / current price - 1`
 
-The output does not deduct transaction friction or adjust for liquidity,
-confidence scores, falling-knife behavior, disagreement penalties, Standard
-prices, build demand, or structural-item rules. There are no per-item
-screening gates. A negative forecast remains visible and ranks below a higher
-forecast.
+After the investment-universe exclusions above, the output does not deduct
+transaction friction or adjust for liquidity, confidence scores, falling-knife
+behavior, disagreement penalties, Standard prices, or build demand. A negative
+forecast remains visible and ranks below a higher forecast.
 
 The chosen 3, 7, or 14-day hold window is the sort horizon. Every row still
 shows all three estimates, their historical targets, current-curve components,
@@ -315,9 +319,12 @@ and broad-league sample counts in the detail view. Budget, item price, and
 portfolio allocation do not affect the order.
 
 The search, market, and minimum-price controls filter the complete ranking
-without changing forecast values or global ranks. Results are displayed in
-pages of 25, 50, or 100 rows. Price thresholds are cumulative: for example,
-`10d+` includes every item priced at 10 Divine Orbs or more.
+without changing forecast values or global ranks. Displayed names include exact
+variant details such as gem level/quality/corruption, Forbidden Flame versus
+Flesh and its passive, base or cluster item level, influence, and socket links.
+Results are displayed in pages of 25, 50, or 100 rows. Price thresholds are
+cumulative: for example, `10d+` includes every item priced at 10 Divine Orbs or
+more.
 
 Every visible row includes a generated link to the official trade site for the
 current league. Skill-gem links carry the archived level, quality, and

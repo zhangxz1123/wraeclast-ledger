@@ -145,6 +145,32 @@ class PoeNinjaNormalizationTests(unittest.TestCase):
                 snapshot_id=1,
             )
 
+    def test_base_item_level_is_preserved_without_changing_identity(self) -> None:
+        points = normalize_poe_ninja(
+            {
+                "lines": [
+                    {
+                        "name": "Abyssal Axe",
+                        "detailsId": "abyssal-axe-86-hunter",
+                        "variant": "Hunter",
+                        "levelRequired": 86,
+                        "divineValue": 1.0,
+                    }
+                ]
+            },
+            league_id="Fixture League",
+            category="BaseType",
+            observed_at="2026-07-29T12:00:00Z",
+            snapshot_id=9,
+        )
+
+        self.assertEqual(len(points), 1)
+        self.assertEqual(points[0].details["levelRequired"], 86)
+        self.assertEqual(
+            points[0].item_key,
+            "basetype:abyssal-axe-86-hunter-variant-hunter",
+        )
+
 
 class OfficialExchangeNormalizationTests(unittest.TestCase):
     def test_cross_rate_and_supported_identifier_mappings(self) -> None:
