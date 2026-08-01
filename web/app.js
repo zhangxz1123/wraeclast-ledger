@@ -6,7 +6,8 @@ const state = {
   recommendations: [],
   syncing: false,
   historySyncing: false,
-  category: "all",
+  excludedCategories: new Set(),
+  availableCategories: [],
   priceRange: "all",
   query: "",
   page: 1,
@@ -43,6 +44,10 @@ const els = {
   modelNote: document.querySelector("#modelNote"),
   recommendationList: document.querySelector("#recommendationList"),
   categoryFilter: document.querySelector("#categoryFilter"),
+  categoryFilterSummary: document.querySelector("#categoryFilterSummary"),
+  categoryChecklist: document.querySelector("#categoryChecklist"),
+  includeAllCategoriesButton: document.querySelector("#includeAllCategoriesButton"),
+  excludeAllCategoriesButton: document.querySelector("#excludeAllCategoriesButton"),
   priceRangeFilter: document.querySelector("#priceRangeFilter"),
   searchInput: document.querySelector("#searchInput"),
   resetHiddenItemsButton: document.querySelector("#resetHiddenItemsButton"),
@@ -449,6 +454,7 @@ function renderStatus() {
 const FORECAST_HORIZONS = [3, 7, 14];
 const BROAD_LEAGUES = ["Mirage", "Keepers", "Mercenaries", "Settlers"];
 const HIDDEN_ITEMS_STORAGE_KEY = "wraeclast-ledger.hidden-items.v1";
+const CATEGORY_EXCLUSIONS_STORAGE_KEY = "wraeclast-ledger.excluded-categories.v1";
 const PRICE_THRESHOLDS = {
   "10c-plus": { field: "priceChaos", minimum: 10 },
   "1d-plus": { field: "priceDivine", minimum: 1 },
@@ -512,6 +518,107 @@ function saveHiddenItems() {
   } catch {
     return false;
   }
+}
+
+function loadCategoryExclusions() {
+  try {
+    const raw = window.localStorage.getItem(CATEGORY_EXCLUSIONS_STORAGE_KEY);
+    if (!raw) {
+      state.excludedCategories = new Set();
+      return;
+    }
+    const values = JSON.parse(raw);
+    if (!Array.isArray(values)) {
+      throw new TypeError("Category exclusion list is not an array.");
+    }
+    state.excludedCategories = new Set(
+      values
+        .filter((value) => typeof value === "string")
+        .map((value) => value.trim())
+        .filter(Boolean),
+    );
+  } catch {
+    state.excludedCategories = new Set();
+  }
+}
+
+function saveCategoryExclusions() {
+  try {
+    window.localStorage.setItem(
+      CATEGORY_EXCLUSIONS_STORAGE_KEY,
+      JSON.stringify([...state.excludedCategories].sort()),
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function categoryLabel(category) {
+  return String(category || "Other")
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/[_-]+/g, " ");
+}
+
+function activeExcludedCategoryCount() {
+  return state.availableCategories.reduce(
+    (count, category) => count + (state.excludedCategories.has(category) ? 1 : 0),
+    0,
+  );
+}
+
+function renderCategoryFilterSummary() {
+  const total = state.availableCategories.length;
+  const excluded = activeExcludedCategoryCount();
+  const included = total - excluded;
+  if (els.categoryFilterSummary) {
+    els.categoryFilterSummary.textContent = !total || excluded === 0
+      ? "All included"
+      : included === 0
+        ? "None included"
+        : `${compact(included)} of ${compact(total)} included`;
+  }
+  if (els.includeAllCategoriesButton) {
+    els.includeAllCategoriesButton.disabled = state.excludedCategories.size === 0;
+  }
+  if (els.excludeAllCategoriesButton) {
+    els.excludeAllCategoriesButton.disabled = total === 0 || excluded === total;
+  }
+}
+
+function applyCategorySelection() {
+  state.page = 1;
+  const persisted = saveCategoryExclusions();
+  renderCategoryFilterSummary();
+  renderRankingSummary();
+  renderRecommendations();
+  if (!persisted) {
+    toast("Section choices could not be saved; they apply to this session only.", "error");
+  }
+}
+
+function setCategoryIncluded(category, included) {
+  if (!category) return;
+  if (included) {
+    state.excludedCategories.delete(category);
+  } else {
+    state.excludedCategories.add(category);
+  }
+  applyCategorySelection();
+}
+
+function includeAllCategories() {
+  if (!state.excludedCategories.size) return;
+  state.excludedCategories.clear();
+  renderCategoryOptions();
+  applyCategorySelection();
+}
+
+function excludeAllCategories() {
+  if (!state.availableCategories.length) return;
+  state.excludedCategories = new Set(state.availableCategories);
+  renderCategoryOptions();
+  applyCategorySelection();
 }
 
 function currentHiddenCount() {
@@ -993,7 +1100,8 @@ function renderRankingSummary() {
   const returned = toNumber(rankingSummary.returned, state.recommendations.length);
   const horizon = toNumber(payload.horizon, toNumber(els.horizonSelect.value, 7));
   const hiddenCount = currentHiddenCount();
-  const filtersActive = state.category !== "all"
+  const excludedCategoryCount = activeExcludedCategoryCount();
+  const filtersActive = excludedCategoryCount > 0
     || state.priceRange !== "all"
     || Boolean(state.query.trim())
     || hiddenCount > 0;
@@ -1004,8 +1112,11 @@ function renderRankingSummary() {
   const hiddenNote = hiddenCount
     ? ` ${compact(hiddenCount)} hidden on this device.`
     : "";
+  const categoryNote = excludedCategoryCount
+    ? ` ${compact(excludedCategoryCount)} item ${excludedCategoryCount === 1 ? "section is" : "sections are"} excluded on this device.`
+    : "";
   els.modelNote.textContent = returned
-    ? `${showing}, sorted by gross ${horizon}-day expected gain.${hiddenNote} Forecasts use poe.ninja Medium/High observations from Mirage, Keepers, Mercenaries, and Settlers; comparison charts also show exact Low-confidence rows as non-forecast context. Forecast curves use one exact point per UTC league day; optional GGG hourly audit rows never enter them. Base types other than Simplex Amulet and Focused Amulet, unique items (except 1-/3-passive Voices and roll-unresolved Sublime Vision, The Adorned, and Watcher's Eye markets), Valdo maps, and non-Awakened gems are archived but omitted from this investment list.${excludedItems ? ` ${compact(excludedItems)} archived markets are omitted by category, the 1c floor, or the persistent-decline rule.` : ""}`
+    ? `${showing}, sorted by gross ${horizon}-day expected gain.${hiddenNote}${categoryNote} Forecasts use poe.ninja Medium/High observations from Mirage, Keepers, Mercenaries, and Settlers; comparison charts also show exact Low-confidence rows as non-forecast context. Forecast curves use one exact point per UTC league day; optional GGG hourly audit rows never enter them. Base types other than Simplex Amulet and Focused Amulet, unique items (except 1-/3-passive Voices and roll-unresolved Sublime Vision, The Adorned, and Watcher's Eye markets), Valdo maps, and non-Awakened gems are archived but omitted from this investment list.${excludedItems ? ` ${compact(excludedItems)} archived markets are omitted by category, the 1c floor, or the persistent-decline rule.` : ""}`
     : `No item forecast is available yet. Build the broad-league archive, then sync again.`;
 }
 
@@ -1376,7 +1487,7 @@ function filteredRecommendations() {
   const query = state.query.trim().toLowerCase();
   const selectedThreshold = PRICE_THRESHOLDS[state.priceRange] || null;
   return state.recommendations.filter((item) => {
-    const categoryMatches = state.category === "all" || item.category === state.category;
+    const categoryMatches = !state.excludedCategories.has(item.category);
     const queryMatches = !query || item.searchText.includes(query);
     const thresholdPrice = selectedThreshold
       ? Number(item[selectedThreshold.field])
@@ -1511,15 +1622,22 @@ function renderRecommendations() {
     const resetAction = state.hiddenItemKeys.size
       ? '<button class="secondary-button" type="button" data-reset-hidden>Reset hidden items</button>'
       : "";
+    const resetCategoryAction = activeExcludedCategoryCount()
+      ? '<button class="secondary-button" type="button" data-reset-categories>Include all sections</button>'
+      : "";
     els.recommendationList.innerHTML = `
       <div class="empty-state">
         <strong>No match for this filter</strong>
-        <p>Adjust the minimum price, market, item search, or hidden list.</p>
-        ${resetAction}
+        <p>Adjust the minimum price, included sections, item search, or hidden list.</p>
+        <div class="empty-state-actions">${resetCategoryAction}${resetAction}</div>
       </div>`;
     els.recommendationList.querySelector("[data-reset-hidden]")?.addEventListener(
       "click",
       resetHiddenItems,
+    );
+    els.recommendationList.querySelector("[data-reset-categories]")?.addEventListener(
+      "click",
+      includeAllCategories,
     );
     return;
   }
@@ -1600,11 +1718,24 @@ function renderRecommendations() {
 }
 
 function renderCategoryOptions() {
-  const categories = [...new Set(state.recommendations.map((item) => item.category))].sort();
-  const selected = state.category;
-  els.categoryFilter.innerHTML = '<option value="all">All ranked markets</option>' +
-    categories.map((category) => `<option value="${escapeHtml(category)}">${escapeHtml(category)}</option>`).join("");
-  els.categoryFilter.value = categories.includes(selected) ? selected : "all";
+  state.availableCategories = [
+    ...new Set(state.recommendations.map((item) => item.category).filter(Boolean)),
+  ].sort((left, right) => categoryLabel(left).localeCompare(categoryLabel(right)));
+  if (els.categoryChecklist) {
+    els.categoryChecklist.innerHTML = state.availableCategories.length
+      ? state.availableCategories.map((category, index) => `
+          <label class="category-option" for="categoryOption${index}">
+            <input
+              id="categoryOption${index}"
+              type="checkbox"
+              data-category-index="${index}"
+              ${state.excludedCategories.has(category) ? "" : "checked"}
+            />
+            <span>${escapeHtml(categoryLabel(category))}</span>
+          </label>`).join("")
+      : '<p class="category-filter-empty">No ranked sections yet.</p>';
+  }
+  renderCategoryFilterSummary();
 }
 
 function renderSources() {
@@ -1919,12 +2050,14 @@ const renderSearchResults = debounce(() => {
 els.syncButton.addEventListener("click", syncMarket);
 els.historyButton.addEventListener("click", syncHistory);
 els.horizonSelect.addEventListener("change", () => loadRecommendations());
-els.categoryFilter.addEventListener("change", (event) => {
-  state.category = event.target.value;
-  state.page = 1;
-  renderRankingSummary();
-  renderRecommendations();
+els.categoryChecklist?.addEventListener("change", (event) => {
+  const index = Number(event.target?.dataset?.categoryIndex);
+  const category = Number.isInteger(index) ? state.availableCategories[index] : null;
+  if (!category) return;
+  setCategoryIncluded(category, Boolean(event.target.checked));
 });
+els.includeAllCategoriesButton?.addEventListener("click", includeAllCategories);
+els.excludeAllCategoriesButton?.addEventListener("click", excludeAllCategories);
 els.priceRangeFilter?.addEventListener("change", (event) => {
   state.priceRange = event.target.value;
   state.page = 1;
@@ -1965,9 +2098,14 @@ els.refreshStatusButton.addEventListener("click", async () => {
   toast("Source status refreshed.");
 });
 window.addEventListener("storage", (event) => {
-  if (event.key !== HIDDEN_ITEMS_STORAGE_KEY) return;
-  loadHiddenItems();
-  renderHiddenItemsControl();
+  if (![HIDDEN_ITEMS_STORAGE_KEY, CATEGORY_EXCLUSIONS_STORAGE_KEY].includes(event.key)) return;
+  if (event.key === HIDDEN_ITEMS_STORAGE_KEY) {
+    loadHiddenItems();
+    renderHiddenItemsControl();
+  } else {
+    loadCategoryExclusions();
+    renderCategoryOptions();
+  }
   renderRankingSummary();
   renderRecommendations();
 });
@@ -2008,6 +2146,7 @@ function configureRuntimeUi() {
 
 async function initialize() {
   loadHiddenItems();
+  loadCategoryExclusions();
   try {
     await discoverRuntime();
   } catch (error) {

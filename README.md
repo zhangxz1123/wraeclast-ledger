@@ -394,6 +394,12 @@ Results are displayed in pages of 25, 50, or 100 rows. Price thresholds are
 cumulative: for example, `10d+` includes every item priced at 10 Divine Orbs or
 more.
 
+The **Sections** checklist can independently include or exclude every ranked
+market category—for example, uncheck `Forbidden Jewel` to remove all Forbidden
+Flame and Forbidden Flesh rows. Section exclusions are saved in browser-local
+storage, combine with every other filter, and can be cleared with **Include
+all**. Newly introduced categories default to included.
+
 Every visible row includes a generated link to the official trade site for the
 current league. Skill-gem links carry the archived level, quality, and
 corruption variant when available. Forbidden-jewel links select Flame or Flesh

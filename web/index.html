@@ -116,12 +116,31 @@
               <span class="sr-only">Search recommendations</span>
               <input id="searchInput" type="search" placeholder="Search items" />
             </label>
-            <label class="filter-field">
-              <span class="sr-only">Filter by category</span>
-              <select id="categoryFilter">
-                <option value="all">All ranked markets</option>
-              </select>
-            </label>
+            <details class="category-filter" id="categoryFilter">
+              <summary aria-label="Choose included item sections">
+                <span>Sections</span>
+                <strong id="categoryFilterSummary">All included</strong>
+              </summary>
+              <div class="category-filter-popover">
+                <div class="category-filter-heading">
+                  <span id="categoryFilterLabel">Include item sections</span>
+                  <div class="category-filter-actions">
+                    <button id="includeAllCategoriesButton" type="button">
+                      Include all
+                    </button>
+                    <button id="excludeAllCategoriesButton" type="button">
+                      Exclude all
+                    </button>
+                  </div>
+                </div>
+                <div
+                  class="category-checklist"
+                  id="categoryChecklist"
+                  role="group"
+                  aria-labelledby="categoryFilterLabel"
+                ></div>
+              </div>
+            </details>
             <label class="filter-field price-filter-field">
               <span class="sr-only">Filter by minimum current price</span>
               <select id="priceRangeFilter">

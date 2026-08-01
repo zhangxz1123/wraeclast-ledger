@@ -393,6 +393,8 @@ test("pagination and hidden-item filtering operate on the complete list", () => 
     state.page = 2;
     state.pageSize = 2;
     state.hiddenItemKeys = new Set(["item:b"]);
+    state.excludedCategories = new Set(["ForbiddenJewel"]);
+    state.availableCategories = ["Currency", "SkillGem", "ForbiddenJewel", "Fragment"];
     state.recommendations = [
       { itemKey: "item:a", searchText: "alpha currency", category: "Currency", priceDivine: 1 },
       { itemKey: "item:b", searchText: "beta currency", category: "Currency", priceDivine: 2 },
@@ -412,11 +414,65 @@ test("pagination and hidden-item filtering operate on the complete list", () => 
 
   assert.deepEqual(
     [...result.keys],
-    ["item:a", "item:c", "item:d", "item:e"],
+    ["item:a", "item:c", "item:e"],
   );
-  assert.deepEqual([...result.pageKeys], ["item:d", "item:e"]);
-  assert.equal(result.total, 4);
+  assert.deepEqual([...result.pageKeys], ["item:e"]);
+  assert.equal(result.total, 3);
   assert.equal(result.totalPages, 2);
+});
+
+test("category exclusions combine with search, price, and per-item hiding", () => {
+  const result = runInApp(`
+    state.query = "jewel";
+    state.priceRange = "1d-plus";
+    state.hiddenItemKeys = new Set(["item:hidden"]);
+    state.excludedCategories = new Set(["ForbiddenJewel"]);
+    state.recommendations = [
+      { itemKey: "item:forbidden", searchText: "forbidden jewel", category: "ForbiddenJewel", priceDivine: 20 },
+      { itemKey: "item:cluster", searchText: "cluster jewel", category: "ClusterJewel", priceDivine: 2 },
+      { itemKey: "item:hidden", searchText: "unique jewel", category: "UniqueJewel", priceDivine: 4 },
+      { itemKey: "item:cheap", searchText: "cluster jewel", category: "ClusterJewel", priceDivine: 0.5 },
+      { itemKey: "item:currency", searchText: "divine orb", category: "Currency", priceDivine: 1 },
+    ];
+    globalThis.__result = filteredRecommendations().map((item) => item.itemKey);
+  `);
+
+  assert.deepEqual([...result], ["item:cluster"]);
+});
+
+test("category exclusions persist locally and can be reset to include all", () => {
+  const result = runInApp(`
+    state.availableCategories = ["ForbiddenJewel", "SkillGem"];
+    state.excludedCategories = new Set(["ForbiddenJewel"]);
+    const saved = saveCategoryExclusions();
+    state.excludedCategories = new Set();
+    loadCategoryExclusions();
+    const restored = [...state.excludedCategories];
+    includeAllCategories();
+    state.excludedCategories = new Set(["temporary"]);
+    loadCategoryExclusions();
+    globalThis.__result = {
+      saved,
+      restored,
+      afterReset: [...state.excludedCategories],
+    };
+  `);
+
+  assert.equal(result.saved, true);
+  assert.deepEqual([...result.restored], ["ForbiddenJewel"]);
+  assert.deepEqual([...result.afterReset], []);
+});
+
+test("section checklist exposes native keyboard controls and bulk actions", () => {
+  const html = fs.readFileSync(
+    new URL("../web/index.html", import.meta.url),
+    "utf8",
+  );
+  assert.match(html, /<details class="category-filter" id="categoryFilter">/);
+  assert.match(html, /<summary aria-label="Choose included item sections">/);
+  assert.match(html, /id="categoryChecklist"[\s\S]*role="group"/);
+  assert.match(html, /id="includeAllCategoriesButton"/);
+  assert.match(html, /id="excludeAllCategoriesButton"/);
 });
 
 test("GitHub Pages paths and exact horizon ranks are repository-relative", () => {
