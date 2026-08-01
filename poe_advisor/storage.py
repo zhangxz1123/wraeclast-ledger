@@ -643,8 +643,11 @@ class Storage:
             result["metadata"] = {}
         return result
 
-    def insert_price_points(self, points: Iterable[PricePoint]) -> int:
-        rows = [
+    @staticmethod
+    def _price_point_rows(
+        points: Iterable[PricePoint],
+    ) -> list[tuple[Any, ...]]:
+        return [
             (
                 point.league_id,
                 point.item_key,
@@ -664,31 +667,70 @@ class Storage:
             for point in points
             if point.divine_value is not None and point.divine_value >= 0
         ]
+
+    @staticmethod
+    def _upsert_price_point_rows(
+        connection: sqlite3.Connection,
+        rows: list[tuple[Any, ...]],
+    ) -> int:
         if not rows:
             return 0
+        before = connection.total_changes
+        connection.executemany(
+            """
+            INSERT INTO price_points(
+                league_id, item_key, name, category, source, observed_at,
+                chaos_value, divine_value, listing_count, volume,
+                confidence, details_json, snapshot_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(league_id, item_key, source, observed_at) DO UPDATE SET
+                name = excluded.name,
+                category = excluded.category,
+                chaos_value = excluded.chaos_value,
+                divine_value = excluded.divine_value,
+                listing_count = excluded.listing_count,
+                volume = excluded.volume,
+                confidence = excluded.confidence,
+                details_json = excluded.details_json,
+                snapshot_id = excluded.snapshot_id
+            """,
+            rows,
+        )
+        return connection.total_changes - before
+
+    def insert_price_points(self, points: Iterable[PricePoint]) -> int:
+        rows = self._price_point_rows(points)
         with self.transaction() as connection:
-            before = connection.total_changes
-            connection.executemany(
-                """
-                INSERT INTO price_points(
-                    league_id, item_key, name, category, source, observed_at,
-                    chaos_value, divine_value, listing_count, volume,
-                    confidence, details_json, snapshot_id, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(league_id, item_key, source, observed_at) DO UPDATE SET
-                    name = excluded.name,
-                    category = excluded.category,
-                    chaos_value = excluded.chaos_value,
-                    divine_value = excluded.divine_value,
-                    listing_count = excluded.listing_count,
-                    volume = excluded.volume,
-                    confidence = excluded.confidence,
-                    details_json = excluded.details_json,
-                    snapshot_id = excluded.snapshot_id
-                """,
-                rows,
+            return self._upsert_price_point_rows(connection, rows)
+
+    def replace_current_history_price_points(
+        self,
+        points: Iterable[PricePoint],
+        *,
+        league_id: str,
+        item_key: str,
+        source: str,
+    ) -> int:
+        """Atomically replace one provider's normalized dated-item curve."""
+
+        rows = self._price_point_rows(points)
+        expected_identity = (str(league_id), str(item_key), str(source))
+        if any((row[0], row[1], row[4]) != expected_identity for row in rows):
+            raise ValueError(
+                "Replacement history points must share league, item, and source"
             )
-            return connection.total_changes - before
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                DELETE FROM price_points
+                WHERE league_id = ? AND item_key = ? AND source = ?
+                  AND COALESCE(
+                      json_extract(details_json, '$.history_backfill'), 0
+                  ) = 1
+                """,
+                expected_identity,
+            )
+            return self._upsert_price_point_rows(connection, rows)
 
     def update_source_state(
         self,
@@ -932,10 +974,10 @@ class Storage:
     ) -> list[dict[str, Any]]:
         """Return one exact observed current-league price per league day.
 
-        The newest qualifying observation in each UTC league-day bucket is
-        selected. This is a daily close-like series, not an interpolated one.
-        A source preference only breaks ties when two sources share the exact
-        same observation timestamp.
+        The newest qualifying observation in each 24-hour window from league
+        launch is selected. This is a daily close-like series, not an
+        interpolated one. A source preference only breaks ties when two sources
+        share the exact same observation timestamp.
         """
 
         if not league_start_at:
@@ -957,13 +999,13 @@ class Storage:
                     SELECT observed_at, divine_value, chaos_value,
                            listing_count, volume, source, confidence,
                            CAST(
-                               julianday(date(observed_at))
-                               - julianday(date(?)) AS INTEGER
+                               julianday(observed_at)
+                               - julianday(?) AS INTEGER
                            ) + 1 AS league_day,
                            ROW_NUMBER() OVER (
                                PARTITION BY CAST(
-                                   julianday(date(observed_at))
-                                   - julianday(date(?)) AS INTEGER
+                                   julianday(observed_at)
+                                   - julianday(?) AS INTEGER
                                )
                                ORDER BY observed_at DESC,
                                         CASE source
@@ -978,7 +1020,7 @@ class Storage:
                       AND item_key = ?
                       AND confidence >= ?
                       AND divine_value > 0
-                      AND date(observed_at) >= date(?)
+                      AND datetime(observed_at) >= datetime(?)
                       {source_clause}
                 )
                 SELECT league_day, observed_at, divine_value, chaos_value,
@@ -1257,8 +1299,8 @@ class Storage:
                 present_rows = connection.execute(
                     """
                     SELECT DISTINCT CAST(
-                               julianday(date(price.observed_at))
-                               - julianday(date(league.start_at))
+                               julianday(price.observed_at)
+                               - julianday(league.start_at)
                            AS INTEGER) + 1 AS league_day
                     FROM price_points AS price
                     JOIN leagues AS league ON league.id = price.league_id
@@ -1267,6 +1309,8 @@ class Storage:
                       AND price.source = ?
                       AND price.divine_value > 0
                       AND league.start_at IS NOT NULL
+                      AND datetime(price.observed_at)
+                          >= datetime(league.start_at)
                     """,
                     (row["league_id"], row["item_key"], row["provider"]),
                 ).fetchall()

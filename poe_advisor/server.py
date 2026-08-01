@@ -764,6 +764,11 @@ class AdvisorApplication:
                     "dated_archive_fetched_at": (
                         archive.get("fetched_at") if archive else None
                     ),
+                    "normalization_version": (
+                        archive.get("normalization_version")
+                        if archive
+                        else None
+                    ),
                     "provider_observed_days": provider_days,
                     "provider_first_observed_day": (
                         provider_days[0] if provider_days else None

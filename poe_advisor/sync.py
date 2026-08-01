@@ -102,6 +102,9 @@ CURRENT_HISTORY_CATALOG_CATEGORY = "current-history-catalog"
 CURRENT_HISTORY_MAX_ITEMS = 2_000
 CURRENT_HISTORY_REQUEST_PAUSE_SECONDS = 0.10
 CURRENT_HISTORY_RECHECK_DAYS = 7
+CURRENT_HISTORY_NORMALIZATION_VERSION = 2
+_POE_NINJA_CHAOS_PAIR_IDS = ("chaos", "chaos-orb")
+_POE_NINJA_DIVINE_PAIR_IDS = ("divine", "divine-orb")
 
 
 def _positive_float(value: Any) -> float | None:
@@ -112,28 +115,43 @@ def _positive_float(value: Any) -> float | None:
     return parsed if math.isfinite(parsed) and parsed > 0 else None
 
 
+def _nonnegative_float(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) and parsed >= 0 else None
+
+
 def _poe_ninja_exchange_history_points(
     payload: Any,
     league: League,
     *,
-    pair_ids: tuple[str, ...] = ("chaos", "chaos-orb"),
+    pair_ids: tuple[str, ...] = _POE_NINJA_CHAOS_PAIR_IDS,
 ) -> list[dict[str, Any]]:
     if not isinstance(payload, dict) or not isinstance(payload.get("pairs"), list):
         raise DataSourceError("poe.ninja exchange details had no pairs array")
     accepted = {value.casefold() for value in pair_ids}
+    matching_pairs = [
+        row
+        for row in payload["pairs"]
+        if isinstance(row, dict)
+        and str(row.get("id") or "").casefold() in accepted
+    ]
     pair = next(
         (
             row
-            for row in payload["pairs"]
-            if isinstance(row, dict)
-            and str(row.get("id") or "").casefold() in accepted
+            for row in matching_pairs
+            if isinstance(row.get("history"), list) and bool(row["history"])
         ),
-        None,
+        matching_pairs[0] if matching_pairs else None,
     )
     if pair is None or not isinstance(pair.get("history"), list):
         raise DataSourceError(
-            "poe.ninja exchange details had no dated Chaos pair history"
+            "poe.ninja exchange details had no dated requested-pair history"
         )
+    pair_id = str(pair.get("id") or "").casefold()
+    quote_currency = "divine" if pair_id in _POE_NINJA_DIVINE_PAIR_IDS else "chaos"
     start = parse_datetime(league.start_at)
     end = parse_datetime(league.end_at)
     if start is None:
@@ -149,23 +167,26 @@ def _poe_ninja_exchange_history_points(
             continue
         observed = parse_datetime(str(row.get("timestamp") or ""))
         rate = _positive_float(row.get("rate"))
-        volume = _positive_float(row.get("volumePrimaryValue"))
+        volume = _nonnegative_float(row.get("volumePrimaryValue"))
         if (
             observed is None
             or rate is None
             or volume is None
-            or observed.date() < start.date()
+            or observed < start
         ):
             continue
         if end is not None and observed.date() > end.date():
             continue
         day = league_day(observed, start)
+        if day < 1:
+            continue
         candidate = {
             "league_day": day,
             "observed_at": iso_utc(observed),
             "mean": rate,
             "volume": volume,
-            "confidence": 0.95,
+            "confidence": 0.95 if volume > 0 else 0.65,
+            "quote_currency": quote_currency,
         }
         previous = by_day.get(day)
         if (
@@ -186,6 +207,37 @@ def _poe_ninja_exchange_history_points(
         ):
             by_day[day] = candidate
     return [by_day[day] for day in sorted(by_day)]
+
+
+def _poe_ninja_exchange_item_history_points(
+    payload: Any,
+    league: League,
+) -> list[dict[str, Any]]:
+    """Prefer poe.ninja's direct Divine quote, then fall back to Chaos."""
+
+    if not isinstance(payload, dict) or not isinstance(payload.get("pairs"), list):
+        raise DataSourceError("poe.ninja exchange details had no pairs array")
+    divine_ids = {value.casefold() for value in _POE_NINJA_DIVINE_PAIR_IDS}
+    has_direct_divine_history = any(
+        isinstance(pair, dict)
+        and str(pair.get("id") or "").casefold() in divine_ids
+        and isinstance(pair.get("history"), list)
+        and bool(pair["history"])
+        for pair in payload["pairs"]
+    )
+    if has_direct_divine_history:
+        points = _poe_ninja_exchange_history_points(
+            payload,
+            league,
+            pair_ids=_POE_NINJA_DIVINE_PAIR_IDS,
+        )
+        if points:
+            return points
+    return _poe_ninja_exchange_history_points(
+        payload,
+        league,
+        pair_ids=_POE_NINJA_CHAOS_PAIR_IDS,
+    )
 
 
 def _poe_ninja_stash_history_points(
@@ -220,11 +272,13 @@ def _poe_ninja_stash_history_points(
         if days_ago < 0 or value is None:
             continue
         observed = utc_midnight - timedelta(days=days_ago)
-        if observed.date() < start.date() or (
+        if observed < start or (
             end is not None and observed.date() > end.date()
         ):
             continue
         day = league_day(observed, start)
+        if day < 1:
+            continue
         count = _positive_float(row.get("count"))
         if count is None:
             continue
@@ -554,6 +608,8 @@ class SyncService:
                     == str(asset["category"]).casefold()
                     and str(archived.get("history_kind") or "")
                     == str(asset["history_kind"])
+                    and int(archived.get("normalization_version") or 0)
+                    == CURRENT_HISTORY_NORMALIZATION_VERSION
                     and archived.get("normalized_price_days_complete") is True
                     and int(archived.get("checked_through_day") or 0)
                     >= minimum_recent_check_day
@@ -589,6 +645,9 @@ class SyncService:
                         archived.get("checked_through_day") or 0
                     ),
                     "normalized_price_days_complete": True,
+                    "normalization_version": (
+                        CURRENT_HISTORY_NORMALIZATION_VERSION
+                    ),
                     "missing_divine_anchor_days": list(
                         archived.get("missing_divine_anchor_days") or []
                     ),
@@ -695,7 +754,7 @@ class SyncService:
                         summary=summary,
                     )
                     if asset["history_kind"] == "exchange":
-                        item_points = _poe_ninja_exchange_history_points(
+                        item_points = _poe_ninja_exchange_item_history_points(
                             record["payload"],
                             league,
                         )
@@ -713,19 +772,34 @@ class SyncService:
                     provider_days = {
                         int(point["league_day"]) for point in item_points
                     }
-                    normalized_days = sorted(
-                        provider_days.intersection(divine_quality.prices)
+                    direct_divine_quote = bool(item_points) and all(
+                        str(point.get("quote_currency") or "") == "divine"
+                        for point in item_points
+                    )
+                    normalized_days = (
+                        sorted(provider_days)
+                        if direct_divine_quote
+                        else sorted(
+                            provider_days.intersection(divine_quality.prices)
+                        )
                     )
                     missing_provider_days = [
                         day
                         for day in range(1, current_day + 1)
                         if day not in provider_days
                     ]
-                    missing_divine_days = sorted(
-                        provider_days.difference(divine_quality.prices)
+                    missing_divine_days = (
+                        []
+                        if direct_divine_quote
+                        else sorted(
+                            provider_days.difference(divine_quality.prices)
+                        )
                     )
                     metadata = {
                         "kind": "current-item-history",
+                        "normalization_version": (
+                            CURRENT_HISTORY_NORMALIZATION_VERSION
+                        ),
                         "provider": PoeNinjaClient.SOURCE,
                         "provider_league": league.id,
                         **asset,
@@ -739,6 +813,9 @@ class SyncService:
                         "provider_missing_days": missing_provider_days,
                         "normalized_days": normalized_days,
                         "missing_divine_anchor_days": missing_divine_days,
+                        "quote_currency": (
+                            "divine" if direct_divine_quote else "chaos"
+                        ),
                         "checked_through_day": current_day,
                         "interpolation": "none",
                     }
@@ -752,6 +829,44 @@ class SyncService:
                     points: list[PricePoint] = []
                     for point in item_points:
                         point_day = int(point["league_day"])
+                        if direct_divine_quote:
+                            points.append(
+                                PricePoint(
+                                    league_id=league.id,
+                                    item_key=item_key,
+                                    name=str(asset["name"]),
+                                    category=str(asset["category"]),
+                                    source=PoeNinjaClient.SOURCE,
+                                    observed_at=str(point["observed_at"]),
+                                    chaos_value=None,
+                                    divine_value=float(point["mean"]),
+                                    listing_count=point.get("listing_count"),
+                                    volume=point.get("volume"),
+                                    confidence=min(
+                                        float(point["confidence"]),
+                                        0.95,
+                                    ),
+                                    details={
+                                        "history_backfill": True,
+                                        "normalization_version": (
+                                            CURRENT_HISTORY_NORMALIZATION_VERSION
+                                        ),
+                                        "provider": PoeNinjaClient.SOURCE,
+                                        "source_item_id": source_item_id,
+                                        "history_kind": asset["history_kind"],
+                                        "detailsId": source_item_id,
+                                        "league_day": point_day,
+                                        "quote_currency": "divine",
+                                        "normalization": (
+                                            "direct same-league poe.ninja "
+                                            "Divine pair history"
+                                        ),
+                                        "interpolated": False,
+                                    },
+                                    snapshot_id=snapshot_id,
+                                )
+                            )
+                            continue
                         divine_point = divine_points_by_day.get(point_day)
                         if divine_point is None:
                             continue
@@ -775,6 +890,9 @@ class SyncService:
                                 ),
                                 details={
                                     "history_backfill": True,
+                                    "normalization_version": (
+                                        CURRENT_HISTORY_NORMALIZATION_VERSION
+                                    ),
                                     "provider": PoeNinjaClient.SOURCE,
                                     "source_item_id": source_item_id,
                                     "history_kind": asset["history_kind"],
@@ -800,7 +918,12 @@ class SyncService:
                             "no item day had an exact poe.ninja Divine/Chaos anchor"
                         )
                     summary["rows_written"] += (
-                        self.storage.insert_price_points(points) if points else 0
+                        self.storage.replace_current_history_price_points(
+                            points,
+                            league_id=league.id,
+                            item_key=item_key,
+                            source=PoeNinjaClient.SOURCE,
+                        )
                     )
                     self.storage.upsert_current_item_history_coverage(
                         league_id=league.id,
@@ -830,6 +953,9 @@ class SyncService:
                         "checked_through_day": current_day,
                         "normalized_price_days_complete": bool(
                             normalized_days
+                        ),
+                        "normalization_version": (
+                            CURRENT_HISTORY_NORMALIZATION_VERSION
                         ),
                         "interpolation": "none",
                     }

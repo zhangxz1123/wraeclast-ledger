@@ -49,10 +49,12 @@ class League:
         start = parse_datetime(self.start_at)
         if start is None:
             return None
-        # poe.ninja labels daily economy buckets by UTC calendar date. League
-        # launches occur in the evening, so elapsed 24-hour windows would put
-        # every completed-dump row one index away from the current API.
-        return max(1, (utc_now().date() - start.date()).days + 1)
+        # League day 1 is the first 24-hour window after launch.  poe.ninja's
+        # first midnight economy bucket is only a few hours after a typical
+        # evening launch, so it must remain on day 1 rather than becoming day
+        # 2 merely because the UTC calendar date changed.
+        elapsed_days = int((utc_now() - start).total_seconds() // 86_400)
+        return max(1, elapsed_days + 1)
 
 
 @dataclass(slots=True)

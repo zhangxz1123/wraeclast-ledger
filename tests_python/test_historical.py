@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 from poe_advisor.historical import (
     COMPLETED_LEAGUES,
@@ -163,8 +164,26 @@ class HistoricalNormalizationTests(unittest.TestCase):
     def test_league_day_uses_launch_time_not_utc_date(self) -> None:
         start = "2026-07-24T20:00:00Z"
         self.assertEqual(league_day("2026-07-24T20:00:00Z", start), 1)
-        self.assertEqual(league_day("2026-07-25T19:59:59Z", start), 2)
+        self.assertEqual(league_day("2026-07-25T00:00:00Z", start), 1)
+        self.assertEqual(league_day("2026-07-25T19:59:59Z", start), 1)
         self.assertEqual(league_day("2026-07-25T20:00:00Z", start), 2)
+
+    def test_active_league_day_uses_the_same_launch_windows(self) -> None:
+        league = League(
+            id="Allflame",
+            name="Allflame",
+            start_at="2026-07-24T20:00:00Z",
+        )
+        with patch(
+            "poe_advisor.models.utc_now",
+            return_value=datetime(2026, 8, 1, 19, 59, tzinfo=timezone.utc),
+        ):
+            self.assertEqual(league.day, 8)
+        with patch(
+            "poe_advisor.models.utc_now",
+            return_value=datetime(2026, 8, 1, 20, 0, tzinfo=timezone.utc),
+        ):
+            self.assertEqual(league.day, 9)
 
     def test_active_league_open_end_sentinel_keeps_dated_history(self) -> None:
         points = parse_daily_history_points(

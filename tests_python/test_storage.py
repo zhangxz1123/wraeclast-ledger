@@ -146,7 +146,7 @@ class StorageTests(unittest.TestCase):
                     name="Awakened Enlighten Support",
                     category="SkillGem",
                     source="poe.ninja",
-                    observed_at=f"2026-07-{23 + day:02d}T00:00:00Z",
+                    observed_at=f"2026-07-{24 + day:02d}T00:00:00Z",
                     chaos_value=3_000.0 + day,
                     divine_value=30.0 + day,
                     confidence=0.9,
@@ -204,6 +204,75 @@ class StorageTests(unittest.TestCase):
                 ).fetchall()
             }
         self.assertIn("ix_current_history_exact_identity", indexes)
+
+    def test_replace_current_history_curve_preserves_overview_rows(self) -> None:
+        item_key = "currency:mirror-of-kalandra"
+        identity = {
+            "league_id": self.league.id,
+            "item_key": item_key,
+            "name": "Mirror of Kalandra",
+            "category": "Currency",
+            "source": "poe.ninja",
+        }
+        self.storage.insert_price_points(
+            [
+                PricePoint(
+                    **identity,
+                    observed_at="2026-07-25T00:00:00Z",
+                    chaos_value=None,
+                    divine_value=90.0,
+                    confidence=0.65,
+                    details={"history_backfill": True},
+                ),
+                PricePoint(
+                    **identity,
+                    observed_at="2026-07-26T12:00:00Z",
+                    chaos_value=15_000.0,
+                    divine_value=150.0,
+                    confidence=0.95,
+                    details={"detailsId": "mirror-of-kalandra"},
+                ),
+            ]
+        )
+
+        written = self.storage.replace_current_history_price_points(
+            [
+                PricePoint(
+                    **identity,
+                    observed_at="2026-07-26T00:00:00Z",
+                    chaos_value=None,
+                    divine_value=139.9,
+                    confidence=0.95,
+                    details={"history_backfill": True},
+                )
+            ],
+            league_id=self.league.id,
+            item_key=item_key,
+            source="poe.ninja",
+        )
+
+        self.assertEqual(written, 1)
+        with closing(self.storage.connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT observed_at, divine_value,
+                       json_extract(details_json, '$.history_backfill') AS backfill
+                FROM price_points
+                WHERE league_id = ? AND item_key = ? AND source = 'poe.ninja'
+                ORDER BY observed_at
+                """,
+                (self.league.id, item_key),
+            ).fetchall()
+        self.assertEqual(
+            [
+                (row["observed_at"], row["divine_value"], row["backfill"])
+                for row in rows
+            ],
+            [
+                ("2026-07-26T00:00:00Z", 139.9, 1),
+                ("2026-07-26T12:00:00Z", 150.0, None),
+            ],
+        )
 
     def test_price_point_upsert_history_and_status_counts(self) -> None:
         snapshot_id, _ = self.storage.add_snapshot(
@@ -649,7 +718,7 @@ class StorageTests(unittest.TestCase):
         )
         self.assertEqual(
             [(row["league_day"], row["divine_value"]) for row in daily],
-            [(1, 30.0), (2, 35.0)],
+            [(1, 32.0), (2, 35.0)],
         )
         unfiltered_daily = self.storage.daily_item_history(
             self.league.id,
@@ -666,7 +735,7 @@ class StorageTests(unittest.TestCase):
                 )
                 for row in unfiltered_daily
             ],
-            [(1, 30.0, 0.8), (2, 35.0, 0.7)],
+            [(1, 99.0, 0.49), (2, 35.0, 0.7)],
         )
 
         self.storage.upsert_league(

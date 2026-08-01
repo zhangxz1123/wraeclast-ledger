@@ -22,6 +22,7 @@ from poe_advisor.sync import (
     DEFAULT_ITEM_CATEGORIES,
     SyncService,
     _poe_ninja_exchange_history_points,
+    _poe_ninja_exchange_item_history_points,
     _poe_ninja_stash_history_points,
 )
 
@@ -377,7 +378,7 @@ class SyncServiceTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
 
-    def test_exchange_history_uses_calendar_days_and_rejects_conflicts(
+    def test_exchange_history_uses_launch_windows_and_rejects_conflicts(
         self,
     ) -> None:
         league = League(
@@ -387,12 +388,12 @@ class SyncServiceTests(unittest.TestCase):
         )
         history = [
             {
-                "timestamp": "2026-03-06T00:00:00Z",
+                "timestamp": "2026-03-06T19:00:00Z",
                 "rate": 100.0,
                 "volumePrimaryValue": 10,
             },
             {
-                "timestamp": "2026-03-07T00:00:00Z",
+                "timestamp": "2026-03-07T19:00:00Z",
                 "rate": 110.0,
                 "volumePrimaryValue": 11,
             },
@@ -411,7 +412,7 @@ class SyncServiceTests(unittest.TestCase):
         self.assertEqual([point["league_day"] for point in points], [1, 2])
 
         zero_volume = {
-            "timestamp": "2026-03-06T00:00:00Z",
+            "timestamp": "2026-03-06T19:00:00Z",
             "rate": 22.25,
             "volumePrimaryValue": 0,
         }
@@ -419,10 +420,14 @@ class SyncServiceTests(unittest.TestCase):
             {"pairs": [{"id": "chaos", "history": [zero_volume, history[1]]}]},
             league,
         )
-        self.assertEqual([point["league_day"] for point in points], [2])
+        self.assertEqual([point["league_day"] for point in points], [1, 2])
+        self.assertEqual(points[0]["mean"], 22.25)
+        self.assertEqual(points[0]["volume"], 0.0)
+        self.assertEqual(points[0]["confidence"], 0.65)
+        self.assertEqual(points[0]["quote_currency"], "chaos")
 
         conflict = {
-            "timestamp": "2026-03-06T00:00:00Z",
+            "timestamp": "2026-03-06T19:00:00Z",
             "rate": 200.0,
             "volumePrimaryValue": 10,
         }
@@ -433,14 +438,82 @@ class SyncServiceTests(unittest.TestCase):
                     league,
                 )
 
+    def test_exchange_item_history_prefers_direct_divine_then_chaos(self) -> None:
+        league = League(
+            id="Allflame",
+            name="Allflame",
+            start_at="2026-07-24T20:00:00Z",
+        )
+        mirror_payload = {
+            "pairs": [
+                {"id": "chaos", "history": []},
+                {
+                    "id": "divine",
+                    "history": [
+                        {
+                            "timestamp": "2026-07-25T00:00:00Z",
+                            "rate": 100.0,
+                            "volumePrimaryValue": 0,
+                        },
+                        {
+                            "timestamp": "2026-07-26T00:00:00Z",
+                            "rate": 139.9,
+                            "volumePrimaryValue": 119457,
+                        },
+                    ],
+                },
+            ]
+        }
+
+        mirror_points = _poe_ninja_exchange_item_history_points(
+            mirror_payload,
+            league,
+        )
+
+        self.assertEqual(
+            [point["league_day"] for point in mirror_points],
+            [1, 2],
+        )
+        self.assertEqual(
+            [point["mean"] for point in mirror_points],
+            [100.0, 139.9],
+        )
+        self.assertTrue(
+            all(point["quote_currency"] == "divine" for point in mirror_points)
+        )
+        self.assertEqual(mirror_points[0]["confidence"], 0.65)
+
+        divine_chaos_payload = {
+            "pairs": [
+                {
+                    "id": "chaos",
+                    "history": [
+                        {
+                            "timestamp": "2026-07-25T00:00:00Z",
+                            "rate": 100.0,
+                            "volumePrimaryValue": 500,
+                        }
+                    ],
+                },
+                {"id": "divine", "history": []},
+            ]
+        }
+        chaos_points = _poe_ninja_exchange_item_history_points(
+            divine_chaos_payload,
+            league,
+        )
+        self.assertEqual([point["mean"] for point in chaos_points], [100.0])
+        self.assertEqual(chaos_points[0]["quote_currency"], "chaos")
+        self.assertEqual(chaos_points[0]["confidence"], 0.95)
+
     def test_stash_history_rejects_conflicting_duplicate_day(self) -> None:
         league = League(
             id="Mirage",
             name="Mirage",
             start_at="2026-03-06T19:00:00Z",
         )
-        first = {"daysAgo": 2, "value": 20.0, "count": 10}
-        conflict = {"daysAgo": 2, "value": 40.0, "count": 10}
+        first = {"daysAgo": 1, "value": 20.0, "count": 10}
+        conflict = {"daysAgo": 1, "value": 40.0, "count": 10}
         for rows in ([first, conflict], [conflict, first]):
             with self.assertRaises(DataSourceError):
                 _poe_ninja_stash_history_points(
@@ -450,7 +523,7 @@ class SyncServiceTests(unittest.TestCase):
                 )
         self.assertEqual(
             _poe_ninja_stash_history_points(
-                [{"daysAgo": 2, "value": 20.0, "count": 0}],
+                [{"daysAgo": 1, "value": 20.0, "count": 0}],
                 league,
                 "2026-03-08T06:00:00Z",
             ),
@@ -681,11 +754,11 @@ class SyncServiceTests(unittest.TestCase):
             service.poe_ninja.history_calls,
         )
         coverage = summary["coverage"][item_key]
-        # poe.ninja history timestamps are UTC calendar buckets.  The league
-        # launched on July 24, so the July 25 bucket is league day 2.
-        self.assertEqual(coverage["first_observed_day"], 2)
-        self.assertEqual(coverage["missing_days"], [1])
-        self.assertEqual(coverage["normalized_days"], list(range(2, 9)))
+        # The first poe.ninja midnight bucket is four hours after launch and
+        # therefore remains in the first 24-hour league window.
+        self.assertEqual(coverage["first_observed_day"], 1)
+        self.assertEqual(coverage["missing_days"], [])
+        self.assertEqual(coverage["normalized_days"], list(range(1, 8)))
         self.assertEqual(coverage["missing_divine_anchor_days"], [])
 
         daily = self.storage.daily_item_history(
@@ -695,13 +768,13 @@ class SyncServiceTests(unittest.TestCase):
             minimum_confidence=0.0,
         )
         by_day = {int(point["league_day"]): point for point in daily}
-        self.assertEqual(by_day[2]["divine_value"], 3000.0 / 100.0)
-        self.assertEqual(by_day[2]["source"], "poe.ninja")
+        self.assertEqual(by_day[1]["divine_value"], 3000.0 / 100.0)
+        self.assertEqual(by_day[1]["source"], "poe.ninja")
         # The later local observation on July 26 wins over that date's
         # midnight poe.ninja history bucket.
-        self.assertEqual(by_day[3]["divine_value"], 50.0)
-        self.assertEqual(by_day[3]["source"], "poe.ninja")
-        self.assertEqual(by_day[4]["divine_value"], 4200.0 / 130.0)
+        self.assertEqual(by_day[2]["divine_value"], 50.0)
+        self.assertEqual(by_day[2]["source"], "poe.ninja")
+        self.assertEqual(by_day[3]["divine_value"], 4200.0 / 130.0)
 
         archived = self.storage.current_item_history_archive(
             league.id,
@@ -709,8 +782,8 @@ class SyncServiceTests(unittest.TestCase):
         )
         assert archived is not None
         self.assertTrue(archived["durable"])
-        self.assertEqual(archived["provider_first_observed_day"], 2)
-        self.assertEqual(archived["normalized_days"], list(range(2, 9)))
+        self.assertEqual(archived["provider_first_observed_day"], 1)
+        self.assertEqual(archived["normalized_days"], list(range(1, 8)))
         self.assertEqual(archived["interpolation"], "none")
         connection = self.storage.connect()
         try:
@@ -793,6 +866,42 @@ class SyncServiceTests(unittest.TestCase):
             calls_after_first,
         )
 
+        # A parser/normalization version bump must invalidate otherwise
+        # complete durable coverage exactly once, even after raw responses
+        # have been removed from the compact public archive.
+        with self.storage.transaction() as connection:
+            connection.execute(
+                """
+                UPDATE current_item_history_coverage
+                SET metadata_json = json_set(
+                    metadata_json, '$.normalization_version', 1
+                )
+                WHERE league_id = ? AND item_key = ?
+                  AND provider = 'poe.ninja'
+                """,
+                (league.id, item_key),
+            )
+        with patch(
+            "poe_advisor.models.utc_now",
+            return_value=datetime(2026, 7, 31, 6, tzinfo=timezone.utc),
+        ):
+            migrated = service.sync_current_item_histories(
+                league,
+                [item_key],
+                max_items=100,
+            )
+        self.assertEqual(migrated["status"], "success")
+        self.assertEqual(migrated["already_backfilled_items"], 0)
+        migrated_archive = self.storage.current_item_history_archive(
+            league.id,
+            item_key,
+            provider="poe.ninja",
+        )
+        assert migrated_archive is not None
+        self.assertEqual(migrated_archive["normalization_version"], 2)
+        calls_after_version_migration = len(service.poe_ninja.history_calls)
+        self.assertEqual(calls_after_version_migration, calls_after_first + 2)
+
         # A durable marker is only a cache hit while every normalized day is
         # still present. If archive corruption or an interrupted migration
         # drops a row, the next run must re-fetch and repair the curve.
@@ -828,7 +937,7 @@ class SyncServiceTests(unittest.TestCase):
         self.assertEqual(repaired["already_backfilled_items"], 0)
         self.assertEqual(
             len(service.poe_ninja.history_calls),
-            calls_after_first + 2,
+            calls_after_version_migration,
         )
         restored = self.storage.current_item_history_archive(
             league.id,
@@ -837,6 +946,129 @@ class SyncServiceTests(unittest.TestCase):
         )
         assert restored is not None
         self.assertTrue(restored["normalized_price_days_complete"])
+
+    def test_ranked_exchange_history_uses_direct_divine_without_chaos_normalization(
+        self,
+    ) -> None:
+        class MirrorPoeNinja(FakePoeNinja):
+            def fetch_exchange_details(
+                self,
+                league: str,
+                category: str,
+                item_id: int | str,
+                **_: Any,
+            ) -> FetchResult:
+                if str(item_id) != "mirror-of-kalandra":
+                    return super().fetch_exchange_details(
+                        league,
+                        category,
+                        item_id,
+                    )
+                self.history_calls.append(
+                    ("exchange", league, category, str(item_id))
+                )
+                response = fetch_result(
+                    self.exchange_details_url(league, category, item_id),
+                    {
+                        "item": {
+                            "id": "mirror",
+                            "name": "Mirror of Kalandra",
+                            "detailsId": "mirror-of-kalandra",
+                        },
+                        "pairs": [
+                            {"id": "chaos", "history": []},
+                            {
+                                "id": "divine",
+                                "history": [
+                                    {
+                                        "timestamp": "2026-07-25T00:00:00Z",
+                                        "rate": 100.0,
+                                        "volumePrimaryValue": 0,
+                                    },
+                                    {
+                                        "timestamp": "2026-07-26T00:00:00Z",
+                                        "rate": 139.9,
+                                        "volumePrimaryValue": 119457,
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                )
+                response.fetched_at = "2026-07-31T06:00:00Z"
+                return response
+
+        client = MirrorPoeNinja()
+        service = self.service(poe_ninja=client)
+        result = service.sync(backfill_hours=0)
+        self.assertTrue(result["ok"])
+        league = self.storage.get_current_league()
+        assert league is not None
+        item_key = "currency:mirror-of-kalandra"
+        self.storage.insert_price_points(
+            [
+                PricePoint(
+                    league_id=league.id,
+                    item_key=item_key,
+                    name="Mirror of Kalandra",
+                    category="Currency",
+                    source="poe.ninja",
+                    observed_at="2026-07-30T06:00:00Z",
+                    chaos_value=65000.0,
+                    divine_value=300.0,
+                    confidence=0.95,
+                    details={"detailsId": "mirror-of-kalandra"},
+                )
+            ]
+        )
+
+        with patch(
+            "poe_advisor.models.utc_now",
+            return_value=datetime(2026, 7, 31, 6, tzinfo=timezone.utc),
+        ):
+            summary = service.sync_current_item_histories(
+                league,
+                [item_key],
+                max_items=100,
+            )
+
+        self.assertEqual(summary["failed_items"], 0)
+        self.assertEqual(summary["coverage"][item_key]["normalized_days"], [1, 2])
+        self.assertEqual(
+            summary["coverage"][item_key]["missing_divine_anchor_days"],
+            [],
+        )
+        self.assertIn(
+            ("exchange", league.id, "Currency", "divine-orb"),
+            client.history_calls,
+        )
+        self.assertIn(
+            ("exchange", league.id, "Currency", "mirror-of-kalandra"),
+            client.history_calls,
+        )
+        histories = self.storage.item_histories(
+            league.id,
+            days=90,
+            item_key=item_key,
+            sources=("poe.ninja",),
+        )[item_key]
+        backfilled = [
+            point
+            for point in histories
+            if point["details"].get("history_backfill") is True
+        ]
+        self.assertEqual(
+            [point["divine_value"] for point in backfilled],
+            [100.0, 139.9],
+        )
+        self.assertEqual(backfilled[0]["chaos_value"], None)
+        self.assertEqual(backfilled[0]["volume"], 0.0)
+        self.assertEqual(backfilled[0]["confidence"], 0.65)
+        self.assertEqual(backfilled[0]["details"]["quote_currency"], "divine")
+        self.assertEqual(
+            backfilled[0]["details"]["normalization"],
+            "direct same-league poe.ninja Divine pair history",
+        )
 
     def test_ranked_current_history_reports_request_limit(self) -> None:
         service = self.service()

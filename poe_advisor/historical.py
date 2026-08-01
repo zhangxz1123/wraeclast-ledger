@@ -222,13 +222,14 @@ def _skill_gem_parts(
 
 
 def league_day(observed_at: str | datetime, league_start: str | datetime) -> int:
-    """Return poe.ninja's one-based UTC calendar-day bucket."""
+    """Return the one-based 24-hour league window containing an observation."""
 
     observed = _as_datetime(observed_at)
     start = _as_datetime(league_start)
     if observed is None or start is None:
         raise ValueError("observed_at and league_start must be valid timestamps")
-    return (observed.date() - start.date()).days + 1
+    elapsed_days = int((observed - start).total_seconds() // 86_400)
+    return elapsed_days + 1
 
 
 def _as_datetime(value: Any) -> datetime | None:
