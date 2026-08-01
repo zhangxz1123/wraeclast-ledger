@@ -1,13 +1,37 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from poe_advisor.__main__ import build_parser
 from poe_advisor.automation import run_daily_update
 
 
 class DailyAutomationTests(unittest.TestCase):
+    def test_cli_market_syncs_default_to_no_hourly_audit_backfill(self) -> None:
+        parser = build_parser()
+
+        self.assertEqual(parser.parse_args(["sync"]).history_hours, 0)
+        self.assertEqual(
+            parser.parse_args(["daily-update"]).history_hours,
+            0,
+        )
+
+    def test_scheduled_workflow_defaults_hourly_audit_backfill_off(self) -> None:
+        workflow = (
+            Path(__file__).resolve().parents[1]
+            / ".github"
+            / "workflows"
+            / "daily-pages.yml"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('default: "0"', workflow)
+        self.assertIn('- "0"', workflow)
+        self.assertIn("inputs.history_hours || '0'", workflow)
+        self.assertNotIn("inputs.history_hours || '168'", workflow)
+
     def test_complete_refresh_runs_curves_history_and_final_model(self) -> None:
         league = SimpleNamespace(id="Live", is_demo=False)
         application = SimpleNamespace()
@@ -89,6 +113,9 @@ class DailyAutomationTests(unittest.TestCase):
             )
 
         self.assertFalse(result["ok"])
+        application.sync_service.sync.assert_called_once_with(
+            backfill_hours=0
+        )
         application.storage.get_current_league.assert_not_called()
 
 

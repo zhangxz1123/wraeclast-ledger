@@ -212,10 +212,54 @@ EXCLUDED_INVESTMENT_CATEGORIES = (
     "DeliriumOrb",
     "Artifact",
     "Incubator",
+    "ValdoMap",
 )
 _EXCLUDED_INVESTMENT_CATEGORY_KEYS = frozenset(
     re.sub(r"[^a-z0-9]+", "", value.casefold())
     for value in EXCLUDED_INVESTMENT_CATEGORIES
+)
+
+# Every poe.ninja market whose normalized category starts with ``Unique`` is
+# archived but omitted from the investment list. Forbidden jewels are exposed
+# by poe.ninja as ``ForbiddenJewel``, so they deliberately remain investable.
+EXCLUDED_INVESTMENT_CATEGORY_PREFIXES = ("Unique",)
+_EXCLUDED_INVESTMENT_CATEGORY_PREFIX_KEYS = tuple(
+    re.sub(r"[^a-z0-9]+", "", value.casefold())
+    for value in EXCLUDED_INVESTMENT_CATEGORY_PREFIXES
+)
+AWAKENED_GEM_NAME_PREFIX = "Awakened "
+
+# The user-selected endgame whitelist is intentionally exact and small.
+# Keep the predicate separate from the broad category rule so a future data
+# source that exposes rolls can add variant-specific checks without changing
+# archive retention or the rest of the ranking pipeline.
+UNIQUE_INVESTMENT_WHITELIST = (
+    "Voices",
+    "Sublime Vision",
+    "The Adorned",
+    "Watcher's Eye",
+)
+_UNIQUE_INVESTMENT_WHITELIST_KEYS = frozenset(
+    re.sub(r"[^a-z0-9]+", "", value.casefold())
+    for value in UNIQUE_INVESTMENT_WHITELIST
+)
+_VOICES_NAME_KEY = "voices"
+_VOICES_ONE_PASSIVE_DETAILS_ID_KEY = "voiceslargeclusterjewel"
+_VOICES_THREE_PASSIVE_VARIANT_KEY = "3passives"
+_VOICES_THREE_PASSIVE_DETAILS_ID_KEY = (
+    "voices3passiveslargeclusterjewel"
+)
+_AGGREGATE_ROLL_UNRESOLVED_UNIQUE_KEYS = frozenset(
+    ("sublimevision", "theadorned", "watcherseye")
+)
+
+INVESTMENT_UNIVERSE_CATEGORY_FILTERS = (
+    *EXCLUDED_INVESTMENT_CATEGORIES,
+    (
+        "Unique* (except 1-/3-passive Voices and the aggregate Sublime "
+        "Vision, The Adorned, and Watcher's Eye markets)"
+    ),
+    "SkillGem (except names beginning with 'Awakened ')",
 )
 
 # These are exact low-end currency markets, not whole categories: valuable
@@ -262,9 +306,110 @@ def _normalized_asset_token(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", value.casefold())
 
 
-def _category_is_excluded(category: str) -> bool:
-    return _normalized_asset_token(category) in (
-        _EXCLUDED_INVESTMENT_CATEGORY_KEYS
+def _unique_item_is_investable(
+    name: str,
+    details: dict[str, Any] | None = None,
+) -> bool:
+    """Return exact-name unique exceptions with verified Voices identity."""
+
+    name_key = _normalized_asset_token(name)
+    if name_key not in _UNIQUE_INVESTMENT_WHITELIST_KEYS:
+        return False
+    if name_key != _VOICES_NAME_KEY:
+        # The overview exposes these three names only as aggregate markets;
+        # ranking rows carry an explicit unresolved-roll caveat below.
+        return True
+    if not isinstance(details, dict):
+        return False
+    variant_key = _normalized_asset_token(str(details.get("variant") or ""))
+    details_id_key = _normalized_asset_token(
+        str(details.get("detailsId") or details.get("details_id") or "")
+    )
+    if variant_key == _VOICES_THREE_PASSIVE_VARIANT_KEY:
+        return details_id_key == _VOICES_THREE_PASSIVE_DETAILS_ID_KEY
+    # poe.ninja represents the one-passive Voices market as its un-suffixed
+    # identity. Five- and seven-passive markets have explicit variants and
+    # are therefore rejected even if a future payload reuses the base ID.
+    return (
+        not variant_key
+        and details_id_key == _VOICES_ONE_PASSIVE_DETAILS_ID_KEY
+    )
+
+
+def _unique_market_scope(
+    name: str,
+    details: dict[str, Any] | None,
+) -> dict[str, str] | None:
+    """Describe resolution quality for a permitted unique market."""
+
+    name_key = _normalized_asset_token(name)
+    if name_key == _VOICES_NAME_KEY and isinstance(details, dict):
+        variant_key = _normalized_asset_token(
+            str(details.get("variant") or "")
+        )
+        details_id_key = _normalized_asset_token(
+            str(details.get("detailsId") or details.get("details_id") or "")
+        )
+        if (
+            variant_key == _VOICES_THREE_PASSIVE_VARIANT_KEY
+            and details_id_key == _VOICES_THREE_PASSIVE_DETAILS_ID_KEY
+        ):
+            return {
+                "code": "exact_voices_3_passives",
+                "label": "Exact poe.ninja variant: 3 passives",
+                "caveat": (
+                    "This price is the distinct poe.ninja 3-passive Voices "
+                    "market. Five- and seven-passive variants are omitted."
+                ),
+                "display_variant": "3 passives",
+            }
+        if (
+            not variant_key
+            and details_id_key == _VOICES_ONE_PASSIVE_DETAILS_ID_KEY
+        ):
+            return {
+                "code": "poe_ninja_default_voices_1_passive",
+                "label": "poe.ninja default variant: 1 passive",
+                "caveat": (
+                    "poe.ninja's un-suffixed voices-large-cluster-jewel "
+                    "identity is its 1-passive market. Five- and "
+                    "seven-passive variants are omitted."
+                ),
+                "display_variant": "1 passive",
+            }
+    if name_key in _AGGREGATE_ROLL_UNRESOLVED_UNIQUE_KEYS:
+        return {
+            "code": "aggregate_roll_unresolved",
+            "label": "Aggregate poe.ninja market · rolls unresolved",
+            "caveat": (
+                "poe.ninja's overview price aggregates this unique without "
+                "its sought modifier rolls. Treat it as family-level market "
+                "context, not the price of a specific roll."
+            ),
+        }
+    return None
+
+
+def _item_is_excluded(
+    category: str,
+    name: str,
+    details: dict[str, Any] | None = None,
+) -> bool:
+    """Return whether an archived market is outside the ranked universe."""
+
+    category_token = _normalized_asset_token(category)
+    if category_token in _EXCLUDED_INVESTMENT_CATEGORY_KEYS:
+        return True
+    if any(
+        category_token.startswith(prefix)
+        for prefix in _EXCLUDED_INVESTMENT_CATEGORY_PREFIX_KEYS
+    ):
+        return not _unique_item_is_investable(name, details)
+    return (
+        category_token == "skillgem"
+        and not name.casefold().startswith(
+            AWAKENED_GEM_NAME_PREFIX.casefold()
+        )
     )
 
 
@@ -645,7 +790,15 @@ class RecommendationEngine:
                 if not daily_key_rows:
                     continue
                 key_latest = daily_key_rows[-1]
-                if _category_is_excluded(str(key_latest["category"])):
+                if _item_is_excluded(
+                    str(key_latest["category"]),
+                    str(key_latest["name"]),
+                    (
+                        key_latest.get("details")
+                        if isinstance(key_latest.get("details"), dict)
+                        else None
+                    ),
+                ):
                     continue
                 if _known_declining_lifecycle(
                     key,
@@ -672,7 +825,15 @@ class RecommendationEngine:
                 continue
             latest = rows[-1]
             category = str(latest["category"])
-            if _category_is_excluded(category):
+            if _item_is_excluded(
+                category,
+                str(latest["name"]),
+                (
+                    latest.get("details")
+                    if isinstance(latest.get("details"), dict)
+                    else None
+                ),
+            ):
                 excluded_category_counts[category] += 1
                 continue
             current = float(latest["divine_value"])
@@ -1685,7 +1846,7 @@ class RecommendationEngine:
                     "apply only to recommendations and the watchlist."
                 ),
                 "excluded_categories": list(
-                    EXCLUDED_INVESTMENT_CATEGORIES
+                    INVESTMENT_UNIVERSE_CATEGORY_FILTERS
                 ),
                 "excluded_category_items": sum(
                     excluded_category_counts.values()
@@ -1856,10 +2017,18 @@ class RecommendationEngine:
                 excluded_stale_current_items += 1
                 continue
             category = str(latest["category"])
-            if _category_is_excluded(category):
+            name = str(latest["name"])
+            if _item_is_excluded(
+                category,
+                name,
+                (
+                    latest.get("details")
+                    if isinstance(latest.get("details"), dict)
+                    else None
+                ),
+            ):
                 excluded_category_counts[category] += 1
                 continue
-            name = str(latest["name"])
             if _low_end_currency_is_excluded(category, name):
                 excluded_low_end_currency_counts[name] += 1
                 continue
@@ -2074,6 +2243,10 @@ class RecommendationEngine:
                 if isinstance(latest.get("details"), dict)
                 else {}
             )
+            unique_market_scope = _unique_market_scope(
+                str(latest["name"]),
+                details,
+            )
             item_level = _item_level_from_identity(
                 item_key,
                 str(latest["category"]),
@@ -2276,6 +2449,11 @@ class RecommendationEngine:
                     if selected["blend"]["current_curve_used"]
                     else "; current curve component not blended"
                 )
+                + (
+                    f"; {unique_market_scope['label']}"
+                    if unique_market_scope is not None
+                    else ""
+                )
                 + "."
             )
             row = {
@@ -2283,8 +2461,28 @@ class RecommendationEngine:
                 "curve_key": item_key,
                 "name": latest["name"],
                 "category": latest["category"],
+                "market_scope_code": (
+                    unique_market_scope.get("code")
+                    if unique_market_scope is not None
+                    else None
+                ),
+                "market_scope_label": (
+                    unique_market_scope.get("label")
+                    if unique_market_scope is not None
+                    else None
+                ),
+                "market_scope_caveat": (
+                    unique_market_scope.get("caveat")
+                    if unique_market_scope is not None
+                    else None
+                ),
                 "trade_identity": {
-                    "variant": details.get("variant"),
+                    "variant": (
+                        unique_market_scope.get("display_variant")
+                        if unique_market_scope is not None
+                        and unique_market_scope.get("display_variant")
+                        else details.get("variant")
+                    ),
                     "base_type": (
                         details.get("baseType")
                         or details.get("base_type")
@@ -2466,6 +2664,9 @@ class RecommendationEngine:
             "curve_key",
             "name",
             "category",
+            "market_scope_code",
+            "market_scope_label",
+            "market_scope_caveat",
             "trade_identity",
             "price_divine",
             "current_price_divine",
@@ -2636,6 +2837,13 @@ class RecommendationEngine:
                 "eligibility_gates": [],
                 "universe_filters": [
                     "excluded small-consumable categories",
+                    (
+                        "Unique* poe.ninja categories except 1-/3-passive "
+                        "Voices and aggregate Sublime Vision, The Adorned, "
+                        "and Watcher's Eye markets"
+                    ),
+                    "Valdo maps",
+                    "non-Awakened skill gems",
                     "explicit low-end currencies such as Chromatic Orb",
                     "current price below one Chaos Orb",
                     "current poe.ninja observation older than one league day",
@@ -2647,7 +2855,7 @@ class RecommendationEngine:
             "investment_scope": {
                 "strategy": "filtered_forecast_ranking",
                 "excluded_categories": list(
-                    EXCLUDED_INVESTMENT_CATEGORIES
+                    INVESTMENT_UNIVERSE_CATEGORY_FILTERS
                 ),
                 "excluded_category_items": sum(
                     excluded_category_counts.values()
@@ -3171,7 +3379,7 @@ class RecommendationEngine:
             reason = str(watch.get("reason") or "Signal review is required.")
             if not key or not name or not category:
                 continue
-            if _category_is_excluded(category):
+            if _item_is_excluded(category, name):
                 continue
             if (
                 watch.get("lifecycle_status") == "known_decline"

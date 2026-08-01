@@ -9,7 +9,15 @@ produces gross 3, 7, and 14-day gain forecasts. The selected horizon determines
 the global order shown across paginated results. The archive is intentionally
 broad, while excluded small-consumable categories, sub-1-chaos markets, and
 persistent completed-league decliners remain outside the displayed investment
-universe.
+universe. Unique-item categories, Valdo maps, and non-Awakened skill gems are
+also archived but omitted from rankings. The unique-item exceptions are
+one- and three-passive Voices, Sublime Vision, The Adorned, and Watcher's Eye;
+Awakened gems and the separately categorized Forbidden Jewel market also
+remain visible. The latter three use aggregate poe.ninja markets and are
+labelled roll-unresolved rather than presented as prices for sought rolls.
+The Voices trade links preserve the exact one-/three-passive count. The
+Adorned trade link targets 90% or greater effect, but its displayed price and
+forecast remain the clearly labelled aggregate poe.ninja family series.
 
 The application does not place trades. Recommendations are probabilistic
 research signals, not guarantees of profit.
@@ -85,6 +93,9 @@ the dashboard's primary update button opens that workflow; it never embeds a
 GitHub token in browser code. A small successful-run heartbeat is committed so
 public-repository schedules do not become dormant after 60 days. A failed
 refresh does not replace the previous Pages deployment or archive snapshot.
+The scheduled and normal manual runs leave the optional GGG hourly exchange
+audit backfill disabled; a positive recovery window must be selected explicitly
+when dispatching the workflow.
 
 GitHub Pages must use **GitHub Actions** as its publishing source. The
 repository workflow needs `contents: write`, `pages: write`, and
@@ -129,9 +140,14 @@ The SQLite database contains:
 - Exact dated current-league poe.ninja detail histories for ranked items,
   including the raw item and same-day Divine/Chaos responses used for
   normalization.
+- Current overview observations may be retained when a user syncs repeatedly,
+  but model curves select only the newest exact poe.ninja observation in each
+  UTC league-day bucket.
 - Completed-league daily prices imported from poe.ninja's official ZIP dumps,
   plus the ZIP fingerprint/checkpoint, direct Chaos quote, confidence, and
   source metadata retained for fast queries.
+- Optional official GGG hourly exchange responses when an audit backfill is
+  explicitly requested. These rows are never forecast or ranking inputs.
 - Prices for excluded low-end markets, including essences, fossils, oils,
   resonators, scarabs, Delirium Orbs, artifacts, and incubators. Keeping these
   observations does not place those categories in the forecast ranking.
@@ -182,8 +198,9 @@ The **Sync market & run model** button calls `POST /api/sync`. A normal sync:
    missing anchors remain gaps.
 8. Regenerates and stores the final ranking after the curve archive is updated.
 
-The optional JSON field `backfill_hours` also advances the official GGG
-Currency Exchange hourly archive:
+Hourly exchange collection is disabled by default. A positive optional JSON
+field `backfill_hours` explicitly advances the official GGG Currency Exchange
+audit archive:
 
 ```json
 {"backfill_hours": 24}
@@ -250,6 +267,11 @@ their relative sparklines are never expanded into invented dates. Exact dated
 current-league curves come from poe.ninja's exchange-detail and stash-item
 history responses. Completed-league curves come only from poe.ninja's official
 ZIP dumps.
+
+Both current- and completed-league model curves are daily. For current-league
+data, the newest exact poe.ninja observation in each UTC league-day bucket is
+used; completed-league dumps already provide exact daily buckets. Intraday rows
+can remain in the local audit archive without increasing model granularity.
 
 The official GGG Currency Exchange feed provides genuine hourly historical
 digests for fungible markets. Old hours may eventually be removed upstream,
@@ -395,7 +417,7 @@ python -m poe_advisor serve --host 127.0.0.1 --port 8787
 # Run one live sync
 python -m poe_advisor sync
 
-# Include a bounded official hourly backfill
+# Opt in to a bounded official hourly audit backfill
 python -m poe_advisor sync --history-hours 24
 
 # Import any official completed-league dumps not already checkpointed

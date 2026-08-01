@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 from poe_advisor.clients import PoeNinjaClient
 from poe_advisor.models import (
@@ -639,11 +641,19 @@ class SyncServiceTests(unittest.TestCase):
             ]
         )
 
-        summary = service.sync_current_item_histories(
-            league,
-            [item_key, "unique:missing-ranked-item"],
-            max_items=100,
-        )
+        # Keep this dated fixture independent of the wall clock. Without the
+        # freeze, every UTC rollover after its final July 31 history bucket
+        # correctly adds another missing league day and makes the assertion
+        # below time-dependent.
+        with patch(
+            "poe_advisor.models.utc_now",
+            return_value=datetime(2026, 7, 31, 6, tzinfo=timezone.utc),
+        ):
+            summary = service.sync_current_item_histories(
+                league,
+                [item_key, "unique:missing-ranked-item"],
+                max_items=100,
+            )
 
         self.assertEqual(summary["status"], "partial")
         self.assertEqual(summary["requested_items"], 2)
@@ -734,11 +744,15 @@ class SyncServiceTests(unittest.TestCase):
         self.assertEqual(history_state["status"], "partial")
 
         calls_after_first = len(service.poe_ninja.history_calls)
-        cached = service.sync_current_item_histories(
-            league,
-            [item_key],
-            max_items=100,
-        )
+        with patch(
+            "poe_advisor.models.utc_now",
+            return_value=datetime(2026, 7, 31, 6, tzinfo=timezone.utc),
+        ):
+            cached = service.sync_current_item_histories(
+                league,
+                [item_key],
+                max_items=100,
+            )
         self.assertEqual(cached["status"], "success")
         self.assertEqual(cached["cached_items"], 1)
         self.assertEqual(

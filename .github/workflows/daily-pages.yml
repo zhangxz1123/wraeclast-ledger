@@ -15,11 +15,12 @@ on:
   workflow_dispatch:
     inputs:
       history_hours:
-        description: Official exchange recovery window
+        description: Optional GGG hourly audit recovery window
         required: true
-        default: "168"
+        default: "0"
         type: choice
         options:
+          - "0"
           - "24"
           - "168"
           - "336"
@@ -134,7 +135,7 @@ jobs:
           # Keep regression tests in the full local default; only the hosted
           # updater opts in to compact completed-league storage.
           POE_ADVISOR_COMPACT_HISTORY: "1"
-          HISTORY_HOURS: ${{ inputs.history_hours || '168' }}
+          HISTORY_HOURS: ${{ inputs.history_hours || '0' }}
           SEASONAL_ITEMS: ${{ inputs.seasonal_items || '20' }}
           CURRENT_HISTORY_ITEMS: ${{ inputs.current_history_items || '100' }}
           POE_OAUTH_TOKEN: ${{ secrets.POE_OAUTH_TOKEN }}

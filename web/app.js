@@ -466,6 +466,12 @@ const UNIQUE_TRADE_CATEGORIES = new Set([
   "UniqueRelic",
   "UniqueWeapon",
 ]);
+// Exact user-facing trade links only; prices and forecasts still come from
+// poe.ninja. These stat IDs identify the rolled explicit modifiers on the
+// official Path of Exile trade search.
+const VOICES_PASSIVE_STAT_ID = "explicit.stat_1085446536";
+const ADORNED_EFFECT_STAT_ID = "explicit.stat_461663422";
+const ADORNED_HIGH_ROLL_MINIMUM = 90;
 const BROAD_LEAGUE_ALIASES = new Map([
   ["mirage", "Mirage"],
   ["keepers", "Keepers"],
@@ -682,6 +688,28 @@ function officialTradeSearch(item) {
     || item.category.startsWith("Unique")
   ) {
     query.name = item.name;
+    if (/^Voices$/i.test(String(item.name || ""))) {
+      const passiveCount = Number.parseInt(
+        String(identity.variant || "").match(/^([13])\s+passives?$/i)?.[1]
+        || "",
+        10,
+      );
+      if (passiveCount === 1 || passiveCount === 3) {
+        query.stats[0].filters.push({
+          id: VOICES_PASSIVE_STAT_ID,
+          value: { min: passiveCount, max: passiveCount },
+          disabled: false,
+        });
+      } else {
+        broad = true;
+      }
+    } else if (/^The Adorned$/i.test(String(item.name || ""))) {
+      query.stats[0].filters.push({
+        id: ADORNED_EFFECT_STAT_ID,
+        value: { min: ADORNED_HIGH_ROLL_MINIMUM },
+        disabled: false,
+      });
+    }
   } else {
     query.type = item.name;
   }
@@ -899,9 +927,14 @@ function normalizeRecommendation(item, index) {
     tradeIdentity,
     variantLabel,
     displayName,
+    marketScopeCode: item.market_scope_code || item.marketScopeCode || null,
+    marketScopeLabel: item.market_scope_label || item.marketScopeLabel || null,
+    marketScopeCaveat: (
+      item.market_scope_caveat || item.marketScopeCaveat || null
+    ),
     searchText: String(
       item.search_text
-      || `${displayName} ${category} ${tradeIdentity.passiveName || ""}`,
+      || `${displayName} ${category} ${tradeIdentity.passiveName || ""} ${item.market_scope_label || ""}`,
     ).toLowerCase(),
     priceDivine: nullableNumber(
       item.price_divine,
@@ -972,7 +1005,7 @@ function renderRankingSummary() {
     ? ` ${compact(hiddenCount)} hidden on this device.`
     : "";
   els.modelNote.textContent = returned
-    ? `${showing}, sorted by gross ${horizon}-day expected gain.${hiddenNote} Forecasts use poe.ninja Medium/High observations from Mirage, Keepers, Mercenaries, and Settlers; Low observations remain in the local archive for audit only.${excludedItems ? ` ${compact(excludedItems)} archived markets are omitted by category, the 1c floor, or the persistent-decline rule.` : ""}`
+    ? `${showing}, sorted by gross ${horizon}-day expected gain.${hiddenNote} Forecasts use poe.ninja Medium/High observations from Mirage, Keepers, Mercenaries, and Settlers; Low observations remain in the local archive for audit only. Forecast curves use one exact point per UTC league day; optional GGG hourly audit rows never enter them. Unique items (except 1-/3-passive Voices and roll-unresolved Sublime Vision, The Adorned, and Watcher's Eye markets), Valdo maps, and non-Awakened gems are archived but omitted from this investment list.${excludedItems ? ` ${compact(excludedItems)} archived markets are omitted by category, the 1c floor, or the persistent-decline rule.` : ""}`
     : `No item forecast is available yet. Build the broad-league archive, then sync again.`;
 }
 
@@ -1518,6 +1551,9 @@ function renderRecommendations() {
               </button>
               <small>
                 <span>${escapeHtml(item.category)}</span>
+                ${item.marketScopeLabel
+                  ? `<span class="cell-meta">${escapeHtml(item.marketScopeLabel)}</span>`
+                  : ""}
               </small>
             </div>
           </div>
@@ -1658,6 +1694,9 @@ function openDetail(rank) {
     </div>
     <h2>${escapeHtml(item.displayName)}</h2>
     <p class="detail-summary">Gross price forecasts from four broadly covered leagues and the current-league curve. These estimates do not deduct trading costs or adjust for execution depth.</p>
+    ${item.marketScopeCaveat
+      ? `<p class="detail-caveat forecast-method-note"><strong>${escapeHtml(item.marketScopeLabel || "Market scope warning")}</strong>: ${escapeHtml(item.marketScopeCaveat)}</p>`
+      : ""}
     <div class="detail-metrics">
       <div><span>CURRENT PRICE</span><strong>${item.priceDivine == null ? "—" : money(item.priceDivine, 2)}</strong></div>
       <div><span>${horizon}D EXPECTED GAIN</span><strong>${forecastPercent(selectedForecast?.expectedGainPct)}</strong></div>
@@ -1787,7 +1826,7 @@ async function syncMarket() {
   setSourceState("warning", "Fetching fresh snapshots and extending the local exchange archive. Keep this page open.");
 
   try {
-    const backfillHours = toNumber(els.backfillSelect.value, 168);
+    const backfillHours = toNumber(els.backfillSelect.value, 0);
     const result = await api("/api/sync", {
       method: "POST",
       body: JSON.stringify({

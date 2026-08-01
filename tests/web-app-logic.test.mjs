@@ -118,6 +118,21 @@ test("official trade links preserve league and exact Awakened gem variant", () =
           passiveName: "Instruments of Virtue",
         },
       }),
+      voicesOne: officialTradeSearch({
+        name: "Voices",
+        category: "UniqueJewel",
+        tradeIdentity: { variant: "1 passive" },
+      }),
+      voicesThree: officialTradeSearch({
+        name: "Voices",
+        category: "UniqueJewel",
+        tradeIdentity: { variant: "3 passives" },
+      }),
+      adorned: officialTradeSearch({
+        name: "The Adorned",
+        category: "UniqueJewel",
+        tradeIdentity: {},
+      }),
     };
   `);
 
@@ -147,6 +162,73 @@ test("official trade links preserve league and exact Awakened gem variant", () =
   );
   assert.equal(result.forbidden.broad, true);
   assert.equal(forbiddenQuery.query.name, "Forbidden Flame");
+
+  for (const [trade, passiveCount] of [
+    [result.voicesOne, 1],
+    [result.voicesThree, 3],
+  ]) {
+    const query = JSON.parse(new URL(trade.url).searchParams.get("q"));
+    assert.deepEqual(query.query.stats[0].filters, [{
+      id: "explicit.stat_1085446536",
+      value: { min: passiveCount, max: passiveCount },
+      disabled: false,
+    }]);
+    assert.equal(trade.broad, false);
+  }
+
+  const adornedQuery = JSON.parse(
+    new URL(result.adorned.url).searchParams.get("q"),
+  );
+  assert.deepEqual(adornedQuery.query.stats[0].filters, [{
+    id: "explicit.stat_461663422",
+    value: { min: 90 },
+    disabled: false,
+  }]);
+  assert.equal(result.adorned.broad, false);
+});
+
+test("local sync leaves optional hourly audit disabled by default", () => {
+  const html = fs.readFileSync(
+    new URL("../web/index.html", import.meta.url),
+    "utf8",
+  );
+  assert.match(
+    html,
+    /<option value="0" selected>Off \(daily model default\)<\/option>/,
+  );
+  assert.match(
+    appSource,
+    /toNumber\(els\.backfillSelect\.value, 0\)/,
+  );
+  assert.doesNotMatch(
+    appSource,
+    /toNumber\(els\.backfillSelect\.value, 168\)/,
+  );
+});
+
+test("aggregate unique roll caveats survive browser normalization", () => {
+  const result = runInApp(`
+    const item = normalizeRecommendation({
+      key: "uniquejewel:sublime-vision",
+      name: "Sublime Vision",
+      category: "UniqueJewel",
+      market_scope_code: "aggregate_roll_unresolved",
+      market_scope_label: "Aggregate poe.ninja market - rolls unresolved",
+      market_scope_caveat: "Not the price of a specific roll.",
+    }, 0);
+    globalThis.__result = {
+      code: item.marketScopeCode,
+      label: item.marketScopeLabel,
+      caveat: item.marketScopeCaveat,
+    };
+  `);
+
+  assert.equal(result.code, "aggregate_roll_unresolved");
+  assert.equal(
+    result.label,
+    "Aggregate poe.ninja market - rolls unresolved",
+  );
+  assert.equal(result.caveat, "Not the price of a specific roll.");
 });
 
 test("full item names wrap and include exact visible variant identity", () => {

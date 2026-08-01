@@ -157,9 +157,9 @@ class RecommendationTests(unittest.TestCase):
             [
                 PricePoint(
                     league_id=live.id,
-                    item_key="unique:stale-variant",
+                    item_key="basetype:stale-variant",
                     name="Stale Variant",
-                    category="UniqueAccessory",
+                    category="BaseType",
                     source="poe.ninja",
                     observed_at=iso_utc(now - timedelta(minutes=30)),
                     chaos_value=200.0,
@@ -170,9 +170,9 @@ class RecommendationTests(unittest.TestCase):
                 ),
                 PricePoint(
                     league_id=live.id,
-                    item_key="unique:refreshed-variant",
+                    item_key="basetype:refreshed-variant",
                     name="Refreshed Variant",
-                    category="UniqueAccessory",
+                    category="BaseType",
                     source="poe.ninja",
                     observed_at=iso_utc(now),
                     chaos_value=200.0,
@@ -236,7 +236,7 @@ class RecommendationTests(unittest.TestCase):
 
         self.assertEqual(
             [row["key"] for row in payload["rankings"]],
-            ["unique:refreshed-variant"],
+            ["basetype:refreshed-variant"],
         )
         self.assertEqual(
             payload["investment_scope"]["excluded_stale_current_items"],

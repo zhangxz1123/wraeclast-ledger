@@ -10,7 +10,7 @@ def run_daily_update(
     *,
     database_path: str | Path,
     web_dir: str | Path,
-    history_hours: int = 168,
+    history_hours: int = 0,
     seasonal_items: int = 20,
     current_history_items: int = 100,
 ) -> dict[str, Any]:

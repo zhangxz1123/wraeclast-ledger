@@ -57,8 +57,10 @@ def build_parser() -> argparse.ArgumentParser:
     sync.add_argument(
         "--history-hours",
         type=int,
-        default=168,
-        help="Official exchange hours to retain on first sync (0-336).",
+        default=0,
+        help=(
+            "Optional official GGG hourly audit backfill (0-336; default: 0)."
+        ),
     )
     sync.add_argument(
         "--no-demo-fallback",
@@ -73,8 +75,11 @@ def build_parser() -> argparse.ArgumentParser:
     daily_update.add_argument(
         "--history-hours",
         type=int,
-        default=168,
-        help="Official exchange recovery window (0-336; default: 168).",
+        default=0,
+        help=(
+            "Optional official GGG hourly audit recovery window "
+            "(0-336; default: 0)."
+        ),
     )
     daily_update.add_argument(
         "--seasonal-items",

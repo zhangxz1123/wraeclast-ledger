@@ -549,11 +549,11 @@ class ForecastRankingTests(unittest.TestCase):
     def test_variant_absent_from_latest_successful_sync_is_omitted(
         self,
     ) -> None:
-        fresh_key = "skillgem:still-listed"
-        stale_key = "skillgem:vanished-variant"
+        fresh_key = "skillgem:awakened-still-listed"
+        stale_key = "skillgem:awakened-vanished-variant"
         self.add_current(
             fresh_key,
-            "Still Listed",
+            "Awakened Still Listed",
             [2.0],
             category="SkillGem",
         )
@@ -562,7 +562,7 @@ class ForecastRankingTests(unittest.TestCase):
                 PricePoint(
                     league_id=self.live.id,
                     item_key=stale_key,
-                    name="Vanished Variant",
+                    name="Awakened Vanished Variant",
                     category="SkillGem",
                     source="poe.ninja",
                     observed_at=iso_utc(self.now - timedelta(days=1)),
@@ -595,8 +595,8 @@ class ForecastRankingTests(unittest.TestCase):
         )
 
         names = {row["name"] for row in payload["rankings"]}
-        self.assertIn("Still Listed", names)
-        self.assertNotIn("Vanished Variant", names)
+        self.assertIn("Awakened Still Listed", names)
+        self.assertNotIn("Awakened Vanished Variant", names)
         self.assertEqual(
             payload["investment_scope"]["excluded_stale_current_items"],
             1,
@@ -686,10 +686,10 @@ class ForecastRankingTests(unittest.TestCase):
     def test_full_exact_variant_universe_is_not_truncated(self) -> None:
         for index in range(105):
             self.add_current(
-                f"unique:fixture-{index:03d}",
+                f"basetype:fixture-{index:03d}",
                 f"Fixture {index:03d}",
                 [1.0],
-                category="UniqueAccessory",
+                category="BaseType",
             )
         self.add_current(
             "skillgem:awakened-enlighten-support-level-1",
@@ -740,6 +740,200 @@ class ForecastRankingTests(unittest.TestCase):
         self.assertNotIn("horizons", awakened[0])
         self.assertEqual(awakened[0]["forecast_3d"], {"days": 3})
 
+    def test_requested_market_categories_are_archived_but_not_ranked(
+        self,
+    ) -> None:
+        fixtures = (
+            (
+                "uniqueaccessory:headhunter",
+                "Headhunter",
+                "UniqueAccessory",
+            ),
+            (
+                "uniquemap:fixture",
+                "Unique Map Fixture",
+                "Unique Map",
+            ),
+            (
+                "uniquejewel:sublime-vision",
+                "Sublime Vision",
+                "UniqueJewel",
+            ),
+            (
+                "uniquejewel:the-adorned",
+                "The Adorned",
+                "UniqueJewel",
+            ),
+            (
+                "uniquejewel:watchers-eye",
+                "Watcher's Eye",
+                "UniqueJewel",
+            ),
+            (
+                "uniquejewel:voices-not-exact",
+                "Voices (3 passives)",
+                "UniqueJewel",
+            ),
+            ("valdomap:fixture", "Valdo Fixture", "ValdoMap"),
+            (
+                "skillgem:enlighten-support",
+                "Enlighten Support",
+                "SkillGem",
+            ),
+            (
+                "skillgem:awakened-without-space",
+                "AwakenedFixture Support",
+                "SkillGem",
+            ),
+            (
+                "skillgem:awakened-enlighten-support",
+                "Awakened Enlighten Support",
+                "SkillGem",
+            ),
+            (
+                "skillgem:awakened-case-fixture",
+                "aWaKeNeD Case Fixture",
+                "SkillGem",
+            ),
+            (
+                "forbiddenjewel:unbreakable",
+                "Unbreakable",
+                "ForbiddenJewel",
+            ),
+        )
+        for key, name, category in fixtures:
+            self.add_current(key, name, [1.0], category=category)
+        self.add_current(
+            "uniquejewel:voices-1-passive",
+            "Voices",
+            [10.0],
+            category="UniqueJewel",
+            details={"detailsId": "voices-large-cluster-jewel"},
+        )
+        self.add_current(
+            "uniquejewel:voices-3-passives",
+            "Voices",
+            [2.0],
+            category="UniqueJewel",
+            details={
+                "variant": "3 passives",
+                "detailsId": "voices-3-passives-large-cluster-jewel",
+            },
+        )
+        self.add_current(
+            "uniquejewel:voices-3-passives-wrong-identity",
+            "Voices",
+            [3.0],
+            category="UniqueJewel",
+            details={
+                "variant": "3 passives",
+                "detailsId": "voices-5-passives-large-cluster-jewel",
+            },
+        )
+        self.add_current(
+            "uniquejewel:voices-5-passives",
+            "Voices",
+            [0.5],
+            category="UniqueJewel",
+            details={"variant": "5 passives"},
+        )
+        self.add_current(
+            "uniquejewel:voices-7-passives",
+            "Voices",
+            [0.1],
+            category="UniqueJewel",
+            details={"variant": "7 passives"},
+        )
+        self.add_current(
+            "uniquejewel:voices-unresolved",
+            "Voices",
+            [5.0],
+            category="UniqueJewel",
+        )
+
+        payload = RecommendationEngine(self.storage).generate(
+            self.live,
+            horizon=7,
+            persist=False,
+        )
+
+        ranked_names = {row["name"] for row in payload["rankings"]}
+        self.assertEqual(
+            ranked_names,
+            {
+                "Awakened Enlighten Support",
+                "aWaKeNeD Case Fixture",
+                "Unbreakable",
+                "Voices",
+                "Sublime Vision",
+                "The Adorned",
+                "Watcher's Eye",
+            },
+        )
+        self.assertEqual(
+            payload["investment_scope"]["excluded_category_counts"],
+            {
+                "SkillGem": 2,
+                "Unique Map": 1,
+                "UniqueAccessory": 1,
+                "UniqueJewel": 5,
+                "ValdoMap": 1,
+            },
+        )
+        self.assertIn(
+            "SkillGem (except names beginning with 'Awakened ')",
+            payload["investment_scope"]["excluded_categories"],
+        )
+        self.assertIn(
+            (
+                "Unique* (except 1-/3-passive Voices and the aggregate "
+                "Sublime Vision, The Adorned, and Watcher's Eye markets)"
+            ),
+            payload["investment_scope"]["excluded_categories"],
+        )
+        self.assertEqual(
+            self.storage.status_counts(self.live.id)["price_points"],
+            len(fixtures) + 6,
+        )
+        rows_by_key = {row["key"]: row for row in payload["rankings"]}
+        self.assertEqual(
+            {
+                key
+                for key in rows_by_key
+                if key.startswith("uniquejewel:voices-")
+            },
+            {
+                "uniquejewel:voices-1-passive",
+                "uniquejewel:voices-3-passives",
+            },
+        )
+        self.assertEqual(
+            rows_by_key["uniquejewel:voices-1-passive"]["trade_identity"][
+                "variant"
+            ],
+            "1 passive",
+        )
+        self.assertEqual(
+            rows_by_key["uniquejewel:voices-3-passives"][
+                "market_scope_code"
+            ],
+            "exact_voices_3_passives",
+        )
+        for name in ("Sublime Vision", "The Adorned", "Watcher's Eye"):
+            row = next(
+                candidate
+                for candidate in payload["rankings"]
+                if candidate["name"] == name
+            )
+            self.assertEqual(
+                row["market_scope_code"],
+                "aggregate_roll_unresolved",
+            )
+            self.assertIn(
+                "not the price of a specific roll",
+                row["market_scope_caveat"],
+            )
+
     def test_item_level_variants_have_distinct_full_identity(self) -> None:
         self.add_current(
             "basetype:abyssal-axe-86-hunter-variant-hunter",
@@ -759,10 +953,10 @@ class ForecastRankingTests(unittest.TestCase):
             },
         )
         self.add_current(
-            "uniqueweapon:agnerod-east-imperial-staff-6l-links-6",
-            "Agnerod East",
+            "basetype:imperial-staff-6l-links-6",
+            "Imperial Staff",
             [1.0],
-            category="UniqueWeapon",
+            category="BaseType",
             details={"baseType": "Imperial Staff", "links": 6},
         )
         self.add_current(
@@ -786,7 +980,7 @@ class ForecastRankingTests(unittest.TestCase):
             identities["+12% to Chaos Resistance"]["item_level"],
             84,
         )
-        self.assertEqual(identities["Agnerod East"]["links"], 6)
+        self.assertEqual(identities["Imperial Staff"]["links"], 6)
         self.assertEqual(
             identities["Ancient Wombgift"]["item_level"],
             84,

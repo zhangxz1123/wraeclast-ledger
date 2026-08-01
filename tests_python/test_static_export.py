@@ -19,6 +19,7 @@ from poe_advisor.static_export import (
     _assert_curve_provenance,
     _assert_export_provenance,
     _compact_forecast,
+    _compact_ranking_row,
     _compact_static_comparison,
     _rank_map_for_horizon,
     export_github_pages,
@@ -49,6 +50,23 @@ class StaticExportTests(unittest.TestCase):
         )
         self.assertEqual(compact["expected_price_divine"], 1.5)
         self.assertEqual(compact["historical_target_divine"], 4.0)
+
+    def test_compact_ranking_retains_unique_market_scope_warning(self) -> None:
+        compact = _compact_ranking_row(
+            {
+                "key": "uniquejewel:sublime-vision",
+                "name": "Sublime Vision",
+                "category": "UniqueJewel",
+                "market_scope_code": "aggregate_roll_unresolved",
+                "market_scope_label": "Aggregate market; rolls unresolved",
+                "market_scope_caveat": "Not a price for a specific roll.",
+            }
+        )
+        self.assertEqual(
+            compact["market_scope_code"],
+            "aggregate_roll_unresolved",
+        )
+        self.assertIn("specific roll", compact["market_scope_caveat"])
 
     def test_export_is_hashed_complete_and_excludes_database(self) -> None:
         output = self.root / "pages"
