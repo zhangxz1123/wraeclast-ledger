@@ -38,7 +38,12 @@ from .provenance import (
 )
 from .seasonality import SeasonalModel
 from .storage import Storage
-from .sync import STANDARD_ANCHOR_SOURCE, SyncAlreadyRunning, SyncService
+from .sync import (
+    CURRENT_HISTORY_MAX_ITEMS,
+    STANDARD_ANCHOR_SOURCE,
+    SyncAlreadyRunning,
+    SyncService,
+)
 
 
 MAX_REQUEST_BYTES = 64 * 1024
@@ -377,9 +382,10 @@ class AdvisorApplication:
         league: Any,
         item_key: str,
     ) -> dict[str, Any]:
-        # The comparison chart must use the same provider-grade floor as the
-        # forecast. poe.ninja's Low observations remain in SQLite for audit,
-        # but cannot enter the displayed weighted curve or a target price.
+        # The chart is an audit view of poe.ninja's exact daily archive, so it
+        # includes positive Low observations. Forecast targets are calculated
+        # from a separate model-grade curve; a display-only point must never
+        # become a target merely because it can be plotted.
         confidence_floor = HISTORICAL_MODEL_CONFIDENCE_FLOOR
         display_grade_floor = 0.5
         decay = SeasonalModel.RECENCY_DECAY_PER_LEAGUE
@@ -391,15 +397,28 @@ class AdvisorApplication:
             sources=None if league.is_demo else CURRENT_PRICE_SOURCES,
         )
         calendar = list(reversed(BROADLY_COVERED_LEAGUES))
-        historical_rows = self.storage.seasonal_price_curve_rows(
+        display_historical_rows = self.storage.seasonal_price_curve_rows(
+            item_key,
+            [spec.league_id for spec in calendar],
+            minimum_confidence=0.0,
+            sources=None if league.is_demo else HISTORICAL_PRICE_SOURCES,
+        )
+        forecast_historical_rows = self.storage.seasonal_price_curve_rows(
             item_key,
             [spec.league_id for spec in calendar],
             minimum_confidence=confidence_floor,
             sources=None if league.is_demo else HISTORICAL_PRICE_SOURCES,
         )
-        rows_by_league: dict[str, list[dict[str, Any]]] = {}
-        for row in historical_rows:
-            rows_by_league.setdefault(str(row["league_id"]), []).append(row)
+        display_rows_by_league: dict[str, list[dict[str, Any]]] = {}
+        for row in display_historical_rows:
+            display_rows_by_league.setdefault(
+                str(row["league_id"]), []
+            ).append(row)
+        forecast_rows_by_league: dict[str, list[dict[str, Any]]] = {}
+        for row in forecast_historical_rows:
+            forecast_rows_by_league.setdefault(
+                str(row["league_id"]), []
+            ).append(row)
 
         past_leagues: list[dict[str, Any]] = []
         weighted_by_day: dict[int, list[tuple[float, float]]] = {}
@@ -415,7 +434,7 @@ class AdvisorApplication:
                     "raw_weight": raw_weight,
                 }
             )
-            rows = rows_by_league.get(spec.league_id, [])
+            rows = display_rows_by_league.get(spec.league_id, [])
             if not rows:
                 continue
             points = []
@@ -432,6 +451,9 @@ class AdvisorApplication:
                         "observed_at": row["observed_at"],
                         "confidence": float(row["confidence"]),
                         "source": row["source"],
+                        "model_grade": (
+                            float(row["confidence"]) >= confidence_floor
+                        ),
                     }
                 )
             past_leagues.append(
@@ -462,6 +484,48 @@ class AdvisorApplication:
                 }
             )
 
+        forecast_weighted_by_day: dict[
+            int, list[tuple[float, float]]
+        ] = {}
+        for age_rank, spec in enumerate(calendar):
+            raw_weight = decay**age_rank
+            for row in forecast_rows_by_league.get(spec.league_id, []):
+                forecast_weighted_by_day.setdefault(
+                    int(row["league_day"]), []
+                ).append((float(row["divine_value"]), raw_weight))
+        forecast_weighted_points = []
+        for league_day, values_and_weights in sorted(
+            forecast_weighted_by_day.items()
+        ):
+            weight_total = sum(weight for _, weight in values_and_weights)
+            if weight_total <= 0:
+                continue
+            forecast_weighted_points.append(
+                {
+                    "league_day": league_day,
+                    "divine_value": sum(
+                        value * weight
+                        for value, weight in values_and_weights
+                    )
+                    / weight_total,
+                    "contributing_leagues": len(values_and_weights),
+                }
+            )
+
+        forecast_contributors_by_day = {
+            int(point["league_day"]): int(
+                point["contributing_leagues"]
+            )
+            for point in forecast_weighted_points
+        }
+        for point in weighted_points:
+            point["forecast_grade_contributing_leagues"] = (
+                forecast_contributors_by_day.get(
+                    int(point["league_day"]),
+                    0,
+                )
+            )
+
         current_points = [
             {
                 "league_day": int(row["league_day"]),
@@ -476,9 +540,9 @@ class AdvisorApplication:
             for row in current_rows
         ]
         current_day = max(1, int(league.day or 1))
-        weighted_price_by_day = {
+        forecast_weighted_price_by_day = {
             int(point["league_day"]): float(point["divine_value"])
-            for point in weighted_points
+            for point in forecast_weighted_points
         }
         current_price = (
             float(current_points[-1]["divine_value"])
@@ -487,7 +551,7 @@ class AdvisorApplication:
         )
         forecast_horizons: dict[str, dict[str, Any]] = {}
         for horizon in FORECAST_HORIZONS:
-            historical_target = weighted_price_by_day.get(
+            historical_target = forecast_weighted_price_by_day.get(
                 current_day + horizon
             )
             historical_gain = (
@@ -521,7 +585,7 @@ class AdvisorApplication:
             contributing = next(
                 (
                     int(point["contributing_leagues"])
-                    for point in weighted_points
+                    for point in forecast_weighted_points
                     if int(point["league_day"])
                     == current_day + horizon
                 ),
@@ -543,7 +607,7 @@ class AdvisorApplication:
                     for league in league_calendar
                     if any(
                         int(point["league_day"]) == current_day + horizon
-                        for point in rows_by_league.get(
+                        for point in forecast_rows_by_league.get(
                             str(league["league_id"]),
                             [],
                         )
@@ -554,7 +618,7 @@ class AdvisorApplication:
                     for league in league_calendar
                     if any(
                         int(point["league_day"]) == current_day + horizon
-                        for point in rows_by_league.get(
+                        for point in forecast_rows_by_league.get(
                             str(league["league_id"]),
                             [],
                         )
@@ -713,6 +777,9 @@ class AdvisorApplication:
             },
             "weighted_historical": {
                 "points": weighted_points,
+                "series_role": "display_only",
+                "confidence_floor": 0.0,
+                "forecast_targets_use_this_series": False,
             },
             "past_leagues": past_leagues,
             "forecast_horizons": forecast_horizons,
@@ -722,6 +789,12 @@ class AdvisorApplication:
                 "historical_confidence_floor": confidence_floor,
                 "confidence_floor": confidence_floor,
                 "display_grade_floor": display_grade_floor,
+                "historical_display_confidence_floor": 0.0,
+                "historical_forecast_confidence_floor": confidence_floor,
+                "weighted_historical_series_role": "display_only",
+                "forecast_target_series": (
+                    "separate_model_grade_weighted_historical"
+                ),
                 "recency_decay_per_league": decay,
                 "age_rank_basis": (
                     "Four broadly covered completed leagues only; Mirage has "
@@ -729,8 +802,14 @@ class AdvisorApplication:
                 ),
                 "historical_aggregation": (
                     "Per-day recency-weighted arithmetic mean, normalized over "
-                    "completed leagues with an exact poe.ninja Medium/High "
-                    "observation. Low observations remain audit-only."
+                    "completed leagues with any positive exact poe.ninja "
+                    "observation. This is the display curve and includes Low "
+                    "observations."
+                ),
+                "forecast_historical_aggregation": (
+                    "Forecast targets use a separate per-day recency-weighted "
+                    "mean containing only exact poe.ninja observations at or "
+                    "above the historical forecast confidence floor."
                 ),
                 "current_point_selection": (
                     "Newest positive-price observation within each league day; "
@@ -861,7 +940,7 @@ class AdvisorRequestHandler(BaseHTTPRequestHandler):
                                 or item.get("key")
                                 or ""
                             ).strip()
-                            for item in rankings[:100]
+                            for item in rankings
                             if isinstance(item, dict)
                             and (
                                 item.get("curve_key")
@@ -878,7 +957,7 @@ class AdvisorRequestHandler(BaseHTTPRequestHandler):
                                 current_history = current_history_sync(
                                     league,
                                     ranked_keys,
-                                    max_items=100,
+                                    max_items=CURRENT_HISTORY_MAX_ITEMS,
                                 )
                             except Exception as error:
                                 current_history = {

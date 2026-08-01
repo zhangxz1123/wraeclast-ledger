@@ -262,11 +262,10 @@ test("full item names wrap and include exact visible variant identity", () => {
       },
     }, 2);
     const base = normalizeRecommendation({
-      key: "basetype:abyssal-axe-86-hunter-variant-hunter",
-      name: "Abyssal Axe",
+      key: "basetype:simplex-amulet-86",
+      name: "Simplex Amulet",
       category: "BaseType",
       trade_identity: {
-        variant: "Hunter",
         item_level: 86,
       },
     }, 3);
@@ -317,7 +316,7 @@ test("full item names wrap and include exact visible variant identity", () => {
     result.flesh,
     "Forbidden Flesh (Instruments of Virtue)",
   );
-  assert.equal(result.base, "Abyssal Axe — Item level 86 · Hunter");
+  assert.equal(result.base, "Simplex Amulet — Item level 86");
   assert.equal(
     result.clusterLevel,
     "+12% to Chaos Resistance — Item level 84 · 2 passives",
@@ -336,6 +335,22 @@ test("full item names wrap and include exact visible variant identity", () => {
   assert.match(titleRule, /white-space:\s*normal/);
   assert.match(titleRule, /overflow-wrap:\s*anywhere/);
   assert.doesNotMatch(titleRule, /text-overflow:\s*ellipsis/);
+});
+
+test("historical chart points expose display and forecast-grade samples", () => {
+  const result = runInApp(`
+    const points = normalizeLeagueCurve([{
+      league_day: 1,
+      divine_value: 2.5,
+      contributing_leagues: 4,
+      forecast_grade_contributing_leagues: 2,
+    }]);
+    globalThis.__result = points[0];
+  `);
+
+  assert.equal(result.leagueDay, 1);
+  assert.equal(result.sampleLeagues, 4);
+  assert.equal(result.forecastGradeSampleLeagues, 2);
 });
 
 test("forbidden-jewel meta targets stay explicit beside raw history", () => {

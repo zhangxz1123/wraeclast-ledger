@@ -73,6 +73,37 @@ def fixture_zip(
     return output.getvalue()
 
 
+def redundant_base_type_fixture_zip() -> bytes:
+    currencies = [
+        "League;Date;Get;Pay;Value;Confidence",
+        f"{LEAGUE};2024-01-01;Divine Orb;Chaos Orb;100;0.99",
+    ]
+    items = [
+        "League;Date;Id;Type;Name;BaseType;Variant;Links;Value;Confidence",
+        (
+            f"{LEAGUE};2024-01-01;historical-card;DivinationCard;"
+            "The Doctor;The Doctor;;;100;0.9"
+        ),
+        (
+            f"{LEAGUE};2024-01-01;historical-base;BaseType;"
+            "Mismatched Base Item;Focused Amulet;;;200;0.9"
+        ),
+        (
+            f"{LEAGUE};2024-01-01;historical-self-base;BaseType;"
+            "Self-named Base Item;Self-named Base Item;;;250;0.9"
+        ),
+        (
+            f"{LEAGUE};2024-01-01;historical-tattoo;Tattoo;"
+            "Variant Tattoo;Variant Tattoo;Historical Variant;;300;0.9"
+        ),
+    ]
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(f"{LEAGUE}.currency.csv", "\n".join(currencies))
+        archive.writestr(f"{LEAGUE}.items.csv", "\n".join(items))
+    return output.getvalue()
+
+
 class FakeDumpClient:
     def __init__(self, raw: bytes):
         self.raw = raw
@@ -486,6 +517,107 @@ class PoeNinjaHistoryImporterTests(unittest.TestCase):
         self.assertEqual(
             compact_storage.seasonal_price_storage_counts(LEAGUE)["compact"],
             6,
+        )
+
+    def test_redundant_dump_base_type_maps_without_weakening_real_variants(
+        self,
+    ) -> None:
+        current_points = normalize_poe_ninja(
+            {
+                "lines": [
+                    {
+                        "id": "current-card",
+                        "detailsId": "the-doctor-current",
+                        "name": "The Doctor",
+                        "category": "DivinationCard",
+                        "chaosValue": 120,
+                        "divineValue": 1.2,
+                    },
+                    {
+                        "id": "current-base",
+                        "detailsId": "mismatched-base-current",
+                        "name": "Mismatched Base Item",
+                        "category": "BaseType",
+                        "baseType": "Simplex Amulet",
+                        "chaosValue": 220,
+                        "divineValue": 2.2,
+                    },
+                    {
+                        "id": "current-tattoo",
+                        "detailsId": "variant-tattoo-current",
+                        "name": "Variant Tattoo",
+                        "category": "Tattoo",
+                        "variant": "Current Variant",
+                        "chaosValue": 330,
+                        "divineValue": 3.3,
+                    },
+                    {
+                        "id": "current-self-base",
+                        "detailsId": "self-named-base-current",
+                        "name": "Self-named Base Item",
+                        "category": "BaseType",
+                        "baseType": "Different Base Type",
+                        "chaosValue": 250,
+                        "divineValue": 2.5,
+                    },
+                ]
+            },
+            league_id="Current",
+            category="DivinationCard",
+            observed_at="2026-07-31T02:00:00Z",
+            snapshot_id=3,
+        )
+        for point in current_points:
+            point.snapshot_id = None
+        self.storage.insert_price_points(current_points)
+        current_by_name = {point.name: point for point in current_points}
+        self.assertNotIn(
+            "baseType",
+            current_by_name["The Doctor"].details,
+        )
+
+        compact_storage = Storage(self.storage.path, compact_history=True)
+        importer = PoeNinjaHistoryImporter(
+            compact_storage,
+            FakeDumpClient(redundant_base_type_fixture_zip()),
+            temporary_directory=self.directory.name,
+        )
+
+        summary = importer.sync()
+
+        self.assertEqual(summary["status"], "success")
+        self.assertEqual(summary["item_rows_matched"], 1)
+        self.assertEqual(summary["unmatched_item_rows"], 3)
+        doctor_key = current_by_name["The Doctor"].item_key
+        doctor_curve = compact_storage.seasonal_price_curve_rows(
+            doctor_key,
+            [LEAGUE],
+            minimum_confidence=0.0,
+            sources=("poe.ninja-history",),
+        )
+        self.assertEqual(len(doctor_curve), 1)
+        self.assertEqual(doctor_curve[0]["source_item_id"], "historical-card")
+        with closing(compact_storage.connect()) as connection:
+            mismatches = connection.execute(
+                """
+                SELECT name, eligible, variant_json
+                FROM historical_assets
+                WHERE source = 'poe.ninja-history'
+                  AND name IN (
+                      'Mismatched Base Item',
+                      'Self-named Base Item',
+                      'Variant Tattoo'
+                  )
+                ORDER BY name
+                """
+            ).fetchall()
+        self.assertEqual(
+            [(row["name"], row["eligible"]) for row in mismatches],
+            [
+                ("Mismatched Base Item", 0),
+                ("Self-named Base Item", 0),
+                ("Variant Tattoo", 0),
+            ],
         )
 
 

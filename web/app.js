@@ -1005,7 +1005,7 @@ function renderRankingSummary() {
     ? ` ${compact(hiddenCount)} hidden on this device.`
     : "";
   els.modelNote.textContent = returned
-    ? `${showing}, sorted by gross ${horizon}-day expected gain.${hiddenNote} Forecasts use poe.ninja Medium/High observations from Mirage, Keepers, Mercenaries, and Settlers; Low observations remain in the local archive for audit only. Forecast curves use one exact point per UTC league day; optional GGG hourly audit rows never enter them. Unique items (except 1-/3-passive Voices and roll-unresolved Sublime Vision, The Adorned, and Watcher's Eye markets), Valdo maps, and non-Awakened gems are archived but omitted from this investment list.${excludedItems ? ` ${compact(excludedItems)} archived markets are omitted by category, the 1c floor, or the persistent-decline rule.` : ""}`
+    ? `${showing}, sorted by gross ${horizon}-day expected gain.${hiddenNote} Forecasts use poe.ninja Medium/High observations from Mirage, Keepers, Mercenaries, and Settlers; comparison charts also show exact Low-confidence rows as non-forecast context. Forecast curves use one exact point per UTC league day; optional GGG hourly audit rows never enter them. Base types other than Simplex Amulet and Focused Amulet, unique items (except 1-/3-passive Voices and roll-unresolved Sublime Vision, The Adorned, and Watcher's Eye markets), Valdo maps, and non-Awakened gems are archived but omitted from this investment list.${excludedItems ? ` ${compact(excludedItems)} archived markets are omitted by category, the 1c floor, or the persistent-decline rule.` : ""}`
     : `No item forecast is available yet. Build the broad-league archive, then sync again.`;
 }
 
@@ -1031,12 +1031,17 @@ function normalizeLeagueCurve(points) {
         point?.samples,
         point?.league_count,
       );
+      const forecastGradeSampleLeagues = nullableNumber(
+        point?.forecast_grade_contributing_leagues,
+        point?.forecastGradeContributingLeagues,
+      );
       const confidenceValue = nullableNumber(point?.confidence);
       const rawModelGrade = point?.model_grade ?? point?.modelGrade;
       return {
         leagueDay,
         divineValue,
         sampleLeagues,
+        forecastGradeSampleLeagues,
         confidence: confidenceValue,
         modelGrade: rawModelGrade == null ? true : rawModelGrade === true,
         observedAt: point?.observed_at || point?.observedAt || null,
@@ -1194,10 +1199,13 @@ function seasonalComparisonMarkup(rawComparison, itemName) {
       const sampleText = point.sampleLeagues == null
         ? ""
         : `, ${point.sampleLeagues} broad league${point.sampleLeagues === 1 ? "" : "s"}`;
+      const forecastGradeText = point.forecastGradeSampleLeagues == null
+        ? ""
+        : `, ${point.forecastGradeSampleLeagues} forecast-grade`;
       const confidenceText = point.confidence == null
         ? ""
         : `, source confidence ${(point.confidence * 100).toFixed(0)}%`;
-      const accessibleLabel = `${label}, league day ${point.leagueDay}, ${money(point.divineValue, 2)}${sampleText}${confidenceText}`;
+      const accessibleLabel = `${label}, league day ${point.leagueDay}, ${money(point.divineValue, 2)}${sampleText}${forecastGradeText}${confidenceText}`;
       return `
         <circle
           class="comparison-point ${kind}"
@@ -1277,7 +1285,7 @@ function seasonalComparisonMarkup(rawComparison, itemName) {
           <th scope="row">Day ${escapeHtml(day)}</th>
           <td>${current ? money(current.divineValue, 2) : "—"}</td>
           <td>${historical ? money(historical.divineValue, 2) : "—"}</td>
-          <td>${historical?.sampleLeagues == null ? "—" : historical.sampleLeagues}</td>
+          <td>${historical?.sampleLeagues == null ? "—" : `${historical.sampleLeagues}${historical.forecastGradeSampleLeagues == null ? "" : ` (${historical.forecastGradeSampleLeagues} forecast-grade)`}`}</td>
         </tr>`;
     })
     .join("");
@@ -1314,7 +1322,7 @@ function seasonalComparisonMarkup(rawComparison, itemName) {
       </div>
       <p class="comparison-method">${escapeHtml(openingGapExplanation)} ${escapeHtml(coverageExplanation)} ${escapeHtml(weightExplanation)} ${escapeHtml(
         `${sampleLabel}.`,
-      )} ${escapeHtml(windowExplanation)} Hover or focus a point for its exact value; the chart does not synthesize missing observations.</p>
+      )} All positive exact poe.ninja rows are plotted, including Low-confidence context; only Medium/High contributors can set a forecast target. ${escapeHtml(windowExplanation)} Hover or focus a point for its exact value; the chart does not synthesize missing observations.</p>
       <details class="comparison-data">
         <summary>Show exact plotted values</summary>
         <div>
@@ -1594,7 +1602,7 @@ function renderRecommendations() {
 function renderCategoryOptions() {
   const categories = [...new Set(state.recommendations.map((item) => item.category))].sort();
   const selected = state.category;
-  els.categoryFilter.innerHTML = '<option value="all">All markets</option>' +
+  els.categoryFilter.innerHTML = '<option value="all">All ranked markets</option>' +
     categories.map((category) => `<option value="${escapeHtml(category)}">${escapeHtml(category)}</option>`).join("");
   els.categoryFilter.value = categories.includes(selected) ? selected : "all";
 }
@@ -1714,8 +1722,9 @@ function openDetail(rank) {
     </div>
     <p class="detail-caveat forecast-method-note">
       Historical targets use only Mirage, Keepers, Mercenaries, and Settlers.
-      Only poe.ninja Medium/High observations enter forecasts and the weighted
-      curve; Low observations remain in the local archive for audit only.
+      Only poe.ninja Medium/High observations enter forecasts. The comparison
+      chart also plots exact Low-confidence rows as context, but they cannot set
+      a forecast target.
       For Forbidden Jewels, a displayed meta-adjusted target multiplies that
       raw curve target by the current-versus-past ascendancy-share signal; the
       chart itself always shows the unadjusted poe.ninja observations.

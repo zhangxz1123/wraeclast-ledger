@@ -23,6 +23,7 @@ from poe_advisor.server import (
     serve_in_thread,
 )
 from poe_advisor.storage import Storage
+from poe_advisor.sync import CURRENT_HISTORY_MAX_ITEMS
 
 
 class FakeSyncService:
@@ -30,6 +31,7 @@ class FakeSyncService:
         self.is_syncing = False
         self.backfills: list[int] = []
         self.current_history_requests: list[list[str]] = []
+        self.current_history_limits: list[int] = []
 
     def sync(self, *, backfill_hours: int = 0) -> dict[str, Any]:
         self.backfills.append(backfill_hours)
@@ -47,6 +49,7 @@ class FakeSyncService:
         max_items: int = 100,
     ) -> dict[str, Any]:
         del league
+        self.current_history_limits.append(max_items)
         selected = list(item_keys[:max_items])
         self.current_history_requests.append(selected)
         return {
@@ -261,6 +264,9 @@ class HTTPServerTests(unittest.TestCase):
 
         item_key = "currency:veiled-orb"
         storage = self.server.application.storage
+        current_league = storage.get_current_league()
+        assert current_league is not None
+        forecast_target_day = int(current_league.day or 1) + 3
         existing_history = storage.all_time_item_history(
             "demo-softcore-fixture",
             item_key,
@@ -301,7 +307,11 @@ class HTTPServerTests(unittest.TestCase):
         fixture_values = {
             "Mercenaries": {1: 10.0},
             "Keepers": {1: 20.0, 2: 25.0},
-            "Mirage": {1: 40.0, 2: 45.0},
+            "Mirage": {
+                1: 40.0,
+                2: 45.0,
+                forecast_target_day: 50.0,
+            },
         }
         for spec in COMPLETED_LEAGUES:
             for league_day, divine_value in fixture_values.get(
@@ -328,6 +338,18 @@ class HTTPServerTests(unittest.TestCase):
                 "league_day": 1,
                 "observed_at": "2024-07-26T20:00:00Z",
                 "divine_value": 1000.0,
+                "confidence": 0.49,
+            }
+        )
+        seasonal_rows.append(
+            {
+                "league_id": "Settlers",
+                "item_key": item_key,
+                "source": "poe.ninja-history",
+                "source_item_id": "veiled-orb-history",
+                "league_day": forecast_target_day,
+                "observed_at": "2024-07-26T20:00:00Z",
+                "divine_value": 2000.0,
                 "confidence": 0.49,
             }
         )
@@ -366,13 +388,14 @@ class HTTPServerTests(unittest.TestCase):
                 point["league_day"]
                 for point in comparison["weighted_historical"]["points"]
             ],
-            [1, 2],
+            [1, 2, forecast_target_day],
         )
         expected_day_one = (
             40.0
             + 20.0 * 0.72
             + 10.0 * 0.72**2
-        ) / (1.0 + 0.72 + 0.72**2)
+            + 1000.0 * 0.72**3
+        ) / (1.0 + 0.72 + 0.72**2 + 0.72**3)
         self.assertAlmostEqual(
             comparison["weighted_historical"]["points"][0]["divine_value"],
             expected_day_one,
@@ -381,14 +404,69 @@ class HTTPServerTests(unittest.TestCase):
             comparison["weighted_historical"]["points"][0][
                 "contributing_leagues"
             ],
+            4,
+        )
+        self.assertEqual(
+            comparison["weighted_historical"]["points"][0][
+                "forecast_grade_contributing_leagues"
+            ],
             3,
+        )
+        display_target = next(
+            point
+            for point in comparison["weighted_historical"]["points"]
+            if point["league_day"] == forecast_target_day
+        )
+        self.assertEqual(display_target["contributing_leagues"], 2)
+        self.assertEqual(
+            display_target["forecast_grade_contributing_leagues"],
+            1,
+        )
+        self.assertAlmostEqual(
+            display_target["divine_value"],
+            (50.0 + 2000.0 * 0.72**3) / (1.0 + 0.72**3),
+        )
+        three_day_forecast = comparison["forecast_horizons"]["3"]
+        self.assertEqual(
+            three_day_forecast["historical_target_price_divine"],
+            50.0,
+        )
+        self.assertEqual(three_day_forecast["historical_sample_leagues"], 1)
+        self.assertEqual(three_day_forecast["sample_leagues"], ["Mirage"])
+        self.assertEqual(
+            comparison["weighted_historical"]["series_role"],
+            "display_only",
+        )
+        self.assertEqual(
+            comparison["weighted_historical"]["confidence_floor"],
+            0.0,
+        )
+        self.assertFalse(
+            comparison["weighted_historical"][
+                "forecast_targets_use_this_series"
+            ]
         )
         self.assertEqual(
             [
                 curve["league_id"]
                 for curve in comparison["past_leagues"]
             ],
-            ["Mirage", "Keepers", "Mercenaries"],
+            ["Mirage", "Keepers", "Mercenaries", "Settlers"],
+        )
+        settlers_curve = next(
+            curve
+            for curve in comparison["past_leagues"]
+            if curve["league_id"] == "Settlers"
+        )
+        self.assertEqual(
+            [point["league_day"] for point in settlers_curve["points"]],
+            [1, forecast_target_day],
+        )
+        self.assertTrue(
+            all(
+                point["model_grade"] is False
+                for point in settlers_curve["points"]
+            )
         )
         self.assertEqual(
             comparison["calculation"]["recency_decay_per_league"],
@@ -405,6 +483,26 @@ class HTTPServerTests(unittest.TestCase):
         self.assertEqual(
             comparison["calculation"]["historical_confidence_floor"],
             0.5,
+        )
+        self.assertEqual(
+            comparison["calculation"][
+                "historical_display_confidence_floor"
+            ],
+            0.0,
+        )
+        self.assertEqual(
+            comparison["calculation"][
+                "historical_forecast_confidence_floor"
+            ],
+            0.5,
+        )
+        self.assertEqual(
+            comparison["calculation"]["weighted_historical_series_role"],
+            "display_only",
+        )
+        self.assertEqual(
+            comparison["calculation"]["forecast_target_series"],
+            "separate_model_grade_weighted_historical",
         )
         self.assertEqual(
             comparison["calculation"]["display_grade_floor"],
@@ -445,7 +543,11 @@ class HTTPServerTests(unittest.TestCase):
         )
         self.assertLessEqual(
             payload["current_history_sync"]["requested_items"],
-            100,
+            CURRENT_HISTORY_MAX_ITEMS,
+        )
+        self.assertEqual(
+            self.fake_sync.current_history_limits[-1],
+            CURRENT_HISTORY_MAX_ITEMS,
         )
         self.assertEqual(
             len(self.fake_sync.current_history_requests[-1]),

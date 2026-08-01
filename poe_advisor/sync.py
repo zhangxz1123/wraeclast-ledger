@@ -100,7 +100,8 @@ CURRENT_HISTORY_ITEM_CATEGORY = "current-item-history"
 CURRENT_HISTORY_DIVINE_CATEGORY = "current-divine-history"
 CURRENT_HISTORY_CATALOG_CATEGORY = "current-history-catalog"
 CURRENT_HISTORY_MAX_ITEMS = 2_000
-CURRENT_HISTORY_REQUEST_PAUSE_SECONDS = 0.03
+CURRENT_HISTORY_REQUEST_PAUSE_SECONDS = 0.10
+CURRENT_HISTORY_RECHECK_DAYS = 7
 
 
 def _positive_float(value: Any) -> float | None:
@@ -373,25 +374,37 @@ class SyncService:
     ) -> dict[str, Any]:
         """Backfill authoritative dated curves from poe.ninja detail APIs."""
 
-        requested_keys = list(
+        all_requested_keys = list(
             dict.fromkeys(
                 str(item_key).strip()
                 for item_key in item_keys
                 if str(item_key).strip()
             )
-        )[: max(1, min(int(max_items), CURRENT_HISTORY_MAX_ITEMS))]
+        )
+        request_limit = max(
+            1,
+            min(int(max_items), CURRENT_HISTORY_MAX_ITEMS),
+        )
+        requested_keys = all_requested_keys[:request_limit]
         summary: dict[str, Any] = {
             "status": "running",
             "source": PoeNinjaClient.SOURCE,
             "price_source": PoeNinjaClient.SOURCE,
             "state_source": POE_NINJA_CURRENT_HISTORY_STATE_SOURCE,
             "requested_items": len(requested_keys),
+            "input_items": len(all_requested_keys),
+            "omitted_items": max(
+                0,
+                len(all_requested_keys) - len(requested_keys),
+            ),
             "matched_items": 0,
             "unmatched_items": 0,
             "ambiguous_items": 0,
+            "derived_exchange_identity_items": 0,
             "unmatched": [],
             "fetched_items": 0,
             "cached_items": 0,
+            "already_backfilled_items": 0,
             "failed_items": 0,
             "rows_written": 0,
             "snapshots_written": 0,
@@ -427,6 +440,13 @@ class SyncService:
                 )
                 return summary
 
+            if summary["omitted_items"]:
+                self._current_history_warning(
+                    summary,
+                    f"{summary['omitted_items']} ranked keys exceeded the "
+                    f"{request_limit}-item current-history request limit.",
+                )
+
             exchange_types = {
                 str(category).casefold()
                 for category in self.storage.get_setting(
@@ -460,6 +480,21 @@ class SyncService:
                     if history_kind == "exchange"
                     else details.get("poe_ninja_id")
                 )
+                identity_source = "poe.ninja overview identity"
+                if (
+                    history_kind == "exchange"
+                    and source_item_id in (None, "")
+                    and ":" in item_key
+                ):
+                    # Exchange item keys are built from poe.ninja's detailsId.
+                    # Older retained overview rows did not always preserve the
+                    # field in details_json, but the canonical suffix remains
+                    # the exact endpoint identity and can recover its dated
+                    # curve without a fuzzy name match.
+                    source_item_id = item_key.split(":", 1)[1].strip()
+                    identity_source = "canonical poe.ninja item-key suffix"
+                    if source_item_id:
+                        summary["derived_exchange_identity_items"] += 1
                 if latest is None or source_item_id in (None, "") or not category:
                     summary["unmatched_items"] += 1
                     if len(summary["unmatched"]) < 20:
@@ -477,6 +512,7 @@ class SyncService:
                         "category": category,
                         "source_item_id": str(source_item_id),
                         "history_kind": history_kind,
+                        "identity_source": identity_source,
                     }
                 )
             summary["matched_items"] = len(selected)
@@ -493,6 +529,100 @@ class SyncService:
                         "No ranked item had an exact poe.ninja detail-history "
                         "identity; no histories were attached."
                     ),
+                )
+                return summary
+
+            current_day = max(1, int(league.day or 1))
+            minimum_recent_check_day = max(
+                1,
+                current_day - CURRENT_HISTORY_RECHECK_DAYS + 1,
+            )
+            pending: list[dict[str, Any]] = []
+            for asset in selected:
+                item_key = str(asset["item_key"])
+                archived = self.storage.current_item_history_archive(
+                    league.id,
+                    item_key,
+                    provider=PoeNinjaClient.SOURCE,
+                )
+                exact_durable_coverage = bool(
+                    archived
+                    and archived.get("durable") is True
+                    and str(archived.get("source_item_id") or "")
+                    == str(asset["source_item_id"])
+                    and str(archived.get("category") or "").casefold()
+                    == str(asset["category"]).casefold()
+                    and str(archived.get("history_kind") or "")
+                    == str(asset["history_kind"])
+                    and archived.get("normalized_price_days_complete") is True
+                    and int(archived.get("checked_through_day") or 0)
+                    >= minimum_recent_check_day
+                )
+                if not exact_durable_coverage:
+                    pending.append(asset)
+                    continue
+                assert archived is not None
+                observed_days = list(
+                    archived.get("provider_observed_days") or []
+                )
+                summary["coverage"][item_key] = {
+                    "source": PoeNinjaClient.SOURCE,
+                    "source_item_id": str(asset["source_item_id"]),
+                    "identity_source": str(
+                        archived.get("identity_source")
+                        or asset["identity_source"]
+                    ),
+                    "first_observed_day": archived.get(
+                        "provider_first_observed_day"
+                    ),
+                    "last_observed_day": archived.get(
+                        "provider_last_observed_day"
+                    ),
+                    "observed_days": observed_days,
+                    "missing_days": list(
+                        archived.get("provider_missing_days") or []
+                    ),
+                    "normalized_days": list(
+                        archived.get("normalized_days") or []
+                    ),
+                    "checked_through_day": int(
+                        archived.get("checked_through_day") or 0
+                    ),
+                    "normalized_price_days_complete": True,
+                    "missing_divine_anchor_days": list(
+                        archived.get("missing_divine_anchor_days") or []
+                    ),
+                    "interpolation": str(
+                        archived.get("interpolation") or "none"
+                    ),
+                    "already_backfilled": True,
+                }
+                summary["cached_items"] += 1
+                summary["already_backfilled_items"] += 1
+
+            selected = pending
+            if not selected:
+                summary["status"] = (
+                    "partial"
+                    if summary["unmatched_items"] or summary["omitted_items"]
+                    else "success"
+                )
+                summary["message"] = (
+                    "All exact current-item histories were already present in "
+                    "the durable poe.ninja coverage archive."
+                )
+                self.storage.update_source_state(
+                    source=POE_NINJA_CURRENT_HISTORY_STATE_SOURCE,
+                    endpoint=f"{league.id}:ranked-current-history",
+                    league_id=league.id,
+                    category="ranked-current-history",
+                    status=summary["status"],
+                    detail=(
+                        f"{summary['matched_items']} exact ranked identities; "
+                        f"{summary['already_backfilled_items']} already "
+                        "backfilled; no detail requests needed."
+                    ),
+                    success=True,
                 )
                 return summary
 
@@ -552,8 +682,6 @@ class SyncService:
                 for point in divine_points
                 if int(point["league_day"]) in divine_quality.prices
             }
-            current_day = max(1, int(league.day or 1))
-
             for asset in selected:
                 item_key = str(asset["item_key"])
                 source_item_id = str(asset["source_item_id"])
@@ -611,6 +739,7 @@ class SyncService:
                         "provider_missing_days": missing_provider_days,
                         "normalized_days": normalized_days,
                         "missing_divine_anchor_days": missing_divine_days,
+                        "checked_through_day": current_day,
                         "interpolation": "none",
                     }
                     snapshot_id = self._store_poe_ninja_current_history_record(
@@ -673,9 +802,21 @@ class SyncService:
                     summary["rows_written"] += (
                         self.storage.insert_price_points(points) if points else 0
                     )
+                    self.storage.upsert_current_item_history_coverage(
+                        league_id=league.id,
+                        item_key=item_key,
+                        provider=PoeNinjaClient.SOURCE,
+                        source_item_id=source_item_id,
+                        category=str(asset["category"]),
+                        history_kind=str(asset["history_kind"]),
+                        endpoint=str(record["endpoint"]),
+                        fetched_at=str(record["fetched_at"]),
+                        metadata=metadata,
+                    )
                     summary["coverage"][item_key] = {
                         "source": PoeNinjaClient.SOURCE,
                         "source_item_id": source_item_id,
+                        "identity_source": asset["identity_source"],
                         "first_observed_day": (
                             min(provider_days) if provider_days else None
                         ),
@@ -686,6 +827,10 @@ class SyncService:
                         "missing_days": missing_provider_days,
                         "normalized_days": normalized_days,
                         "missing_divine_anchor_days": missing_divine_days,
+                        "checked_through_day": current_day,
+                        "normalized_price_days_complete": bool(
+                            normalized_days
+                        ),
                         "interpolation": "none",
                     }
                     summary[
@@ -708,6 +853,7 @@ class SyncService:
                 "partial"
                 if summary["failed_items"]
                 or summary["unmatched_items"]
+                or summary["omitted_items"]
                 or divine_quality.partial
                 else "success"
             )
@@ -1031,6 +1177,7 @@ class SyncService:
                         "name": str(asset["name"]),
                         "category": str(asset["category"]),
                         "source_item_id": source_item_id,
+                        "identity_source": asset["identity_source"],
                         "divine_source_item_id": str(
                             divine_asset["source_item_id"]
                         ),

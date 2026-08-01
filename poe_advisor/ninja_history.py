@@ -24,7 +24,7 @@ from .normalization import canonical_key, slugify
 from .provenance import POE_NINJA_CURRENT_SOURCE, POE_NINJA_HISTORY_SOURCE
 
 
-DUMP_IMPORT_VERSION = 3
+DUMP_IMPORT_VERSION = 4
 DUMP_SETTING_PREFIX = "poe_ninja_dump:"
 CHAOS_ORB_NAME = "Chaos Orb"
 DIVINE_ORB_NAME = "Divine Orb"
@@ -1659,6 +1659,20 @@ def _identity_matches(
     ):
         historical = _identity_text(dump_row.get(dump_key))
         present = _identity_text(details.get(current_key))
+        # Several completed-league categories (notably divination cards and
+        # tattoos) repeat the display name in BaseType even though the current
+        # poe.ninja row has no baseType field.  That value carries no identity
+        # information, so it must not prevent the strict visible-identity
+        # fallback used when dump IDs have changed between leagues.  Real base
+        # types, variants, and link counts remain exact discriminators.
+        if (
+            strict_visible
+            and dump_key == "BaseType"
+            and historical
+            and not present
+            and historical == _identity_text(dump_row.get("Name"))
+        ):
+            continue
         if strict_visible and historical and not present:
             return False
         if historical and present and historical != present:

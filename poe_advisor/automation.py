@@ -12,7 +12,7 @@ def run_daily_update(
     web_dir: str | Path,
     history_hours: int = 0,
     seasonal_items: int = 20,
-    current_history_items: int = 100,
+    current_history_items: int = 2_000,
 ) -> dict[str, Any]:
     """Run the same durable refresh stages used by the interactive dashboard."""
 
@@ -77,7 +77,7 @@ def run_daily_update(
         rankings = preliminary.get("recommendations", [])
     ranked_keys = [
         str(item.get("curve_key") or item.get("key") or "").strip()
-        for item in rankings[: int(current_history_items)]
+        for item in rankings
         if isinstance(item, dict)
         and (item.get("curve_key") or item.get("key"))
     ]

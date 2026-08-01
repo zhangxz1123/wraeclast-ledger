@@ -7,6 +7,7 @@ import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
+from datetime import timedelta
 from pathlib import Path
 
 from poe_advisor.archive import (
@@ -14,6 +15,7 @@ from poe_advisor.archive import (
     create_public_market_snapshot,
 )
 from poe_advisor.demo import seed_demo
+from poe_advisor.models import PricePoint, parse_datetime
 from poe_advisor.storage import Storage
 
 
@@ -45,6 +47,44 @@ class PublicArchiveTests(unittest.TestCase):
         )
         self.assertTrue(created)
         self._add_public_and_private_state()
+        self.coverage_item_key = "skillgem:awakened-enlighten-support"
+        league_start = parse_datetime(self.league.start_at)
+        assert league_start is not None
+        self.storage.insert_price_points(
+            [
+                PricePoint(
+                    league_id=self.league.id,
+                    item_key=self.coverage_item_key,
+                    name="Awakened Enlighten Support",
+                    category="SkillGem",
+                    source="poe.ninja",
+                    observed_at=(
+                        league_start + timedelta(days=day - 1)
+                    ).isoformat().replace("+00:00", "Z"),
+                    chaos_value=3_000.0 + day,
+                    divine_value=30.0 + day,
+                    confidence=0.9,
+                )
+                for day in (2, 3)
+            ]
+        )
+        self.storage.upsert_current_item_history_coverage(
+            league_id=self.league.id,
+            item_key=self.coverage_item_key,
+            provider="poe.ninja",
+            source_item_id="95714",
+            category="SkillGem",
+            history_kind="stash-item",
+            endpoint="https://poe.ninja/fixture/history/95714",
+            fetched_at="2026-07-31T12:00:00Z",
+            metadata={
+                "provider_observed_days": [2, 3],
+                "provider_missing_days": [1],
+                "normalized_days": [2, 3],
+                "missing_divine_anchor_days": [],
+                "interpolation": "none",
+            },
+        )
 
     def _add_public_and_private_state(self) -> None:
         with closing(sqlite3.connect(self.database)) as connection:
@@ -243,6 +283,7 @@ class PublicArchiveTests(unittest.TestCase):
                     "historical_assets",
                     "historical_fetch_state",
                     "seasonal_prices",
+                    "current_item_history_coverage",
                     "meta_class_snapshots",
                     "recommendation_runs",
                 )
@@ -300,6 +341,7 @@ class PublicArchiveTests(unittest.TestCase):
                 ).fetchone()[0],
                 0,
             )
+
             self.assertEqual(
                 archive.execute(
                     """
@@ -351,6 +393,27 @@ class PublicArchiveTests(unittest.TestCase):
                 ["ggg_currency_cursor:Currency", "poe_ninja_dump:Mirage"],
             )
 
+        restored_storage = Storage(restored)
+        restored_coverage = restored_storage.current_item_history_archive(
+            self.league.id,
+            self.coverage_item_key,
+            provider="poe.ninja",
+        )
+        assert restored_coverage is not None
+        self.assertTrue(restored_coverage["normalized_price_days_complete"])
+        self.assertEqual(restored_coverage["normalized_days"], [2, 3])
+        restored_curve = restored_storage.daily_item_history(
+            self.league.id,
+            self.coverage_item_key,
+            self.league.start_at,
+            minimum_confidence=0.0,
+            sources=("poe.ninja",),
+        )
+        self.assertEqual(
+            [int(point["league_day"]) for point in restored_curve],
+            [2, 3],
+        )
+
         # VACUUM must physically remove the exact compressed private blob,
         # not merely make it unreachable in SQLite's b-tree.
         private_blob = gzip.compress(
@@ -362,6 +425,15 @@ class PublicArchiveTests(unittest.TestCase):
 
         # The resulting schema remains writable by the next daily update.
         updater_storage = Storage(restored)
+        coverage = updater_storage.current_item_history_archive(
+            self.league.id,
+            self.coverage_item_key,
+            provider="poe.ninja",
+        )
+        assert coverage is not None
+        self.assertTrue(coverage["durable"])
+        self.assertEqual(coverage["provider_observed_days"], [2, 3])
+        self.assertEqual(coverage["provider_missing_days"], [1])
         _, created = updater_storage.add_snapshot(
             source="fixture-next-update",
             endpoint="https://example.invalid/current",

@@ -65,6 +65,38 @@ CREATE TABLE IF NOT EXISTS raw_snapshots (
 CREATE UNIQUE INDEX IF NOT EXISTS uq_raw_snapshot
 ON raw_snapshots(source, endpoint, COALESCE(league_id, ''), sha256);
 
+-- Durable, exact coverage for the one-time poe.ninja current-league history
+-- backfill.  Raw responses are intentionally removed from public archives;
+-- this compact normalized record survives that sanitization and prevents the
+-- daily updater from downloading every item curve again.
+CREATE TABLE IF NOT EXISTS current_item_history_coverage (
+    league_id TEXT NOT NULL,
+    item_key TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    source_item_id TEXT NOT NULL,
+    category TEXT NOT NULL,
+    history_kind TEXT NOT NULL,
+    endpoint TEXT NOT NULL,
+    fetched_at TEXT NOT NULL,
+    first_observed_day INTEGER,
+    last_observed_day INTEGER,
+    observed_days_json TEXT NOT NULL DEFAULT '[]',
+    missing_days_json TEXT NOT NULL DEFAULT '[]',
+    normalized_days_json TEXT NOT NULL DEFAULT '[]',
+    missing_divine_anchor_days_json TEXT NOT NULL DEFAULT '[]',
+    interpolation TEXT NOT NULL DEFAULT 'none',
+    identity_source TEXT NOT NULL DEFAULT '',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(league_id, item_key, provider),
+    FOREIGN KEY (league_id) REFERENCES leagues(id)
+);
+
+CREATE INDEX IF NOT EXISTS ix_current_history_exact_identity
+ON current_item_history_coverage(
+    league_id, provider, category, source_item_id, history_kind
+);
+
 CREATE TABLE IF NOT EXISTS price_points (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     league_id TEXT NOT NULL,
@@ -311,7 +343,7 @@ CREATE TABLE IF NOT EXISTS meta_class_snapshots (
 CREATE INDEX IF NOT EXISTS ix_meta_class_latest
 ON meta_class_snapshots(league_id, source, observed_at DESC);
 
-PRAGMA user_version = 4;
+PRAGMA user_version = 5;
 """
 
 
@@ -1161,27 +1193,138 @@ class Storage:
         self,
         league_id: str,
         item_key: str,
+        *,
+        provider: str | None = None,
     ) -> dict[str, Any] | None:
         """Return coverage metadata from the newest exact history response.
 
-        Raw history responses are stored independently of normalized price
-        rows, including valid empty responses. Reading their metadata lets the
-        chart distinguish "the provider had no day-1 observation" from "this
-        item has not been backfilled yet."
+        Durable normalized coverage is authoritative because public archives
+        deliberately discard raw source payloads.  The raw-snapshot scan is a
+        migration fallback for databases created before schema version 5.
         """
 
+        with closing(self.connect()) as connection:
+            parameters: list[Any] = [str(league_id), str(item_key)]
+            provider_clause = ""
+            if provider is not None:
+                provider_clause = "AND provider = ?"
+                parameters.append(str(provider))
+            row = connection.execute(
+                f"""
+                SELECT league_id, item_key, provider, source_item_id,
+                       category, history_kind, endpoint, fetched_at,
+                       first_observed_day, last_observed_day,
+                       observed_days_json, missing_days_json,
+                       normalized_days_json,
+                       missing_divine_anchor_days_json, interpolation,
+                       identity_source, metadata_json, updated_at
+                FROM current_item_history_coverage
+                WHERE league_id = ? AND item_key = ?
+                  {provider_clause}
+                ORDER BY CASE WHEN provider = 'poe.ninja' THEN 0 ELSE 1 END,
+                         fetched_at DESC, provider
+                LIMIT 1
+                """,
+                parameters,
+            ).fetchone()
+        if row is not None:
+            try:
+                metadata = json.loads(row["metadata_json"])
+            except (TypeError, json.JSONDecodeError):
+                metadata = {}
+
+            def decode_days(column: str) -> list[int]:
+                try:
+                    values = json.loads(row[column])
+                except (TypeError, json.JSONDecodeError):
+                    return []
+                if not isinstance(values, list):
+                    return []
+                return sorted(
+                    {
+                        int(value)
+                        for value in values
+                        if isinstance(value, (int, float))
+                        and not isinstance(value, bool)
+                        and math.isfinite(float(value))
+                        and int(value) > 0
+                    }
+                )
+
+            observed_days = decode_days("observed_days_json")
+            normalized_days = decode_days("normalized_days_json")
+            with closing(self.connect()) as connection:
+                present_rows = connection.execute(
+                    """
+                    SELECT DISTINCT CAST(
+                               julianday(date(price.observed_at))
+                               - julianday(date(league.start_at))
+                           AS INTEGER) + 1 AS league_day
+                    FROM price_points AS price
+                    JOIN leagues AS league ON league.id = price.league_id
+                    WHERE price.league_id = ?
+                      AND price.item_key = ?
+                      AND price.source = ?
+                      AND price.divine_value > 0
+                      AND league.start_at IS NOT NULL
+                    """,
+                    (row["league_id"], row["item_key"], row["provider"]),
+                ).fetchall()
+            normalized_price_days = sorted(
+                {
+                    int(value["league_day"])
+                    for value in present_rows
+                    if value["league_day"] is not None
+                    and int(value["league_day"]) > 0
+                }
+            )
+            missing_normalized_price_days = sorted(
+                set(normalized_days).difference(normalized_price_days)
+            )
+            return {
+                **(metadata if isinstance(metadata, dict) else {}),
+                "snapshot_id": None,
+                "durable": True,
+                "league_id": row["league_id"],
+                "item_key": row["item_key"],
+                "provider": row["provider"],
+                "source_item_id": row["source_item_id"],
+                "category": row["category"],
+                "history_kind": row["history_kind"],
+                "endpoint": row["endpoint"],
+                "fetched_at": row["fetched_at"],
+                "provider_observed_days": observed_days,
+                "provider_first_observed_day": row["first_observed_day"],
+                "provider_last_observed_day": row["last_observed_day"],
+                "provider_missing_days": decode_days("missing_days_json"),
+                "normalized_days": normalized_days,
+                "normalized_price_days": normalized_price_days,
+                "missing_normalized_price_days": (
+                    missing_normalized_price_days
+                ),
+                "normalized_price_days_complete": bool(normalized_days)
+                and not missing_normalized_price_days,
+                "missing_divine_anchor_days": decode_days(
+                    "missing_divine_anchor_days_json"
+                ),
+                "interpolation": row["interpolation"],
+                "identity_source": row["identity_source"],
+                "updated_at": row["updated_at"],
+            }
+
+        raw_provider = str(provider or "poe.ninja")
         with closing(self.connect()) as connection:
             rows = connection.execute(
                 """
                 SELECT id, fetched_at, endpoint, metadata_json
                 FROM raw_snapshots
-                WHERE source = 'poe.ninja'
+                WHERE source = ?
                   AND league_id = ?
                   AND category = 'current-item-history'
                 ORDER BY fetched_at DESC, id DESC
                 LIMIT 5000
                 """,
-                (league_id,),
+                (raw_provider, league_id),
             ).fetchall()
         for row in rows:
             try:
@@ -1192,11 +1335,131 @@ class Storage:
                 continue
             return {
                 "snapshot_id": int(row["id"]),
+                "durable": False,
                 "fetched_at": row["fetched_at"],
                 "endpoint": row["endpoint"],
                 **metadata,
             }
         return None
+
+    def upsert_current_item_history_coverage(
+        self,
+        *,
+        league_id: str,
+        item_key: str,
+        provider: str,
+        source_item_id: str,
+        category: str,
+        history_kind: str,
+        endpoint: str,
+        fetched_at: str,
+        metadata: dict[str, Any],
+    ) -> None:
+        """Persist exact current-history coverage independently of raw data."""
+
+        identity = {
+            "league_id": str(league_id).strip(),
+            "item_key": str(item_key).strip(),
+            "provider": str(provider).strip(),
+            "source_item_id": str(source_item_id).strip(),
+            "category": str(category).strip(),
+            "history_kind": str(history_kind).strip(),
+            "endpoint": str(endpoint).strip(),
+            "fetched_at": str(fetched_at).strip(),
+        }
+        missing = [key for key, value in identity.items() if not value]
+        if missing:
+            raise ValueError(
+                "Current-history coverage requires: " + ", ".join(missing)
+            )
+
+        def normalize_days(value: Any) -> list[int]:
+            if not isinstance(value, (list, tuple, set)):
+                return []
+            return sorted(
+                {
+                    int(day)
+                    for day in value
+                    if isinstance(day, (int, float))
+                    and not isinstance(day, bool)
+                    and math.isfinite(float(day))
+                    and int(day) > 0
+                }
+            )
+
+        observed_days = normalize_days(metadata.get("provider_observed_days"))
+        missing_days = normalize_days(metadata.get("provider_missing_days"))
+        normalized_days = normalize_days(metadata.get("normalized_days"))
+        missing_divine_days = normalize_days(
+            metadata.get("missing_divine_anchor_days")
+        )
+        first_observed_day = min(observed_days) if observed_days else None
+        last_observed_day = max(observed_days) if observed_days else None
+        interpolation = str(metadata.get("interpolation") or "none")
+        identity_source = str(metadata.get("identity_source") or "")
+        durable_metadata = {
+            **metadata,
+            "kind": "current-item-history",
+            **identity,
+            "provider_observed_days": observed_days,
+            "provider_first_observed_day": first_observed_day,
+            "provider_last_observed_day": last_observed_day,
+            "provider_missing_days": missing_days,
+            "normalized_days": normalized_days,
+            "missing_divine_anchor_days": missing_divine_days,
+            "interpolation": interpolation,
+            "identity_source": identity_source,
+        }
+        now = iso_utc()
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO current_item_history_coverage(
+                    league_id, item_key, provider, source_item_id, category,
+                    history_kind, endpoint, fetched_at, first_observed_day,
+                    last_observed_day, observed_days_json, missing_days_json,
+                    normalized_days_json, missing_divine_anchor_days_json,
+                    interpolation, identity_source, metadata_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(league_id, item_key, provider) DO UPDATE SET
+                    source_item_id = excluded.source_item_id,
+                    category = excluded.category,
+                    history_kind = excluded.history_kind,
+                    endpoint = excluded.endpoint,
+                    fetched_at = excluded.fetched_at,
+                    first_observed_day = excluded.first_observed_day,
+                    last_observed_day = excluded.last_observed_day,
+                    observed_days_json = excluded.observed_days_json,
+                    missing_days_json = excluded.missing_days_json,
+                    normalized_days_json = excluded.normalized_days_json,
+                    missing_divine_anchor_days_json =
+                        excluded.missing_divine_anchor_days_json,
+                    interpolation = excluded.interpolation,
+                    identity_source = excluded.identity_source,
+                    metadata_json = excluded.metadata_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    identity["league_id"],
+                    identity["item_key"],
+                    identity["provider"],
+                    identity["source_item_id"],
+                    identity["category"],
+                    identity["history_kind"],
+                    identity["endpoint"],
+                    identity["fetched_at"],
+                    first_observed_day,
+                    last_observed_day,
+                    json.dumps(observed_days, separators=(",", ":")),
+                    json.dumps(missing_days, separators=(",", ":")),
+                    json.dumps(normalized_days, separators=(",", ":")),
+                    json.dumps(missing_divine_days, separators=(",", ":")),
+                    interpolation,
+                    identity_source,
+                    json.dumps(durable_metadata, separators=(",", ":")),
+                    now,
+                ),
+            )
 
     def item_metadata(
         self,

@@ -90,8 +90,11 @@ def build_parser() -> argparse.ArgumentParser:
     daily_update.add_argument(
         "--current-history-items",
         type=int,
-        default=100,
-        help="Top current-league curves to refresh (0-2000; default: 100).",
+        default=2000,
+        help=(
+            "Ranked current-league curves to refresh "
+            "(0-2000; default: all currently ranked markets, up to 2000)."
+        ),
     )
 
     recommend = subparsers.add_parser(

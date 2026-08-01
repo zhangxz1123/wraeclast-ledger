@@ -708,6 +708,7 @@ class SyncServiceTests(unittest.TestCase):
             item_key,
         )
         assert archived is not None
+        self.assertTrue(archived["durable"])
         self.assertEqual(archived["provider_first_observed_day"], 2)
         self.assertEqual(archived["normalized_days"], list(range(2, 9)))
         self.assertEqual(archived["interpolation"], "none")
@@ -744,6 +745,36 @@ class SyncServiceTests(unittest.TestCase):
         self.assertEqual(history_state["status"], "partial")
 
         calls_after_first = len(service.poe_ninja.history_calls)
+        # Public archives remove every raw response. Durable exact coverage
+        # must still make the full-universe backfill one-time and avoid even a
+        # Divine-history request on the next daily update.
+        with self.storage.transaction() as connection:
+            connection.execute(
+                """
+                UPDATE price_points
+                SET snapshot_id = NULL
+                WHERE snapshot_id IN (
+                    SELECT id FROM raw_snapshots
+                    WHERE league_id = ?
+                      AND category IN (
+                          'current-divine-history',
+                          'current-item-history'
+                      )
+                )
+                """,
+                (league.id,),
+            )
+            connection.execute(
+                """
+                DELETE FROM raw_snapshots
+                WHERE league_id = ?
+                  AND category IN (
+                      'current-divine-history',
+                      'current-item-history'
+                  )
+                """,
+                (league.id,),
+            )
         with patch(
             "poe_advisor.models.utc_now",
             return_value=datetime(2026, 7, 31, 6, tzinfo=timezone.utc),
@@ -755,9 +786,123 @@ class SyncServiceTests(unittest.TestCase):
             )
         self.assertEqual(cached["status"], "success")
         self.assertEqual(cached["cached_items"], 1)
+        self.assertEqual(cached["already_backfilled_items"], 1)
+        self.assertTrue(cached["coverage"][item_key]["already_backfilled"])
         self.assertEqual(
             len(service.poe_ninja.history_calls),
             calls_after_first,
+        )
+
+        # A durable marker is only a cache hit while every normalized day is
+        # still present. If archive corruption or an interrupted migration
+        # drops a row, the next run must re-fetch and repair the curve.
+        with self.storage.transaction() as connection:
+            connection.execute(
+                """
+                DELETE FROM price_points
+                WHERE league_id = ? AND item_key = ?
+                  AND source = 'poe.ninja'
+                  AND json_extract(details_json, '$.history_backfill') = 1
+                  AND json_extract(details_json, '$.league_day') = 4
+                """,
+                (league.id, item_key),
+            )
+        damaged = self.storage.current_item_history_archive(
+            league.id,
+            item_key,
+            provider="poe.ninja",
+        )
+        assert damaged is not None
+        self.assertFalse(damaged["normalized_price_days_complete"])
+        self.assertEqual(damaged["missing_normalized_price_days"], [4])
+        with patch(
+            "poe_advisor.models.utc_now",
+            return_value=datetime(2026, 7, 31, 6, tzinfo=timezone.utc),
+        ):
+            repaired = service.sync_current_item_histories(
+                league,
+                [item_key],
+                max_items=100,
+            )
+        self.assertEqual(repaired["status"], "success")
+        self.assertEqual(repaired["already_backfilled_items"], 0)
+        self.assertEqual(
+            len(service.poe_ninja.history_calls),
+            calls_after_first + 2,
+        )
+        restored = self.storage.current_item_history_archive(
+            league.id,
+            item_key,
+            provider="poe.ninja",
+        )
+        assert restored is not None
+        self.assertTrue(restored["normalized_price_days_complete"])
+
+    def test_ranked_current_history_reports_request_limit(self) -> None:
+        service = self.service()
+        result = service.sync(backfill_hours=0)
+        self.assertTrue(result["ok"])
+        league = self.storage.get_current_league()
+        assert league is not None
+
+        summary = service.sync_current_item_histories(
+            league,
+            ["missing:a", "missing:b", "missing:c"],
+            max_items=2,
+        )
+
+        self.assertEqual(summary["input_items"], 3)
+        self.assertEqual(summary["requested_items"], 2)
+        self.assertEqual(summary["omitted_items"], 1)
+        self.assertEqual(summary["status"], "partial")
+        self.assertTrue(
+            any("exceeded" in warning for warning in summary["warnings"])
+        )
+
+    def test_exchange_history_recovers_identity_from_canonical_item_key(self) -> None:
+        service = self.service()
+        result = service.sync(backfill_hours=0)
+        self.assertTrue(result["ok"])
+        league = self.storage.get_current_league()
+        assert league is not None
+        self.storage.set_setting(
+            "exchange_categories",
+            ["Currency", "DivinationCard"],
+        )
+        item_key = "divinationcard:the-visionary"
+        self.storage.insert_price_points(
+            [
+                PricePoint(
+                    league_id=league.id,
+                    item_key=item_key,
+                    name="The Visionary",
+                    category="DivinationCard",
+                    source="poe.ninja",
+                    observed_at="2026-07-30T06:00:00Z",
+                    chaos_value=10.0,
+                    divine_value=0.1,
+                    listing_count=10,
+                    confidence=0.9,
+                    details={},
+                )
+            ]
+        )
+
+        summary = service.sync_current_item_histories(
+            league,
+            [item_key],
+        )
+
+        self.assertEqual(summary["matched_items"], 1)
+        self.assertEqual(summary["unmatched_items"], 0)
+        self.assertEqual(summary["derived_exchange_identity_items"], 1)
+        self.assertIn(
+            ("exchange", league.id, "DivinationCard", "the-visionary"),
+            service.poe_ninja.history_calls,
+        )
+        self.assertEqual(
+            summary["coverage"][item_key]["identity_source"],
+            "canonical poe.ninja item-key suffix",
         )
 
     def test_ranked_current_history_fails_closed_on_bad_divine_curve(

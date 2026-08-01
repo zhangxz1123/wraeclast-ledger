@@ -195,19 +195,19 @@ class ForecastRankingTests(unittest.TestCase):
         self.assertEqual(payload["forecast_model"]["eligibility_gates"], [])
 
     def test_low_confidence_dump_outliers_are_audit_only(self) -> None:
-        tricorne = "basetype:tricorne-85-crusader-variant-crusader"
-        engraved = "basetype:engraved-hatchet-84-elder-variant-elder"
+        simplex = "basetype:simplex-amulet-85-crusader-variant-crusader"
+        focused = "basetype:focused-amulet-84-elder-variant-elder"
         infested = "beast:infested-ursa"
         self.add_current(
-            tricorne,
-            "Tricorne",
+            simplex,
+            "Simplex Amulet",
             [0.01],
             category="BaseType",
             details={"variant": "Crusader"},
         )
         self.add_current(
-            engraved,
-            "Engraved Hatchet",
+            focused,
+            "Focused Amulet",
             [0.02],
             category="BaseType",
             details={"variant": "Elder"},
@@ -222,8 +222,8 @@ class ForecastRankingTests(unittest.TestCase):
 
         # These reproduce the extreme Low rows in poe.ninja's Mirage dump.
         self.add_target(
-            tricorne,
-            "Tricorne",
+            simplex,
+            "Simplex Amulet",
             "Mirage",
             7,
             3.1848,
@@ -231,8 +231,8 @@ class ForecastRankingTests(unittest.TestCase):
             confidence=0.35,
         )
         self.add_target(
-            engraved,
-            "Engraved Hatchet",
+            focused,
+            "Focused Amulet",
             "Mirage",
             7,
             5.308,
@@ -248,10 +248,10 @@ class ForecastRankingTests(unittest.TestCase):
             category="Beast",
             confidence=0.35,
         )
-        # Engraved Hatchet still has a target from its qualifying observations.
+        # Focused Amulet still has a target from qualifying observations.
         self.add_target(
-            engraved,
-            "Engraved Hatchet",
+            focused,
+            "Focused Amulet",
             "Mercenaries",
             7,
             0.02556299452221546,
@@ -259,8 +259,8 @@ class ForecastRankingTests(unittest.TestCase):
             confidence=0.65,
         )
         self.add_target(
-            engraved,
-            "Engraved Hatchet",
+            focused,
+            "Focused Amulet",
             "Settlers",
             7,
             0.04838709677419355,
@@ -278,10 +278,13 @@ class ForecastRankingTests(unittest.TestCase):
         # Low data is a forecast-quality rule, not an item eligibility rule.
         self.assertEqual(
             set(by_name),
-            {"Tricorne", "Engraved Hatchet", "Infested Ursa"},
+            {"Simplex Amulet", "Focused Amulet", "Infested Ursa"},
         )
-        self.assertIsNone(by_name["Tricorne"]["expected_gain"])
-        self.assertEqual(by_name["Tricorne"]["forecast_7d"], {"days": 7})
+        self.assertIsNone(by_name["Simplex Amulet"]["expected_gain"])
+        self.assertEqual(
+            by_name["Simplex Amulet"]["forecast_7d"],
+            {"days": 7},
+        )
         self.assertIsNone(by_name["Infested Ursa"]["expected_gain"])
         self.assertEqual(
             by_name["Infested Ursa"]["forecast_7d"],
@@ -293,20 +296,20 @@ class ForecastRankingTests(unittest.TestCase):
             0.02556299452221546 * weights[0]
             + 0.04838709677419355 * weights[1]
         ) / sum(weights)
-        engraved_forecast = by_name["Engraved Hatchet"]["forecast_7d"]
+        focused_forecast = by_name["Focused Amulet"]["forecast_7d"]
         self.assertAlmostEqual(
-            engraved_forecast["raw_historical_target_divine"],
+            focused_forecast["raw_historical_target_divine"],
             expected_target,
         )
         self.assertEqual(
-            engraved_forecast["historical_leagues"],
+            focused_forecast["historical_leagues"],
             ["Mercenaries", "Settlers"],
         )
         self.assertLess(
-            engraved_forecast["raw_historical_target_divine"],
+            focused_forecast["raw_historical_target_divine"],
             0.05,
         )
-        self.assertEqual(payload["rankings"][0]["name"], "Engraved Hatchet")
+        self.assertEqual(payload["rankings"][0]["name"], "Focused Amulet")
         self.assertEqual(
             payload["forecast_model"]["historical_confidence_floor"],
             0.5,
@@ -686,10 +689,10 @@ class ForecastRankingTests(unittest.TestCase):
     def test_full_exact_variant_universe_is_not_truncated(self) -> None:
         for index in range(105):
             self.add_current(
-                f"basetype:fixture-{index:03d}",
+                f"invitation:fixture-{index:03d}",
                 f"Fixture {index:03d}",
                 [1.0],
-                category="BaseType",
+                category="Invitation",
             )
         self.add_current(
             "skillgem:awakened-enlighten-support-level-1",
@@ -800,6 +803,26 @@ class ForecastRankingTests(unittest.TestCase):
                 "Unbreakable",
                 "ForbiddenJewel",
             ),
+            (
+                "basetype:abyssal-axe-86-hunter-variant-hunter",
+                "Abyssal Axe",
+                "BaseType",
+            ),
+            (
+                "basetype:replica-simplex-amulet-86",
+                "Replica Simplex Amulet",
+                "BaseType",
+            ),
+            (
+                "basetype:simplex-amulet-86-hunter-variant-hunter",
+                "Simplex Amulet",
+                "BaseType",
+            ),
+            (
+                "basetype:focused-amulet-86-shaper-variant-shaper",
+                "Focused Amulet",
+                "BaseType",
+            ),
         )
         for key, name, category in fixtures:
             self.add_current(key, name, [1.0], category=category)
@@ -868,11 +891,14 @@ class ForecastRankingTests(unittest.TestCase):
                 "Sublime Vision",
                 "The Adorned",
                 "Watcher's Eye",
+                "Simplex Amulet",
+                "Focused Amulet",
             },
         )
         self.assertEqual(
             payload["investment_scope"]["excluded_category_counts"],
             {
+                "BaseType": 2,
                 "SkillGem": 2,
                 "Unique Map": 1,
                 "UniqueAccessory": 1,
@@ -882,6 +908,10 @@ class ForecastRankingTests(unittest.TestCase):
         )
         self.assertIn(
             "SkillGem (except names beginning with 'Awakened ')",
+            payload["investment_scope"]["excluded_categories"],
+        )
+        self.assertIn(
+            "BaseType (except Simplex Amulet and Focused Amulet)",
             payload["investment_scope"]["excluded_categories"],
         )
         self.assertIn(
@@ -936,8 +966,8 @@ class ForecastRankingTests(unittest.TestCase):
 
     def test_item_level_variants_have_distinct_full_identity(self) -> None:
         self.add_current(
-            "basetype:abyssal-axe-86-hunter-variant-hunter",
-            "Abyssal Axe",
+            "basetype:simplex-amulet-86-hunter-variant-hunter",
+            "Simplex Amulet",
             [1.0],
             category="BaseType",
             details={"variant": "Hunter"},
@@ -953,11 +983,11 @@ class ForecastRankingTests(unittest.TestCase):
             },
         )
         self.add_current(
-            "basetype:imperial-staff-6l-links-6",
-            "Imperial Staff",
+            "basetype:focused-amulet-6l-links-6",
+            "Focused Amulet",
             [1.0],
             category="BaseType",
-            details={"baseType": "Imperial Staff", "links": 6},
+            details={"baseType": "Focused Amulet", "links": 6},
         )
         self.add_current(
             "wombgift:ancient-wombgift-84",
@@ -975,12 +1005,12 @@ class ForecastRankingTests(unittest.TestCase):
             row["name"]: row["trade_identity"]
             for row in payload["rankings"]
         }
-        self.assertEqual(identities["Abyssal Axe"]["item_level"], 86)
+        self.assertEqual(identities["Simplex Amulet"]["item_level"], 86)
         self.assertEqual(
             identities["+12% to Chaos Resistance"]["item_level"],
             84,
         )
-        self.assertEqual(identities["Imperial Staff"]["links"], 6)
+        self.assertEqual(identities["Focused Amulet"]["links"], 6)
         self.assertEqual(
             identities["Ancient Wombgift"]["item_level"],
             84,
@@ -1021,8 +1051,18 @@ class ForecastRankingTests(unittest.TestCase):
             {
                 spec.league_id
                 for spec in BROADLY_COVERED_LEAGUES
-                if spec.league_id != "Mirage"
             },
+        )
+        mirage_curve = next(
+            row
+            for row in comparison["past_leagues"]
+            if row["league_id"] == "Mirage"
+        )
+        self.assertTrue(
+            all(
+                point["model_grade"] is False
+                for point in mirage_curve["points"]
+            )
         )
         self.assertEqual(
             comparison["calculation"]["historical_confidence_floor"],

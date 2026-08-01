@@ -229,6 +229,22 @@ _EXCLUDED_INVESTMENT_CATEGORY_PREFIX_KEYS = tuple(
 )
 AWAKENED_GEM_NAME_PREFIX = "Awakened "
 
+# BaseType observations remain in the local archive, but the investment view
+# keeps only the two scarce amulet bases requested by the user. Match the full
+# normalized display name so similarly named gems or future bases cannot leak
+# into the ranking. ``bases`` is the legacy poe.watch category spelling; its
+# archived rows are currently ineligible, but recognizing it keeps the policy
+# consistent if one is ever presented to the recommendation engine.
+BASE_TYPE_INVESTMENT_WHITELIST = (
+    "Simplex Amulet",
+    "Focused Amulet",
+)
+_BASE_TYPE_INVESTMENT_WHITELIST_KEYS = frozenset(
+    re.sub(r"[^a-z0-9]+", "", value.casefold())
+    for value in BASE_TYPE_INVESTMENT_WHITELIST
+)
+_BASE_TYPE_CATEGORY_KEYS = frozenset(("basetype", "bases"))
+
 # The user-selected endgame whitelist is intentionally exact and small.
 # Keep the predicate separate from the broad category rule so a future data
 # source that exposes rolls can add variant-specific checks without changing
@@ -260,6 +276,7 @@ INVESTMENT_UNIVERSE_CATEGORY_FILTERS = (
         "Vision, The Adorned, and Watcher's Eye markets)"
     ),
     "SkillGem (except names beginning with 'Awakened ')",
+    "BaseType (except Simplex Amulet and Focused Amulet)",
 )
 
 # These are exact low-end currency markets, not whole categories: valuable
@@ -400,6 +417,11 @@ def _item_is_excluded(
     category_token = _normalized_asset_token(category)
     if category_token in _EXCLUDED_INVESTMENT_CATEGORY_KEYS:
         return True
+    if category_token in _BASE_TYPE_CATEGORY_KEYS:
+        return (
+            _normalized_asset_token(name)
+            not in _BASE_TYPE_INVESTMENT_WHITELIST_KEYS
+        )
     if any(
         category_token.startswith(prefix)
         for prefix in _EXCLUDED_INVESTMENT_CATEGORY_PREFIX_KEYS
@@ -2782,8 +2804,9 @@ class RecommendationEngine:
                 "price with the recency-weighted target-day price in Settlers, "
                 "Mercenaries, Keepers, and Mirage. Only poe.ninja historical "
                 "observations graded Medium or High (normalized confidence "
-                "at least 0.5) enter that target or the displayed weighted "
-                "curve; Low observations remain archived for audit. When at "
+                "at least 0.5) enter that forecast target. The comparison "
+                "chart also plots exact Low-confidence observations as "
+                "non-forecast context. When at "
                 "least two "
                 "current-league days exist, it blends 70% historical target "
                 "and 30% robust current-curve projection in log-return space. "
@@ -2844,6 +2867,7 @@ class RecommendationEngine:
                     ),
                     "Valdo maps",
                     "non-Awakened skill gems",
+                    "BaseType markets except Simplex Amulet and Focused Amulet",
                     "explicit low-end currencies such as Chromatic Orb",
                     "current price below one Chaos Orb",
                     "current poe.ninja observation older than one league day",

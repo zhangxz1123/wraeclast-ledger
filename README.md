@@ -9,8 +9,9 @@ produces gross 3, 7, and 14-day gain forecasts. The selected horizon determines
 the global order shown across paginated results. The archive is intentionally
 broad, while excluded small-consumable categories, sub-1-chaos markets, and
 persistent completed-league decliners remain outside the displayed investment
-universe. Unique-item categories, Valdo maps, and non-Awakened skill gems are
-also archived but omitted from rankings. The unique-item exceptions are
+universe. Base types other than Simplex Amulet and Focused Amulet, unique-item
+categories, Valdo maps, and non-Awakened skill gems are also archived but
+omitted from rankings. The unique-item exceptions are
 one- and three-passive Voices, Sublime Vision, The Adorned, and Watcher's Eye;
 Awakened gems and the separately categorized Forbidden Jewel market also
 remain visible. The latter three use aggregate poe.ninja markets and are
@@ -74,8 +75,9 @@ the local API or a raw copy of the local SQLite database. The included
 1. Restores the most recent sanitized, compressed market database from the
    `market-archive` GitHub Release.
 2. Runs the full unattended refresh: poe.ninja current overviews, exact
-   top-ranked detail histories, optional build composition, any not-yet-imported
-   broad-league official dumps, and the recommendation model.
+   dated detail histories for every currently ranked identity (up to 2,000),
+   optional build composition, any not-yet-imported broad-league official
+   dumps, and the recommendation model.
 3. Exports a lightweight all-item search/filter index, small content-hashed
    3/7/14-day ranking pages, and lazily loaded price-curve shards. The hosted
    page never downloads or parses one giant all-item recommendation catalog.
@@ -192,10 +194,13 @@ The **Sync market & run model** button calls `POST /api/sync`. A normal sync:
 6. Archives poe.ninja's indexed-build class distribution and its nearest
    available past-league time-machine snapshots. The much smaller official
    experience-ladder sample is used only when poe.ninja is unavailable.
-7. Runs a preliminary top-100 ranking and requests each exact identity's dated
-   poe.ninja detail history. Prices are normalized only when that item day has
-   an exact same-day poe.ninja Divine/Chaos observation; missing trades and
-   missing anchors remain gaps.
+7. Runs a preliminary complete ranking and requests every in-scope exact
+   identity's dated poe.ninja detail history (up to the 2,000-item safety cap).
+   Prices are normalized only when that item day has an exact same-day
+   poe.ninja Divine/Chaos observation; missing trades and missing anchors remain
+   gaps. A compact coverage checkpoint survives hosted-archive cleanup, verifies
+   that every normalized day still has a stored price row, and rechecks each
+   exact curve at least weekly so interrupted or late provider data can heal.
 8. Regenerates and stores the final ranking after the curve archive is updated.
 
 Hourly exchange collection is disabled by default. A positive optional JSON
@@ -310,6 +315,7 @@ market below 1 Chaos is also omitted; this is a minimum unit-price floor, not an
 upper price or budget cap. The model additionally removes an exact item when
 its weekly median Divine-relative curve robustly declines across at least two
 broadly covered past leagues with at least 65% of the available recency weight.
+BaseType markets are omitted except for Simplex Amulet and Focused Amulet.
 All excluded prices are still archived locally for research and fast queries.
 
 The automatic lifecycle rule requires at least 12 usable weekly buckets over a
@@ -333,10 +339,12 @@ not contribute to forecasts.
 For each item and horizon, the model reads the exact historical price at the
 current league day plus 3, 7, or 14 days. Only poe.ninja observations graded
 Medium or High (normalized confidence at least `0.5`) may enter a forecast,
-the same-day comparison, the structural-decline classifier, or the displayed
-weighted historical curve. Low-confidence rows remain complete in the local
-archive for audit. That recency-weighted future price is compared directly
-with today's current-league price; a historical entry price is not required.
+the same-day comparison, or the structural-decline classifier. The displayed
+weighted historical curve includes every positive exact poe.ninja row,
+including Low-confidence context, while exposing the number of forecast-grade
+contributors separately. Low rows never set a forecast target. The qualifying
+recency-weighted future price is compared directly with today's current-league
+price; a historical entry price is not required.
 The qualifying future-day observation count is shown per horizon.
 Missing observations stay missing; the dashboard displays `—` and “no exact
 broad-league future-day price,” never 0%.
@@ -443,14 +451,15 @@ python -m poe_advisor recommend --horizon 7
   a league ZIP.
 - `GET /api/recommendations?horizon=7` — every exact ranked item variant sorted
   by the selected gross forecast. The response uses compact rows so the browser
-  can paginate and filter the complete universe locally. Each row exposes
+  can paginate and filter the complete ranked universe locally. Each row exposes
   `forecast_3d` / `forecast_7d` / `forecast_14d`, with `expected_gain_pct`,
   `historical_target_price_divine`, `historical_target_gain_pct`,
   `historical_sample_leagues`, `historical_leagues`, and
   `current_curve_projection.capped_gain_pct`.
 - `GET /api/history?key=<item-key>` — current and recency-weighted historical
-  price curves and explicit day-by-day coverage. The weighted curve used by
-  the forecast contains only the four broadly covered leagues.
+  price curves and explicit day-by-day coverage. The displayed weighted curve
+  contains only the four broadly covered leagues and includes exact Low rows;
+  forecast targets use a separate Medium/High-only weighted series.
 - `GET /api/settings` — non-secret settings.
 - `POST /api/settings` — update the permitted public settings.
 

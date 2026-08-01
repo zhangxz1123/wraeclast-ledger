@@ -18,6 +18,10 @@ class DailyAutomationTests(unittest.TestCase):
             parser.parse_args(["daily-update"]).history_hours,
             0,
         )
+        self.assertEqual(
+            parser.parse_args(["daily-update"]).current_history_items,
+            2000,
+        )
 
     def test_scheduled_workflow_defaults_hourly_audit_backfill_off(self) -> None:
         workflow = (
@@ -31,6 +35,7 @@ class DailyAutomationTests(unittest.TestCase):
         self.assertIn('- "0"', workflow)
         self.assertIn("inputs.history_hours || '0'", workflow)
         self.assertNotIn("inputs.history_hours || '168'", workflow)
+        self.assertIn("inputs.current_history_items || '2000'", workflow)
 
     def test_complete_refresh_runs_curves_history_and_final_model(self) -> None:
         league = SimpleNamespace(id="Live", is_demo=False)

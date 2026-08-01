@@ -76,6 +76,135 @@ class StorageTests(unittest.TestCase):
             1,
         )
 
+    def test_current_history_coverage_is_durable_indexed_and_upserted(self) -> None:
+        item_key = "skillgem:awakened-enlighten-support"
+        endpoint = "https://poe.ninja/fixture/history/95714"
+        self.storage.add_snapshot(
+            source="poe.ninja",
+            endpoint=endpoint,
+            league_id=self.league.id,
+            category="current-item-history",
+            fetched_at="2026-07-31T07:00:00Z",
+            status_code=200,
+            raw=b"[]",
+            metadata={
+                "item_key": item_key,
+                "provider": "poe.ninja",
+                "source_item_id": "95714",
+                "category": "SkillGem",
+                "history_kind": "stash-item",
+                "provider_observed_days": [99],
+            },
+        )
+        legacy = self.storage.current_item_history_archive(
+            self.league.id,
+            item_key,
+            provider="poe.ninja",
+        )
+        assert legacy is not None
+        self.assertFalse(legacy["durable"])
+        self.assertEqual(legacy["provider_observed_days"], [99])
+
+        self.storage.upsert_current_item_history_coverage(
+            league_id=self.league.id,
+            item_key=item_key,
+            provider="poe.ninja",
+            source_item_id="95714",
+            category="SkillGem",
+            history_kind="stash-item",
+            endpoint=endpoint,
+            fetched_at="2026-07-31T06:00:00Z",
+            metadata={
+                "identity_source": "poe.ninja overview identity",
+                "provider_observed_days": [3, 2, 2],
+                "provider_missing_days": [1],
+                "normalized_days": [2, 3],
+                "missing_divine_anchor_days": [],
+                "interpolation": "none",
+            },
+        )
+        durable = self.storage.current_item_history_archive(
+            self.league.id,
+            item_key,
+            provider="poe.ninja",
+        )
+        assert durable is not None
+        self.assertTrue(durable["durable"])
+        self.assertIsNone(durable["snapshot_id"])
+        self.assertEqual(durable["provider_observed_days"], [2, 3])
+        self.assertEqual(durable["provider_first_observed_day"], 2)
+        self.assertEqual(durable["provider_last_observed_day"], 3)
+        self.assertEqual(durable["provider_missing_days"], [1])
+        self.assertFalse(durable["normalized_price_days_complete"])
+        self.assertEqual(durable["missing_normalized_price_days"], [2, 3])
+
+        self.storage.insert_price_points(
+            [
+                PricePoint(
+                    league_id=self.league.id,
+                    item_key=item_key,
+                    name="Awakened Enlighten Support",
+                    category="SkillGem",
+                    source="poe.ninja",
+                    observed_at=f"2026-07-{23 + day:02d}T00:00:00Z",
+                    chaos_value=3_000.0 + day,
+                    divine_value=30.0 + day,
+                    confidence=0.9,
+                )
+                for day in (2, 3)
+            ]
+        )
+        complete = self.storage.current_item_history_archive(
+            self.league.id,
+            item_key,
+            provider="poe.ninja",
+        )
+        assert complete is not None
+        self.assertTrue(complete["normalized_price_days_complete"])
+        self.assertEqual(complete["missing_normalized_price_days"], [])
+
+        self.storage.upsert_current_item_history_coverage(
+            league_id=self.league.id,
+            item_key=item_key,
+            provider="poe.ninja",
+            source_item_id="95714",
+            category="SkillGem",
+            history_kind="stash-item",
+            endpoint=endpoint,
+            fetched_at="2026-08-01T06:00:00Z",
+            metadata={
+                "provider_observed_days": [1, 2, 3, 4],
+                "provider_missing_days": [],
+                "normalized_days": [1, 2, 3, 4],
+                "missing_divine_anchor_days": [],
+            },
+        )
+        refreshed = self.storage.current_item_history_archive(
+            self.league.id,
+            item_key,
+            provider="poe.ninja",
+        )
+        assert refreshed is not None
+        self.assertEqual(refreshed["fetched_at"], "2026-08-01T06:00:00Z")
+        self.assertEqual(refreshed["provider_observed_days"], [1, 2, 3, 4])
+        self.assertFalse(refreshed["normalized_price_days_complete"])
+        self.assertEqual(refreshed["missing_normalized_price_days"], [1, 4])
+
+        with closing(self.storage.connect()) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM current_item_history_coverage"
+                ).fetchone()[0],
+                1,
+            )
+            indexes = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA index_list(current_item_history_coverage)"
+                ).fetchall()
+            }
+        self.assertIn("ix_current_history_exact_identity", indexes)
+
     def test_price_point_upsert_history_and_status_counts(self) -> None:
         snapshot_id, _ = self.storage.add_snapshot(
             source="fixture",
@@ -637,7 +766,7 @@ class StorageTests(unittest.TestCase):
             ],
         )
 
-    def test_v4_schema_migrates_an_existing_database_idempotently(self) -> None:
+    def test_v5_schema_migrates_an_existing_database_idempotently(self) -> None:
         legacy_path = Path(self.temporary_directory.name) / "legacy-v1.sqlite3"
         connection = sqlite3.connect(legacy_path)
         try:
@@ -668,7 +797,7 @@ class StorageTests(unittest.TestCase):
         finally:
             connection.close()
 
-        self.assertEqual(version, 4)
+        self.assertEqual(version, 5)
         self.assertEqual(marker, "preserved")
         self.assertTrue(
             {
@@ -677,6 +806,7 @@ class StorageTests(unittest.TestCase):
                 "seasonal_prices",
                 "compact_seasonal_prices",
                 "compact_seasonal_prices_staging",
+                "current_item_history_coverage",
                 "meta_class_snapshots",
             }.issubset(tables)
         )
