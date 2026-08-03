@@ -1,16 +1,16 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-08-02T17:32:50Z",
-  "data_updated_at": "2026-08-02T17:30:47Z",
+  "generated_at": "2026-08-03T18:18:16Z",
+  "data_updated_at": "2026-08-03T18:15:04Z",
   "repository": "zhangxz1123/wraeclast-ledger",
-  "commit_sha": "99dd85dd21b4e56692556b556359cfaccae2a950",
+  "commit_sha": "3c3c8825f3596a392454a3ab25c05928e37eefc7",
   "league": {
     "id": "Allflame",
     "name": "Allflame",
-    "day": 9
+    "day": 10
   },
-  "ranked_items": 1807,
-  "history_items": 1807,
-  "workflow_run_id": "30758957403",
-  "workflow_run_url": "https://github.com/zhangxz1123/wraeclast-ledger/actions/runs/30758957403"
+  "ranked_items": 1805,
+  "history_items": 1805,
+  "workflow_run_id": "30840254055",
+  "workflow_run_url": "https://github.com/zhangxz1123/wraeclast-ledger/actions/runs/30840254055"
 }
