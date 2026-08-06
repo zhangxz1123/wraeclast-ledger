@@ -124,6 +124,122 @@ class DailyAutomationTests(unittest.TestCase):
         )
         application.storage.get_current_league.assert_not_called()
 
+    def test_partial_current_overview_stops_before_optional_stages(self) -> None:
+        league = SimpleNamespace(id="Live", is_demo=False)
+        application = SimpleNamespace()
+        application.sync_service = Mock()
+        application.sync_service.sync.return_value = {
+            "ok": True,
+            "warnings": [],
+            "stats": {"poe_ninja_price_failed_endpoints": 1},
+        }
+        application.storage = Mock()
+        application.storage.get_current_league.return_value = league
+        application.sync_meta = Mock()
+
+        with patch(
+            "poe_advisor.automation.AdvisorApplication.create",
+            return_value=application,
+        ):
+            result = run_daily_update(
+                database_path="archive.sqlite3",
+                web_dir="web",
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("overview collection", result["message"])
+        application.sync_meta.assert_not_called()
+
+    def test_omitted_current_history_stops_before_publish_model(self) -> None:
+        league = SimpleNamespace(id="Live", is_demo=False)
+        application = SimpleNamespace()
+        application.storage = Mock()
+        application.storage.get_current_league.return_value = league
+        application.sync_service = Mock()
+        application.sync_service.sync.return_value = {
+            "ok": True,
+            "status": "success",
+            "warnings": [],
+            "stats": {
+                "failed_endpoints": 1,
+                "poe_ninja_price_failed_endpoints": 0,
+            },
+        }
+        application.sync_service.sync_current_item_histories.return_value = {
+            "status": "success",
+            "input_items": 2,
+            "requested_items": 1,
+            "omitted_items": 1,
+        }
+        application.sync_meta = Mock(
+            return_value={"status": "success", "failed_leagues": 0}
+        )
+        application.history_service = Mock()
+        application.recommendation_engine = Mock()
+        application.recommendation_engine.generate.return_value = {
+            "rankings": [{"key": "item:a"}]
+        }
+
+        with patch(
+            "poe_advisor.automation.AdvisorApplication.create",
+            return_value=application,
+        ):
+            result = run_daily_update(
+                database_path="archive.sqlite3",
+                web_dir="web",
+                current_history_items=1,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("previous published dashboard", result["message"])
+        application.history_service.backfill.assert_not_called()
+        application.recommendation_engine.generate.assert_called_once()
+
+    def test_current_history_exception_stops_before_publish_model(self) -> None:
+        league = SimpleNamespace(id="Live", is_demo=False)
+        application = SimpleNamespace()
+        application.storage = Mock()
+        application.storage.get_current_league.return_value = league
+        application.sync_service = Mock()
+        application.sync_service.sync.return_value = {
+            "ok": True,
+            "status": "success",
+            "warnings": [],
+            "stats": {
+                "failed_endpoints": 1,
+                "poe_ninja_price_failed_endpoints": 0,
+            },
+        }
+        application.sync_service.sync_current_item_histories.side_effect = (
+            RuntimeError("fixture detail outage")
+        )
+        application.sync_meta = Mock(
+            return_value={"status": "success", "failed_leagues": 0}
+        )
+        application.history_service = Mock()
+        application.recommendation_engine = Mock()
+        application.recommendation_engine.generate.return_value = {
+            "rankings": [{"key": "item:a"}]
+        }
+
+        with patch(
+            "poe_advisor.automation.AdvisorApplication.create",
+            return_value=application,
+        ):
+            result = run_daily_update(
+                database_path="archive.sqlite3",
+                web_dir="web",
+                current_history_items=1,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("previous published dashboard", result["message"])
+        application.history_service.backfill.assert_not_called()
+        application.recommendation_engine.generate.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

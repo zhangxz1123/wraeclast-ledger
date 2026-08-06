@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -946,6 +946,255 @@ class SyncServiceTests(unittest.TestCase):
         )
         assert restored is not None
         self.assertTrue(restored["normalized_price_days_complete"])
+
+    def test_ranked_history_rechecks_an_unexpected_closed_day_gap(self) -> None:
+        class HealingPoeNinja(FakePoeNinja):
+            def __init__(self) -> None:
+                super().__init__()
+                self.heal = False
+
+            def fetch_exchange_details(
+                self,
+                league: str,
+                category: str,
+                item_id: int | str,
+                **kwargs: Any,
+            ) -> FetchResult:
+                if not self.heal:
+                    return super().fetch_exchange_details(
+                        league,
+                        category,
+                        item_id,
+                        **kwargs,
+                    )
+                self.history_calls.append(
+                    ("exchange", league, category, str(item_id))
+                )
+                response = fetch_result(
+                    self.exchange_details_url(league, category, item_id),
+                    {
+                        "item": {
+                            "id": "divine",
+                            "name": "Divine Orb",
+                            "detailsId": "divine-orb",
+                        },
+                        "pairs": [
+                            {
+                                "id": "chaos",
+                                "history": [
+                                    {
+                                        "timestamp": (
+                                            datetime(2026, 7, 25, tzinfo=timezone.utc)
+                                            + timedelta(days=index)
+                                        ).isoformat().replace("+00:00", "Z"),
+                                        "rate": 100.0 + index * 10.0,
+                                        "volumePrimaryValue": 1000 + index,
+                                    }
+                                    for index in range(10)
+                                ],
+                            }
+                        ],
+                    },
+                )
+                response.fetched_at = "2026-08-03T18:00:00Z"
+                return response
+
+            def fetch_stash_item_history(
+                self,
+                league: str,
+                category: str,
+                item_id: int | str,
+                **_: Any,
+            ) -> FetchResult:
+                if not self.heal:
+                    return super().fetch_stash_item_history(
+                        league,
+                        category,
+                        item_id,
+                    )
+                self.history_calls.append(
+                    ("stash-item", league, category, str(item_id))
+                )
+                response = fetch_result(
+                    self.stash_item_history_url(league, category, item_id),
+                    [
+                        {
+                            "count": 20 + index,
+                            "value": 3000 + index * 600,
+                            "daysAgo": 9 - index,
+                        }
+                        for index in range(10)
+                    ],
+                )
+                response.fetched_at = "2026-08-03T18:00:00Z"
+                return response
+
+        self.storage.set_setting("item_categories", ["SkillGem"])
+        client = HealingPoeNinja()
+        service = self.service(poe_ninja=client)
+        result = service.sync(backfill_hours=0)
+        self.assertTrue(result["ok"])
+        league = self.storage.get_current_league()
+        assert league is not None
+        item_key = (
+            "skillgem:awakened-enlighten-support-1-variant-1-"
+            "corrupted-false-gemlevel-1-gemquality-0"
+        )
+
+        with patch(
+            "poe_advisor.models.utc_now",
+            return_value=datetime(2026, 7, 31, 6, tzinfo=timezone.utc),
+        ):
+            initial = service.sync_current_item_histories(
+                league,
+                [item_key],
+                max_items=100,
+            )
+        self.assertEqual(initial["status"], "success")
+        calls_after_initial = len(client.history_calls)
+
+        # Simulate successful overviews on league days 8 and 10 with a missed
+        # scheduled run on closed day 9. The seven-day age check alone would
+        # accept this curve, but the missing available day must force a detail
+        # refresh so poe.ninja can heal it.
+        self.storage.insert_price_points(
+            [
+                PricePoint(
+                    league_id=league.id,
+                    item_key=item_key,
+                    name="Awakened Enlighten Support",
+                    category="SkillGem",
+                    source="poe.ninja",
+                    observed_at="2026-08-01T12:00:00Z",
+                    chaos_value=6800.0,
+                    divine_value=40.0,
+                    confidence=0.9,
+                    details={"poe_ninja_id": "95714"},
+                ),
+                PricePoint(
+                    league_id=league.id,
+                    item_key=item_key,
+                    name="Awakened Enlighten Support",
+                    category="SkillGem",
+                    source="poe.ninja",
+                    observed_at="2026-08-03T12:00:00Z",
+                    chaos_value=7200.0,
+                    divine_value=42.0,
+                    confidence=0.9,
+                    details={"poe_ninja_id": "95714"},
+                ),
+            ]
+        )
+        client.heal = True
+        with patch(
+            "poe_advisor.models.utc_now",
+            return_value=datetime(2026, 8, 3, 18, tzinfo=timezone.utc),
+        ):
+            repaired = service.sync_current_item_histories(
+                league,
+                [item_key],
+                max_items=100,
+            )
+
+        self.assertEqual(repaired["status"], "success")
+        self.assertEqual(repaired["gap_recheck_items"], 1)
+        self.assertEqual(repaired["gap_recheck_days"], 1)
+        self.assertEqual(
+            repaired["coverage"][item_key]["rechecked_missing_days"],
+            [9],
+        )
+        self.assertEqual(len(client.history_calls), calls_after_initial + 2)
+        daily = self.storage.daily_item_history(
+            league.id,
+            item_key,
+            league.start_at,
+            minimum_confidence=0.0,
+            sources=("poe.ninja",),
+        )
+        self.assertEqual(
+            [int(point["league_day"]) for point in daily],
+            list(range(1, 11)),
+        )
+
+    def test_only_provider_confirmed_closed_gap_can_remain_cached(self) -> None:
+        self.storage.set_setting("item_categories", ["SkillGem"])
+        client = FakePoeNinja()
+        service = self.service(poe_ninja=client)
+        self.assertTrue(service.sync(backfill_hours=0)["ok"])
+        league = self.storage.get_current_league()
+        assert league is not None
+        item_key = (
+            "skillgem:awakened-enlighten-support-1-variant-1-"
+            "corrupted-false-gemlevel-1-gemquality-0"
+        )
+        with patch(
+            "poe_advisor.models.utc_now",
+            return_value=datetime(2026, 7, 31, 6, tzinfo=timezone.utc),
+        ):
+            self.assertEqual(
+                service.sync_current_item_histories(
+                    league,
+                    [item_key],
+                    max_items=100,
+                )["status"],
+                "success",
+            )
+        calls_after_initial = len(client.history_calls)
+
+        with self.storage.transaction() as connection:
+            connection.execute(
+                """
+                UPDATE current_item_history_coverage
+                SET missing_days_json = '[8]',
+                    missing_divine_anchor_days_json = '[]',
+                    metadata_json = json_set(
+                        metadata_json, '$.checked_through_day', 9
+                    )
+                WHERE league_id = ? AND item_key = ?
+                  AND provider = 'poe.ninja'
+                """,
+                (league.id, item_key),
+            )
+        with patch(
+            "poe_advisor.models.utc_now",
+            return_value=datetime(2026, 8, 2, 18, tzinfo=timezone.utc),
+        ):
+            confirmed_gap = service.sync_current_item_histories(
+                league,
+                [item_key],
+                max_items=100,
+            )
+        self.assertEqual(confirmed_gap["status"], "success")
+        self.assertEqual(confirmed_gap["already_backfilled_items"], 1)
+        self.assertEqual(confirmed_gap["gap_recheck_items"], 0)
+        self.assertEqual(len(client.history_calls), calls_after_initial)
+
+        # The same missing stored day is repairable when the item existed but
+        # its Divine conversion anchor was absent. It must not be exempted as
+        # a provider-confirmed no-trade day.
+        with self.storage.transaction() as connection:
+            connection.execute(
+                """
+                UPDATE current_item_history_coverage
+                SET missing_days_json = '[]',
+                    missing_divine_anchor_days_json = '[8]'
+                WHERE league_id = ? AND item_key = ?
+                  AND provider = 'poe.ninja'
+                """,
+                (league.id, item_key),
+            )
+        with patch(
+            "poe_advisor.models.utc_now",
+            return_value=datetime(2026, 8, 2, 18, tzinfo=timezone.utc),
+        ):
+            missing_anchor = service.sync_current_item_histories(
+                league,
+                [item_key],
+                max_items=100,
+            )
+        self.assertEqual(missing_anchor["gap_recheck_items"], 1)
+        self.assertEqual(missing_anchor["gap_recheck_days"], 1)
+        self.assertEqual(len(client.history_calls), calls_after_initial + 2)
 
     def test_ranked_exchange_history_uses_direct_divine_without_chaos_normalization(
         self,

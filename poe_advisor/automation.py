@@ -52,6 +52,27 @@ def run_daily_update(
         warnings = []
         result["warnings"] = warnings
 
+    failed_current_endpoints = int(
+        (result.get("stats") or {}).get(
+            "poe_ninja_price_failed_endpoints"
+        )
+        or 0
+    )
+    if failed_current_endpoints:
+        warnings.append(
+            f"{failed_current_endpoints} current poe.ninja overview "
+            "endpoint(s) failed."
+        )
+        return {
+            **result,
+            "ok": False,
+            "status": "failed",
+            "message": (
+                "Current-league overview collection was incomplete; the "
+                "previous published dashboard and archive were kept."
+            ),
+        }
+
     try:
         meta_summary = application.sync_meta(league)
         result["meta_sync"] = meta_summary
@@ -95,11 +116,39 @@ def run_daily_update(
                 )
             )
             result["current_history_sync"] = current_history
-            if current_history.get("status") in {"failed", "partial"}:
+            history_counts_incomplete = any(
+                int(current_history.get(field) or 0) > 0
+                for field in (
+                    "omitted_items",
+                    "unmatched_items",
+                    "failed_items",
+                )
+            )
+            input_items = current_history.get("input_items")
+            requested_items = current_history.get("requested_items")
+            request_count_incomplete = (
+                input_items is not None
+                and requested_items is not None
+                and int(requested_items) != int(input_items)
+            )
+            if (
+                current_history.get("status") != "success"
+                or history_counts_incomplete
+                or request_count_incomplete
+            ):
                 warnings.append(
                     "Some ranked current-league price curves remain "
                     "incomplete."
                 )
+                return {
+                    **result,
+                    "ok": False,
+                    "status": "failed",
+                    "message": (
+                        "Current-league curve catch-up was incomplete; the "
+                        "previous published dashboard and archive were kept."
+                    ),
+                }
         except Exception as error:
             result["current_history_sync"] = {
                 "status": "failed",
@@ -109,6 +158,15 @@ def run_daily_update(
                 "Ranked current-league curve refresh stopped safely; stored "
                 "curves remain available."
             )
+            return {
+                **result,
+                "ok": False,
+                "status": "failed",
+                "message": (
+                    "Current-league curve catch-up failed; the previous "
+                    "published dashboard and archive were kept."
+                ),
+            }
 
     if seasonal_items and application.history_service is not None:
         try:

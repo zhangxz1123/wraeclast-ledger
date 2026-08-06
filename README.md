@@ -200,13 +200,22 @@ The **Sync market & run model** button calls `POST /api/sync`. A normal sync:
    available past-league time-machine snapshots. The much smaller official
    experience-ladder sample is used only when poe.ninja is unavailable.
 7. Runs a preliminary complete ranking and requests every in-scope exact
-   identity's dated poe.ninja detail history (up to the 2,000-item safety cap).
+   identity's dated poe.ninja detail history (up to the 3,000-item safety cap).
    Prices are normalized only when that item day has an exact same-day
    poe.ninja Divine/Chaos observation; missing trades and missing anchors remain
    gaps. A compact coverage checkpoint survives hosted-archive cleanup, verifies
-   that every normalized day still has a stored price row, and rechecks each
-   exact curve at least weekly so interrupted or late provider data can heal.
+   that every normalized day still has a stored price row, and rejects a cached
+   curve whenever a closed league day is absent without being confirmed absent
+   by poe.ninja. This lets the next successful run recover a day skipped by an
+   interrupted schedule. Exact curves are also rechecked at least weekly for
+   late provider revisions; genuine no-trade days remain blank.
 8. Regenerates and stores the final ranking after the curve archive is updated.
+
+The unattended updater fails closed before export when any current poe.ninja
+overview endpoint fails, or when a ranked identity is omitted, unmatched, or
+fails its current-history refresh. The previously published dashboard and
+durable archive remain in place instead of replacing them with a knowingly
+incomplete release.
 
 Hourly exchange collection is disabled by default. A positive optional JSON
 field `backfill_hours` explicitly advances the official GGG Currency Exchange

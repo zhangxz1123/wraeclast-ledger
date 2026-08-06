@@ -459,6 +459,8 @@ class SyncService:
             "fetched_items": 0,
             "cached_items": 0,
             "already_backfilled_items": 0,
+            "gap_recheck_items": 0,
+            "gap_recheck_days": 0,
             "failed_items": 0,
             "rows_written": 0,
             "snapshots_written": 0,
@@ -599,6 +601,45 @@ class SyncService:
                     item_key,
                     provider=PoeNinjaClient.SOURCE,
                 )
+                unexpected_missing_days: list[int] = []
+                if archived:
+                    # The overview sync normally contributes one observation
+                    # per league day, while the detail endpoint repairs a day
+                    # skipped by an interrupted scheduled run. A provider-
+                    # confirmed no-trade day is a real gap and stays blank; a
+                    # closed day absent from both the stored curve and that
+                    # confirmed-gap list means available poe.ninja data has not
+                    # yet been collected and must invalidate the cache.
+                    stored_days = {
+                        int(day)
+                        for day in archived.get("normalized_price_days", [])
+                    }
+                    checked_through_day = int(
+                        archived.get("checked_through_day") or 0
+                    )
+                    confirmed_unavailable_days = {
+                        int(day)
+                        for day in (
+                            archived.get("provider_missing_days") or []
+                        )
+                        # Detail histories contain closed daily buckets. The
+                        # still-open day at fetch time is not a confirmed
+                        # no-trade day and must become repairable after it
+                        # closes, including for older coverage rows that saved
+                        # the open day in provider_missing_days.
+                        if int(day) < checked_through_day
+                    }
+                    unexpected_missing_days = sorted(
+                        set(range(1, current_day))
+                        .difference(stored_days)
+                        .difference(confirmed_unavailable_days)
+                    )
+                if unexpected_missing_days:
+                    asset["gap_recheck_days"] = unexpected_missing_days
+                    summary["gap_recheck_items"] += 1
+                    summary["gap_recheck_days"] += len(
+                        unexpected_missing_days
+                    )
                 exact_durable_coverage = bool(
                     archived
                     and archived.get("durable") is True
@@ -613,6 +654,7 @@ class SyncService:
                     and archived.get("normalized_price_days_complete") is True
                     and int(archived.get("checked_through_day") or 0)
                     >= minimum_recent_check_day
+                    and not unexpected_missing_days
                 )
                 if not exact_durable_coverage:
                     pending.append(asset)
@@ -654,6 +696,7 @@ class SyncService:
                     "interpolation": str(
                         archived.get("interpolation") or "none"
                     ),
+                    "unexpected_missing_days": [],
                     "already_backfilled": True,
                 }
                 summary["cached_items"] += 1
@@ -785,7 +828,7 @@ class SyncService:
                     )
                     missing_provider_days = [
                         day
-                        for day in range(1, current_day + 1)
+                        for day in range(1, current_day)
                         if day not in provider_days
                     ]
                     missing_divine_days = (
@@ -818,6 +861,9 @@ class SyncService:
                         ),
                         "checked_through_day": current_day,
                         "interpolation": "none",
+                        "rechecked_missing_days": list(
+                            asset.get("gap_recheck_days") or []
+                        ),
                     }
                     snapshot_id = self._store_poe_ninja_current_history_record(
                         record,
@@ -958,6 +1004,9 @@ class SyncService:
                             CURRENT_HISTORY_NORMALIZATION_VERSION
                         ),
                         "interpolation": "none",
+                        "rechecked_missing_days": list(
+                            asset.get("gap_recheck_days") or []
+                        ),
                     }
                     summary[
                         "cached_items" if record["cached"] else "fetched_items"
@@ -996,6 +1045,7 @@ class SyncService:
                 detail=(
                     f"{summary['matched_items']} exact ranked identities; "
                     f"{summary['unmatched_items']} unmatched; "
+                    f"{summary['gap_recheck_items']} gap repairs; "
                     f"{summary['rows_written']} normalized daily rows; "
                     f"{summary['failed_items']} failures."
                 ),
@@ -1695,6 +1745,7 @@ class SyncService:
             "endpoints_checked": 0,
             "not_modified": 0,
             "failed_endpoints": 0,
+            "poe_ninja_price_failed_endpoints": 0,
             "official_hours": 0,
             "forbidden_variants": 0,
             "forbidden_variants_mapped": 0,
@@ -2069,6 +2120,7 @@ class SyncService:
                     label = "poe.ninja Standard"
                 else:
                     stats["failed_endpoints"] += 1
+                    stats["poe_ninja_price_failed_endpoints"] += 1
                     label = "poe.ninja"
                 warnings.append(f"{label} {category} failed: {error}")
                 self.storage.update_source_state(
