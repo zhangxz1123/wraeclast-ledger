@@ -99,7 +99,7 @@ POE_NINJA_CURRENT_HISTORY_STATE_SOURCE = "poe.ninja-current-history"
 CURRENT_HISTORY_ITEM_CATEGORY = "current-item-history"
 CURRENT_HISTORY_DIVINE_CATEGORY = "current-divine-history"
 CURRENT_HISTORY_CATALOG_CATEGORY = "current-history-catalog"
-CURRENT_HISTORY_MAX_ITEMS = 2_000
+CURRENT_HISTORY_MAX_ITEMS = 3_000
 CURRENT_HISTORY_REQUEST_PAUSE_SECONDS = 0.10
 CURRENT_HISTORY_RECHECK_DAYS = 7
 CURRENT_HISTORY_NORMALIZATION_VERSION = 2
@@ -436,7 +436,7 @@ class SyncService:
             )
         )
         request_limit = max(
-            1,
+            0,
             min(int(max_items), CURRENT_HISTORY_MAX_ITEMS),
         )
         requested_keys = all_requested_keys[:request_limit]

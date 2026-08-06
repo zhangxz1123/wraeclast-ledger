@@ -40,30 +40,52 @@ function fakeElement(selector) {
 function runInApp(statements) {
   const elements = new Map();
   const storage = new Map();
+  const cookies = new Map();
+  const cookieWrites = [];
+  const documentStub = {
+    baseURI: "https://owner.github.io/wraeclast-ledger/",
+    querySelector(selector) {
+      if (!elements.has(selector)) {
+        elements.set(selector, fakeElement(selector));
+      }
+      return elements.get(selector);
+    },
+    querySelectorAll() {
+      return [];
+    },
+    createElement() {
+      return {
+        textContent: "",
+        remove() {},
+        get innerHTML() {
+          return this.textContent;
+        },
+      };
+    },
+    cookieWrites,
+  };
+  Object.defineProperty(documentStub, "cookie", {
+    get() {
+      return [...cookies.entries()]
+        .map(([key, value]) => `${key}=${value}`)
+        .join("; ");
+    },
+    set(header) {
+      const parts = String(header).split(";").map((part) => part.trim());
+      const separator = parts[0].indexOf("=");
+      if (separator < 1) return;
+      const key = parts[0].slice(0, separator);
+      const value = parts[0].slice(separator + 1);
+      cookieWrites.push(String(header));
+      const expired = parts.some((part) => /^Max-Age=0$/i.test(part));
+      if (expired) cookies.delete(key);
+      else cookies.set(key, value);
+    },
+  });
   const context = vm.createContext({
     URL,
     console,
-    document: {
-      baseURI: "https://owner.github.io/wraeclast-ledger/",
-      querySelector(selector) {
-        if (!elements.has(selector)) {
-          elements.set(selector, fakeElement(selector));
-        }
-        return elements.get(selector);
-      },
-      querySelectorAll() {
-        return [];
-      },
-      createElement() {
-        return {
-          textContent: "",
-          remove() {},
-          get innerHTML() {
-            return this.textContent;
-          },
-        };
-      },
-    },
+    document: documentStub,
     fetch: async () => ({
       ok: true,
       json: async () => ({}),
@@ -461,6 +483,89 @@ test("category exclusions persist locally and can be reset to include all", () =
   assert.equal(result.saved, true);
   assert.deepEqual([...result.restored], ["ForbiddenJewel"]);
   assert.deepEqual([...result.afterReset], []);
+});
+
+test("dashboard preferences persist in a first-party cookie and restore controls", () => {
+  const result = runInApp(`
+    els.horizonSelect.value = "14";
+    state.priceRange = "10d-plus";
+    state.query = "awakened enlighten";
+    state.pageSize = 100;
+    state.excludedCategories = new Set(["ForbiddenJewel", "Currency"]);
+    const saved = saveDashboardPreferences();
+    const cookieBeforeRestore = document.cookie;
+    const cookieWrite = document.cookieWrites.at(-1);
+
+    els.horizonSelect.value = "3";
+    els.priceRangeFilter.value = "all";
+    els.searchInput.value = "";
+    els.pageSizeSelect.value = "25";
+    state.priceRange = "all";
+    state.query = "";
+    state.pageSize = 25;
+    state.excludedCategories = new Set();
+
+    const restored = loadDashboardPreferences();
+    globalThis.__result = {
+      saved,
+      restored,
+      cookieBeforeRestore,
+      cookieWrite,
+      horizon: els.horizonSelect.value,
+      priceRange: state.priceRange,
+      priceControl: els.priceRangeFilter.value,
+      query: state.query,
+      searchControl: els.searchInput.value,
+      pageSize: state.pageSize,
+      pageSizeControl: els.pageSizeSelect.value,
+      categories: [...state.excludedCategories].sort(),
+    };
+  `);
+
+  assert.equal(result.saved, true);
+  assert.equal(result.restored, true);
+  assert.match(result.cookieBeforeRestore, /wraeclast_ledger_preferences_v1=/);
+  assert.match(result.cookieWrite, /Max-Age=31536000/);
+  assert.match(result.cookieWrite, /Path=\/wraeclast-ledger\//);
+  assert.match(result.cookieWrite, /SameSite=Lax/);
+  assert.match(result.cookieWrite, /Secure/);
+  assert.equal(result.horizon, "14");
+  assert.equal(result.priceRange, "10d-plus");
+  assert.equal(result.priceControl, "10d-plus");
+  assert.equal(result.query, "awakened enlighten");
+  assert.equal(result.searchControl, "awakened enlighten");
+  assert.equal(result.pageSize, 100);
+  assert.equal(result.pageSizeControl, "100");
+  assert.deepEqual([...result.categories], ["Currency", "ForbiddenJewel"]);
+});
+
+test("invalid saved preference values fall back safely", () => {
+  const result = runInApp(`
+    document.cookie = DASHBOARD_PREFERENCES_COOKIE_KEY + "=" + encodeURIComponent(JSON.stringify({
+      v: 1,
+      h: 99,
+      p: "not-a-price-filter",
+      q: "x".repeat(250),
+      s: 999,
+      c: ["SkillGem", "", 42],
+    }));
+    const restored = loadDashboardPreferences();
+    globalThis.__result = {
+      restored,
+      horizon: els.horizonSelect.value,
+      priceRange: state.priceRange,
+      queryLength: state.query.length,
+      pageSize: state.pageSize,
+      categories: [...state.excludedCategories],
+    };
+  `);
+
+  assert.equal(result.restored, true);
+  assert.equal(result.horizon, "7");
+  assert.equal(result.priceRange, "all");
+  assert.equal(result.queryLength, 200);
+  assert.equal(result.pageSize, 50);
+  assert.deepEqual([...result.categories], ["SkillGem"]);
 });
 
 test("section checklist exposes native keyboard controls and bulk actions", () => {

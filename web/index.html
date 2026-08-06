@@ -217,10 +217,16 @@
           <h2 id="methodTitle">One comparable forecast for every in-scope item.</h2>
           <p>
             The output is a gross price forecast, not a promise of executable
-            profit. Markets below 1 Chaos, assets with a persistent decline
+            profit. Markets below 1 Chaos and assets with a persistent decline
             across broadly covered past leagues, excluded small-consumable
             categories, and base types other than Simplex Amulet and Focused
-            Amulet remain outside this investment universe.
+            Amulet normally remain outside this investment universe.
+            General unique markets enter only when at least three broadly
+            covered leagues show a sufficiently complete first-month history
+            with positive recency-weighted appreciation; the named endgame
+            exceptions remain exempt from this unique-history screen. A unique
+            that passes the first-month screen is not rejected merely because
+            it depreciates later in the league.
             Row titles include the exact visible variant identity, including
             gem state, Forbidden Jewel kind/passive, item level, and links.
           </p>
@@ -259,8 +265,9 @@
             in a local SQLite database for reproducible forecasts. Excluded
             markets such as essences, fossils, and oils, base types other than
             Simplex Amulet and Focused Amulet, sub-1-chaos items, and persistent
-            historical decliners stay archived for fast research; they are
-            simply outside the investment ranking.
+            historical decliners normally stay archived for fast research. Unique
+            markets without broad first-month appreciation evidence are also
+            retained locally, but remain outside the investment ranking.
           </p>
         </div>
         <dl class="archive-stats">
@@ -317,12 +324,16 @@
         Sync stores poe.ninja current overviews locally across all 18 exchange
         and 25 item-overview categories configured by the app, then archives
         exact dated poe.ninja detail histories for every currently ranked
-        identity (up to 2,000).
+        identity (up to 3,000).
         Source item IDs and visible variant fields must match; each dated price
         uses a direct same-day Divine/Chaos observation. Storage is deliberately
         broader than the investment universe, so excluded low-end consumables,
         non-whitelisted base types, sub-1-chaos items, and persistent past-league
-        decliners remain available for research. GGG’s passive-tree export and
+        decliners remain available for research. General uniques are admitted
+        only when their exact market has adequate days 1–30 coverage in at
+        least three broad leagues and its recency-weighted late-month median is
+        above its launch-week median; those qualifying uniques are exempt from
+        the generic later-life decline veto. GGG’s passive-tree export and
         build samples are metadata,
         not alternative price sources. The official Currency Exchange backfill
         is a separate research archive and cannot enter a forecast curve.

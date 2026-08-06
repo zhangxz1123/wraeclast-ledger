@@ -7,6 +7,7 @@ from unittest.mock import Mock, patch
 
 from poe_advisor.__main__ import build_parser
 from poe_advisor.automation import run_daily_update
+from poe_advisor.sync import CURRENT_HISTORY_MAX_ITEMS
 
 
 class DailyAutomationTests(unittest.TestCase):
@@ -20,7 +21,7 @@ class DailyAutomationTests(unittest.TestCase):
         )
         self.assertEqual(
             parser.parse_args(["daily-update"]).current_history_items,
-            2000,
+            CURRENT_HISTORY_MAX_ITEMS,
         )
 
     def test_scheduled_workflow_defaults_hourly_audit_backfill_off(self) -> None:
@@ -35,7 +36,7 @@ class DailyAutomationTests(unittest.TestCase):
         self.assertIn('- "0"', workflow)
         self.assertIn("inputs.history_hours || '0'", workflow)
         self.assertNotIn("inputs.history_hours || '168'", workflow)
-        self.assertIn("inputs.current_history_items || '2000'", workflow)
+        self.assertIn("inputs.current_history_items || '3000'", workflow)
 
     def test_complete_refresh_runs_curves_history_and_final_model(self) -> None:
         league = SimpleNamespace(id="Live", is_demo=False)

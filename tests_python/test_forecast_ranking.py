@@ -160,6 +160,61 @@ class ForecastRankingTests(unittest.TestCase):
                 )
         self.storage.upsert_seasonal_prices(rows)
 
+    def add_first_month_curve(
+        self,
+        key: str,
+        name: str,
+        league_id: str,
+        *,
+        early_value: float,
+        late_value: float,
+        category: str = "UniqueAccessory",
+        days: range = range(1, 31),
+    ) -> None:
+        spec = next(
+            value
+            for value in COMPLETED_LEAGUES
+            if value.league_id == league_id
+        )
+        self.storage.upsert_historical_assets(
+            [
+                {
+                    "source": "poe.ninja-history",
+                    "source_item_id": key,
+                    "item_key": key,
+                    "name": name,
+                    "category": category,
+                    "eligible": True,
+                }
+            ]
+        )
+        start = datetime.fromisoformat(spec.start_at.replace("Z", "+00:00"))
+        league_days = list(days)
+        first_day = min(league_days)
+        day_span = max(1, max(league_days) - first_day)
+        self.storage.upsert_seasonal_prices(
+            [
+                {
+                    "league_id": league_id,
+                    "item_key": key,
+                    "source": "poe.ninja-history",
+                    "source_item_id": key,
+                    "league_day": league_day,
+                    "observed_at": iso_utc(
+                        start + timedelta(days=league_day - 1)
+                    ),
+                    "divine_value": (
+                        early_value
+                        + (late_value - early_value)
+                        * (league_day - first_day)
+                        / day_span
+                    ),
+                    "confidence": 0.9,
+                }
+                for league_day in days
+            ]
+        )
+
     def test_only_broad_leagues_contribute_and_sparse_history_is_not_gated(
         self,
     ) -> None:
@@ -916,8 +971,10 @@ class ForecastRankingTests(unittest.TestCase):
         )
         self.assertIn(
             (
-                "Unique* (except 1-/3-passive Voices and the aggregate "
-                "Sublime Vision, The Adorned, and Watcher's Eye markets)"
+                "Unique* without a broadly covered first-month appreciation "
+                "pattern (1-/3-passive Voices and the aggregate Sublime "
+                "Vision, The Adorned, and Watcher's Eye markets remain "
+                "explicit exceptions)"
             ),
             payload["investment_scope"]["excluded_categories"],
         )
@@ -963,6 +1020,168 @@ class ForecastRankingTests(unittest.TestCase):
                 "not the price of a specific roll",
                 row["market_scope_caveat"],
             )
+
+    def test_only_broadly_supported_first_month_appreciating_uniques_enter(
+        self,
+    ) -> None:
+        rising_key = "uniqueaccessory:rising-fixture"
+        declining_key = "uniqueaccessory:declining-fixture"
+        partial_key = "uniqueaccessory:partial-fixture"
+        two_league_key = "uniqueaccessory:two-league-fixture"
+        voices_key = "uniquejewel:voices-5-passives"
+        decline_control_key = "currency:rising-then-declining-control"
+        for key, name, category, details in (
+            (rising_key, "Rising Fixture", "UniqueAccessory", None),
+            (declining_key, "Declining Fixture", "UniqueAccessory", None),
+            (partial_key, "Partial Fixture", "UniqueAccessory", None),
+            (two_league_key, "Two League Fixture", "UniqueAccessory", None),
+            (
+                voices_key,
+                "Voices",
+                "UniqueJewel",
+                {"variant": "5 passives"},
+            ),
+        ):
+            self.add_current(
+                key,
+                name,
+                [1.0],
+                category=category,
+                details=details,
+            )
+        self.add_current(
+            decline_control_key,
+            "Rising Then Declining Control",
+            [1.0],
+            category="Currency",
+        )
+
+        for league_id in ("Mercenaries", "Keepers", "Mirage"):
+            self.add_first_month_curve(
+                rising_key,
+                "Rising Fixture",
+                league_id,
+                early_value=1.0,
+                late_value=2.0,
+            )
+            # The item falls later in the league strongly enough to satisfy
+            # the generic 120-day decline classifier. Its requested opening-
+            # month appreciation signal must nevertheless remain trackable.
+            self.add_first_month_curve(
+                rising_key,
+                "Rising Fixture",
+                league_id,
+                early_value=2.0,
+                late_value=0.05,
+                days=range(31, 121),
+            )
+            self.add_first_month_curve(
+                decline_control_key,
+                "Rising Then Declining Control",
+                league_id,
+                early_value=1.0,
+                late_value=2.0,
+                category="Currency",
+            )
+            self.add_first_month_curve(
+                decline_control_key,
+                "Rising Then Declining Control",
+                league_id,
+                early_value=2.0,
+                late_value=0.05,
+                category="Currency",
+                days=range(31, 121),
+            )
+            self.add_first_month_curve(
+                partial_key,
+                "Partial Fixture",
+                league_id,
+                early_value=1.0,
+                late_value=2.0,
+                days=range(1, 8),
+            )
+            self.add_first_month_curve(
+                voices_key,
+                "Voices",
+                league_id,
+                early_value=1.0,
+                late_value=2.0,
+                category="UniqueJewel",
+            )
+        for league_id in (
+            "Settlers",
+            "Mercenaries",
+            "Keepers",
+            "Mirage",
+        ):
+            self.add_first_month_curve(
+                declining_key,
+                "Declining Fixture",
+                league_id,
+                early_value=2.0,
+                late_value=1.0,
+            )
+        for league_id in ("Keepers", "Mirage"):
+            self.add_first_month_curve(
+                two_league_key,
+                "Two League Fixture",
+                league_id,
+                early_value=1.0,
+                late_value=2.0,
+            )
+
+        # Named endgame exceptions remain included without historical gates.
+        self.add_current(
+            "uniquejewel:sublime-vision",
+            "Sublime Vision",
+            [2.0],
+            category="UniqueJewel",
+        )
+
+        payload = RecommendationEngine(self.storage).generate(
+            self.live,
+            horizon=7,
+            persist=False,
+        )
+
+        rows_by_name = {row["name"]: row for row in payload["rankings"]}
+        self.assertIn("Rising Fixture", rows_by_name)
+        self.assertIn("Sublime Vision", rows_by_name)
+        self.assertNotIn("Declining Fixture", rows_by_name)
+        self.assertNotIn("Partial Fixture", rows_by_name)
+        self.assertNotIn("Two League Fixture", rows_by_name)
+        self.assertNotIn("Rising Then Declining Control", rows_by_name)
+        # Historical appreciation must not bypass exact Voices variants.
+        self.assertNotIn("Voices", rows_by_name)
+
+        rising = rows_by_name["Rising Fixture"]
+        self.assertEqual(
+            rising["market_scope_code"],
+            "historical_first_month_appreciator",
+        )
+        self.assertIn("first-month", rising["market_scope_label"])
+        scope = payload["investment_scope"]
+        self.assertEqual(scope["historically_appreciating_unique_items"], 1)
+        self.assertNotIn(
+            rising_key,
+            {
+                row["key"]
+                for row in scope["automatic_decline_vetoes"]
+            },
+        )
+        self.assertIn(
+            decline_control_key,
+            {
+                row["key"]
+                for row in scope["automatic_decline_vetoes"]
+            },
+        )
+        model = scope["unique_appreciation_model"]
+        self.assertEqual(model["maximum_league_day"], 30)
+        self.assertEqual(model["early_window_days"], [1, 7])
+        self.assertEqual(model["late_window_days"], [24, 30])
+        self.assertEqual(model["minimum_sample_leagues"], 3)
+        self.assertEqual(model["missing_or_partial_history"], "excluded")
 
     def test_item_level_variants_have_distinct_full_identity(self) -> None:
         self.add_current(

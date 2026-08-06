@@ -37,7 +37,7 @@ on:
       current_history_items:
         description: Ranked current-league item curves to refresh
         required: true
-        default: "2000"
+        default: "3000"
         type: choice
         options:
           - "0"
@@ -45,6 +45,7 @@ on:
           - "100"
           - "200"
           - "2000"
+          - "3000"
   schedule:
     - cron: "23 9 * * *"
       timezone: "America/Los_Angeles"
@@ -138,7 +139,7 @@ jobs:
           POE_ADVISOR_COMPACT_HISTORY: "1"
           HISTORY_HOURS: ${{ inputs.history_hours || '0' }}
           SEASONAL_ITEMS: ${{ inputs.seasonal_items || '20' }}
-          CURRENT_HISTORY_ITEMS: ${{ inputs.current_history_items || '2000' }}
+          CURRENT_HISTORY_ITEMS: ${{ inputs.current_history_items || '3000' }}
           POE_OAUTH_TOKEN: ${{ secrets.POE_OAUTH_TOKEN }}
         run: >-
           python -B -m poe_advisor

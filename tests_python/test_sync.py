@@ -1091,6 +1091,30 @@ class SyncServiceTests(unittest.TestCase):
             any("exceeded" in warning for warning in summary["warnings"])
         )
 
+    def test_ranked_current_history_zero_limit_disables_requests(self) -> None:
+        service = self.service()
+        result = service.sync(backfill_hours=0)
+        self.assertTrue(result["ok"])
+        league = self.storage.get_current_league()
+        assert league is not None
+        history_calls_before = list(service.poe_ninja.history_calls)
+
+        summary = service.sync_current_item_histories(
+            league,
+            ["missing:a", "missing:b"],
+            max_items=0,
+        )
+
+        self.assertEqual(summary["status"], "success")
+        self.assertEqual(summary["requested_items"], 0)
+        self.assertEqual(summary["input_items"], 2)
+        self.assertEqual(summary["omitted_items"], 2)
+        self.assertEqual(
+            summary["message"],
+            "No ranked item histories were requested.",
+        )
+        self.assertEqual(service.poe_ninja.history_calls, history_calls_before)
+
     def test_exchange_history_recovers_identity_from_canonical_item_key(self) -> None:
         service = self.service()
         result = service.sync(backfill_hours=0)

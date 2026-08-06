@@ -199,6 +199,22 @@ DECLINE_MAXIMUM_EARLY_LATE_RATIO = 0.80
 DECLINE_MINIMUM_LEAGUE_VOTES = 2
 DECLINE_MINIMUM_WEIGHTED_SUPPORT = 0.65
 
+# A general unique market enters the tracker only when its exact poe.ninja
+# identity has a repeatable first-month appreciation profile in the broadly
+# covered completed leagues.  Endpoint prices are noisy, so each league uses
+# the median of the launch week and the median of days 24-30.  Requiring at
+# least half of the first month's daily bars, coverage in both windows, three
+# comparable leagues, and both ordinary and recency-weighted majority support
+# makes missing or thin history fail closed.
+UNIQUE_APPRECIATION_MAXIMUM_DAY = 30
+UNIQUE_APPRECIATION_EARLY_LAST_DAY = 7
+UNIQUE_APPRECIATION_LATE_FIRST_DAY = 24
+UNIQUE_APPRECIATION_MINIMUM_DAILY_POINTS = 15
+UNIQUE_APPRECIATION_MINIMUM_WINDOW_POINTS = 2
+UNIQUE_APPRECIATION_MINIMUM_SAMPLE_LEAGUES = 3
+UNIQUE_APPRECIATION_MINIMUM_POSITIVE_FRACTION = 0.60
+UNIQUE_APPRECIATION_MINIMUM_WEIGHTED_SUPPORT = 0.60
+
 # These markets remain in the local archive for research and fast queries, but
 # they are intentionally outside the investment ranking. Their repeatable
 # supply and tiny unit values make them better suited to bulk arbitrage than
@@ -220,8 +236,10 @@ _EXCLUDED_INVESTMENT_CATEGORY_KEYS = frozenset(
 )
 
 # Every poe.ninja market whose normalized category starts with ``Unique`` is
-# archived but omitted from the investment list. Forbidden jewels are exposed
-# by poe.ninja as ``ForbiddenJewel``, so they deliberately remain investable.
+# archived. General uniques enter the tracker only after passing the
+# first-month appreciation rule; the explicit endgame exceptions below remain
+# investable without that history. Forbidden jewels are exposed by poe.ninja
+# as ``ForbiddenJewel``, so they deliberately remain investable.
 EXCLUDED_INVESTMENT_CATEGORY_PREFIXES = ("Unique",)
 _EXCLUDED_INVESTMENT_CATEGORY_PREFIX_KEYS = tuple(
     re.sub(r"[^a-z0-9]+", "", value.casefold())
@@ -272,8 +290,9 @@ _AGGREGATE_ROLL_UNRESOLVED_UNIQUE_KEYS = frozenset(
 INVESTMENT_UNIVERSE_CATEGORY_FILTERS = (
     *EXCLUDED_INVESTMENT_CATEGORIES,
     (
-        "Unique* (except 1-/3-passive Voices and the aggregate Sublime "
-        "Vision, The Adorned, and Watcher's Eye markets)"
+        "Unique* without a broadly covered first-month appreciation pattern "
+        "(1-/3-passive Voices and the aggregate Sublime Vision, The Adorned, "
+        "and Watcher's Eye markets remain explicit exceptions)"
     ),
     "SkillGem (except names beginning with 'Awakened ')",
     "BaseType (except Simplex Amulet and Focused Amulet)",
@@ -326,12 +345,18 @@ def _normalized_asset_token(value: str) -> str:
 def _unique_item_is_investable(
     name: str,
     details: dict[str, Any] | None = None,
+    *,
+    historical_appreciation: bool = False,
 ) -> bool:
-    """Return exact-name unique exceptions with verified Voices identity."""
+    """Return permitted unique markets without weakening Voices identity."""
 
     name_key = _normalized_asset_token(name)
     if name_key not in _UNIQUE_INVESTMENT_WHITELIST_KEYS:
-        return False
+        # Display-name suffixes such as ``Voices (3 passives)`` are not a
+        # substitute for poe.ninja's exact variant/detailsId identity.
+        if name_key.startswith(_VOICES_NAME_KEY):
+            return False
+        return historical_appreciation
     if name_key != _VOICES_NAME_KEY:
         # The overview exposes these three names only as aggregate markets;
         # ranking rows carry an explicit unresolved-roll caveat below.
@@ -411,6 +436,8 @@ def _item_is_excluded(
     category: str,
     name: str,
     details: dict[str, Any] | None = None,
+    *,
+    historical_unique_appreciation: bool = False,
 ) -> bool:
     """Return whether an archived market is outside the ranked universe."""
 
@@ -426,12 +453,24 @@ def _item_is_excluded(
         category_token.startswith(prefix)
         for prefix in _EXCLUDED_INVESTMENT_CATEGORY_PREFIX_KEYS
     ):
-        return not _unique_item_is_investable(name, details)
+        return not _unique_item_is_investable(
+            name,
+            details,
+            historical_appreciation=historical_unique_appreciation,
+        )
     return (
         category_token == "skillgem"
         and not name.casefold().startswith(
             AWAKENED_GEM_NAME_PREFIX.casefold()
         )
+    )
+
+
+def _is_unique_category(category: str) -> bool:
+    category_token = _normalized_asset_token(category)
+    return any(
+        category_token.startswith(prefix)
+        for prefix in _EXCLUDED_INVESTMENT_CATEGORY_PREFIX_KEYS
     )
 
 
@@ -512,6 +551,138 @@ def _weighted_median(
         if cumulative >= midpoint:
             return value
     return eligible[-1][0]
+
+
+def _historical_unique_appreciation_assessments(
+    rows: list[dict[str, Any]],
+    *,
+    league_weights: dict[str, float],
+) -> dict[str, dict[str, Any]]:
+    """Classify exact unique markets by broad-league first-month gains.
+
+    For each league, the launch-week median is compared with the median for
+    days 24-30.  A market passes only when at least three leagues have dense
+    enough observations, at least 60% of those leagues appreciate, at least
+    60% of their available recency weight supports appreciation, and their
+    recency-weighted geometric gain is positive.
+    """
+
+    grouped: defaultdict[
+        str, defaultdict[str, dict[int, float]]
+    ] = defaultdict(lambda: defaultdict(dict))
+    for row in rows:
+        item_key = str(row.get("item_key") or "").strip()
+        league_id = str(row.get("league_id") or "").strip()
+        try:
+            league_day = int(row.get("league_day") or 0)
+            price = float(row.get("divine_value") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if (
+            not item_key
+            or league_id not in league_weights
+            or league_day < 1
+            or league_day > UNIQUE_APPRECIATION_MAXIMUM_DAY
+            or not math.isfinite(price)
+            or price <= 0
+        ):
+            continue
+        grouped[item_key][league_id][league_day] = price
+
+    assessments: dict[str, dict[str, Any]] = {}
+    for item_key, league_points in grouped.items():
+        profiles: list[dict[str, Any]] = []
+        for league_id, prices_by_day in league_points.items():
+            early_prices = [
+                price
+                for day, price in prices_by_day.items()
+                if day <= UNIQUE_APPRECIATION_EARLY_LAST_DAY
+            ]
+            late_prices = [
+                price
+                for day, price in prices_by_day.items()
+                if day >= UNIQUE_APPRECIATION_LATE_FIRST_DAY
+            ]
+            if (
+                len(prices_by_day)
+                < UNIQUE_APPRECIATION_MINIMUM_DAILY_POINTS
+                or len(early_prices)
+                < UNIQUE_APPRECIATION_MINIMUM_WINDOW_POINTS
+                or len(late_prices)
+                < UNIQUE_APPRECIATION_MINIMUM_WINDOW_POINTS
+            ):
+                continue
+            early_price = statistics.median(early_prices)
+            late_price = statistics.median(late_prices)
+            log_gain = math.log(late_price / early_price)
+            profiles.append(
+                {
+                    "league_id": league_id,
+                    "observed_days": len(prices_by_day),
+                    "early_price_divine": early_price,
+                    "late_price_divine": late_price,
+                    "gain": math.expm1(log_gain),
+                    "log_gain": log_gain,
+                    "appreciates": log_gain > 0.0,
+                    "weight": float(league_weights[league_id]),
+                }
+            )
+
+        profiles.sort(
+            key=lambda profile: (
+                -float(profile["weight"]),
+                str(profile["league_id"]),
+            )
+        )
+        total_weight = sum(float(profile["weight"]) for profile in profiles)
+        positive_profiles = [
+            profile for profile in profiles if profile["appreciates"]
+        ]
+        positive_weight = sum(
+            float(profile["weight"]) for profile in positive_profiles
+        )
+        weighted_support = (
+            positive_weight / total_weight if total_weight > 0 else 0.0
+        )
+        positive_fraction = (
+            len(positive_profiles) / len(profiles) if profiles else 0.0
+        )
+        weighted_log_gain = (
+            sum(
+                float(profile["log_gain"]) * float(profile["weight"])
+                for profile in profiles
+            )
+            / total_weight
+            if total_weight > 0
+            else None
+        )
+        weighted_gain = (
+            math.expm1(weighted_log_gain)
+            if weighted_log_gain is not None
+            else None
+        )
+        qualifies = (
+            len(profiles) >= UNIQUE_APPRECIATION_MINIMUM_SAMPLE_LEAGUES
+            and positive_fraction
+            >= UNIQUE_APPRECIATION_MINIMUM_POSITIVE_FRACTION
+            and weighted_support
+            >= UNIQUE_APPRECIATION_MINIMUM_WEIGHTED_SUPPORT
+            and weighted_gain is not None
+            and weighted_gain > 0.0
+        )
+        assessments[item_key] = {
+            "qualifies": qualifies,
+            "sample_leagues": len(profiles),
+            "positive_leagues": [
+                str(profile["league_id"])
+                for profile in positive_profiles
+            ],
+            "positive_fraction": positive_fraction,
+            "weighted_support": weighted_support,
+            "weighted_first_month_gain": weighted_gain,
+            "profiles": profiles,
+        }
+    return assessments
 
 
 def _historical_decline_assessments(
@@ -1962,6 +2133,8 @@ class RecommendationEngine:
         sub-chaos markets, unresolved source identifiers, and assets with a
         persistent completed-league decline lifecycle are omitted before the
         remaining exact variants are ranked by their selected forecast.
+        General uniques admitted by the explicit first-month appreciation
+        screen are exempt from the generic later-life decline classifier.
         """
 
         selected_horizon = (
@@ -1992,6 +2165,56 @@ class RecommendationEngine:
             spec.league_id: SeasonalModel.RECENCY_DECAY_PER_LEAGUE**index
             for index, spec in enumerate(newest_first)
         }
+
+        # General uniques fail closed until their exact current item key has a
+        # sufficiently complete, repeatable first-month appreciation pattern.
+        # The named endgame exceptions are handled independently by
+        # ``_unique_item_is_investable`` and therefore do not need history to
+        # remain in the tracker.
+        unique_history_candidate_keys: list[str] = []
+        for item_key, raw_rows in histories.items():
+            rows = _daily_rows(raw_rows)
+            if not rows:
+                continue
+            latest = rows[-1]
+            category = str(latest.get("category") or "")
+            details = (
+                latest.get("details")
+                if isinstance(latest.get("details"), dict)
+                else None
+            )
+            if (
+                _is_unique_category(category)
+                and not _unique_item_is_investable(
+                    str(latest.get("name") or ""),
+                    details,
+                )
+            ):
+                unique_history_candidate_keys.append(item_key)
+
+        unique_appreciation_assessments: dict[str, dict[str, Any]] = {}
+        if unique_history_candidate_keys:
+            # Storage batches the key predicate internally. Keeping this as
+            # one 30-day read avoids reopening SQLite for every small group;
+            # unlike the 120-day decline scan below, the result is bounded.
+            first_month_rows = self.storage.seasonal_lifecycle_rows(
+                unique_history_candidate_keys,
+                BROADLY_COVERED_LEAGUE_IDS,
+                minimum_league_day=1,
+                maximum_league_day=UNIQUE_APPRECIATION_MAXIMUM_DAY,
+                minimum_confidence=HISTORICAL_MODEL_CONFIDENCE_FLOOR,
+                sources=HISTORICAL_PRICE_SOURCES,
+            )
+            unique_appreciation_assessments = (
+                _historical_unique_appreciation_assessments(
+                    first_month_rows, league_weights=raw_league_weight
+                )
+            )
+        appreciating_unique_keys = frozenset(
+            item_key
+            for item_key, assessment in unique_appreciation_assessments.items()
+            if assessment["qualifies"]
+        )
         excluded_category_counts: defaultdict[str, int] = defaultdict(int)
         excluded_low_end_currency_counts: defaultdict[str, int] = (
             defaultdict(int)
@@ -2048,6 +2271,9 @@ class RecommendationEngine:
                     if isinstance(latest.get("details"), dict)
                     else None
                 ),
+                historical_unique_appreciation=(
+                    item_key in appreciating_unique_keys
+                ),
             ):
                 excluded_category_counts[category] += 1
                 continue
@@ -2096,7 +2322,13 @@ class RecommendationEngine:
         # independent, so batches can be reduced and merged without changing
         # the classification result.
         decline_assessments: dict[str, dict[str, Any]] = {}
-        lifecycle_item_keys = sorted(current_items)
+        # A general unique that passed the explicit first-month screen must
+        # remain trackable even if its much later league lifecycle declines.
+        # That later decline does not make its opening month monotonically
+        # decreasing. Explicit known-lifecycle vetoes still run below.
+        lifecycle_item_keys = sorted(
+            set(current_items).difference(appreciating_unique_keys)
+        )
         for offset in range(0, len(lifecycle_item_keys), 250):
             lifecycle_rows = self.storage.seasonal_lifecycle_rows(
                 lifecycle_item_keys[offset : offset + 250],
@@ -2155,6 +2387,9 @@ class RecommendationEngine:
                 )
                 current_items.pop(item_key)
 
+        tracked_appreciating_unique_keys = appreciating_unique_keys.intersection(
+            current_items
+        )
         item_keys = list(current_items)
 
         historical_rows_by_horizon: dict[
@@ -2269,6 +2504,33 @@ class RecommendationEngine:
                 str(latest["name"]),
                 details,
             )
+            unique_appreciation = unique_appreciation_assessments.get(
+                item_key
+            )
+            if (
+                unique_market_scope is None
+                and unique_appreciation is not None
+                and unique_appreciation["qualifies"]
+            ):
+                first_month_gain = float(
+                    unique_appreciation["weighted_first_month_gain"]
+                )
+                sample_leagues = int(
+                    unique_appreciation["sample_leagues"]
+                )
+                unique_market_scope = {
+                    "code": "historical_first_month_appreciator",
+                    "label": (
+                        "Broad-league first-month appreciator "
+                        f"({first_month_gain * 100:+.1f}%)"
+                    ),
+                    "caveat": (
+                        "Included because this exact poe.ninja market's "
+                        "recency-weighted late-week median exceeds its "
+                        f"launch-week median across {sample_leagues} "
+                        "sufficiently covered broad leagues."
+                    ),
+                }
             item_level = _item_level_from_identity(
                 item_key,
                 str(latest["category"]),
@@ -2799,7 +3061,9 @@ class RecommendationEngine:
             "confidence_note": (
                 "Within the investment universe, this is a gross-price "
                 "forecast rather than a pass/fail recommendation. Sub-chaos "
-                "markets and persistent completed-league decliners are omitted. "
+                "markets and persistent completed-league decliners are omitted, "
+                "except general uniques admitted by the explicit first-month "
+                "appreciation screen. "
                 "For each horizon, the model compares today's current-league "
                 "price with the recency-weighted target-day price in Settlers, "
                 "Mercenaries, Keepers, and Mirage. Only poe.ninja historical "
@@ -2861,9 +3125,11 @@ class RecommendationEngine:
                 "universe_filters": [
                     "excluded small-consumable categories",
                     (
-                        "Unique* poe.ninja categories except 1-/3-passive "
-                        "Voices and aggregate Sublime Vision, The Adorned, "
-                        "and Watcher's Eye markets"
+                        "Unique* poe.ninja categories require a sufficiently "
+                        "covered, broadly supported first-month appreciation "
+                        "pattern; exact 1-/3-passive Voices and aggregate "
+                        "Sublime Vision, The Adorned, and Watcher's Eye "
+                        "markets remain explicit exceptions"
                     ),
                     "Valdo maps",
                     "non-Awakened skill gems",
@@ -2872,7 +3138,11 @@ class RecommendationEngine:
                     "current price below one Chaos Orb",
                     "current poe.ninja observation older than one league day",
                     "current item absent from the latest successful or partial poe.ninja sync",
-                    "persistent broad-league structural decline",
+                    (
+                        "persistent broad-league structural decline, except "
+                        "general uniques admitted by the first-month "
+                        "appreciation screen"
+                    ),
                     "unresolved source identity",
                 ],
             },
@@ -2905,6 +3175,47 @@ class RecommendationEngine:
                 ),
                 "excluded_stale_current_items": excluded_stale_current_items,
                 "current_source_verified_at": current_source_verified_at,
+                "historically_appreciating_unique_items": len(
+                    tracked_appreciating_unique_keys
+                ),
+                "unique_appreciation_model": {
+                    "historical_leagues": list(
+                        BROADLY_COVERED_LEAGUE_IDS
+                    ),
+                    "currency": "Divine Orb",
+                    "maximum_league_day": (
+                        UNIQUE_APPRECIATION_MAXIMUM_DAY
+                    ),
+                    "early_window_days": [
+                        1,
+                        UNIQUE_APPRECIATION_EARLY_LAST_DAY,
+                    ],
+                    "late_window_days": [
+                        UNIQUE_APPRECIATION_LATE_FIRST_DAY,
+                        UNIQUE_APPRECIATION_MAXIMUM_DAY,
+                    ],
+                    "window_estimator": "median",
+                    "aggregate_gain_estimator": (
+                        "recency-weighted geometric return"
+                    ),
+                    "minimum_daily_points_per_league": (
+                        UNIQUE_APPRECIATION_MINIMUM_DAILY_POINTS
+                    ),
+                    "minimum_points_per_window": (
+                        UNIQUE_APPRECIATION_MINIMUM_WINDOW_POINTS
+                    ),
+                    "minimum_sample_leagues": (
+                        UNIQUE_APPRECIATION_MINIMUM_SAMPLE_LEAGUES
+                    ),
+                    "minimum_positive_league_fraction": (
+                        UNIQUE_APPRECIATION_MINIMUM_POSITIVE_FRACTION
+                    ),
+                    "minimum_recency_weighted_positive_support": (
+                        UNIQUE_APPRECIATION_MINIMUM_WEIGHTED_SUPPORT
+                    ),
+                    "minimum_weighted_first_month_gain": 0.0,
+                    "missing_or_partial_history": "excluded",
+                },
                 "automatic_decline_items": len(automatic_decline_vetoes),
                 "automatic_decline_vetoes": sorted(
                     automatic_decline_vetoes,

@@ -8,10 +8,15 @@ future historical level, blends it with the current-league price curve, and
 produces gross 3, 7, and 14-day gain forecasts. The selected horizon determines
 the global order shown across paginated results. The archive is intentionally
 broad, while excluded small-consumable categories, sub-1-chaos markets, and
-persistent completed-league decliners remain outside the displayed investment
-universe. Base types other than Simplex Amulet and Focused Amulet, unique-item
-categories, Valdo maps, and non-Awakened skill gems are also archived but
-omitted from rankings. The unique-item exceptions are
+persistent completed-league decliners normally remain outside the displayed
+investment universe. General uniques that pass the explicit first-month screen
+are exempt from that later-life decline veto. Base types other than Simplex
+Amulet and Focused Amulet, unique-item
+categories without a sufficiently covered, broadly supported first-month
+appreciation pattern, Valdo maps, and non-Awakened skill gems are also archived
+but omitted from rankings. The unique-item screen compares launch-week and
+days 24–30 medians in at least three broadly covered leagues, with newer
+leagues weighted more heavily. The unique-item exceptions to this screen are
 one- and three-passive Voices, Sublime Vision, The Adorned, and Watcher's Eye;
 Awakened gems and the separately categorized Forbidden Jewel market also
 remain visible. The latter three use aggregate poe.ninja markets and are
@@ -75,7 +80,7 @@ the local API or a raw copy of the local SQLite database. The included
 1. Restores the most recent sanitized, compressed market database from the
    `market-archive` GitHub Release.
 2. Runs the full unattended refresh: poe.ninja current overviews, exact
-   dated detail histories for every currently ranked identity (up to 2,000),
+   dated detail histories for every currently ranked identity (up to 3,000),
    optional build composition, any not-yet-imported broad-league official
    dumps, and the recommendation model.
 3. Exports a lightweight all-item search/filter index, small content-hashed

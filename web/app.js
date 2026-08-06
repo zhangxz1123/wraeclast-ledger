@@ -455,6 +455,10 @@ const FORECAST_HORIZONS = [3, 7, 14];
 const BROAD_LEAGUES = ["Mirage", "Keepers", "Mercenaries", "Settlers"];
 const HIDDEN_ITEMS_STORAGE_KEY = "wraeclast-ledger.hidden-items.v1";
 const CATEGORY_EXCLUSIONS_STORAGE_KEY = "wraeclast-ledger.excluded-categories.v1";
+const DASHBOARD_PREFERENCES_COOKIE_KEY = "wraeclast_ledger_preferences_v1";
+const DASHBOARD_PREFERENCES_MAX_AGE = 60 * 60 * 24 * 365;
+const DASHBOARD_PAGE_SIZES = [25, 50, 100];
+const MAX_SAVED_QUERY_LENGTH = 200;
 const PRICE_THRESHOLDS = {
   "10c-plus": { field: "priceChaos", minimum: 10 },
   "1d-plus": { field: "priceDivine", minimum: 1 },
@@ -487,6 +491,105 @@ const BROAD_LEAGUE_ALIASES = new Map([
   ["settlers", "Settlers"],
   ["settlers of kalguur", "Settlers"],
 ]);
+
+function dashboardCookieValue() {
+  const prefix = `${DASHBOARD_PREFERENCES_COOKIE_KEY}=`;
+  const entry = String(document.cookie || "")
+    .split(";")
+    .map((part) => part.trim())
+    .find((part) => part.startsWith(prefix));
+  return entry ? entry.slice(prefix.length) : null;
+}
+
+function dashboardCookiePath() {
+  try {
+    const pathname = new URL(document.baseURI).pathname || "/";
+    if (pathname.endsWith("/")) return pathname;
+    const directory = pathname.slice(0, pathname.lastIndexOf("/") + 1);
+    return directory || "/";
+  } catch {
+    return "/";
+  }
+}
+
+function saveDashboardPreferences() {
+  const preferences = {
+    v: 1,
+    h: FORECAST_HORIZONS.includes(toNumber(els.horizonSelect?.value, 7))
+      ? toNumber(els.horizonSelect.value, 7)
+      : 7,
+    p: state.priceRange === "all" || PRICE_THRESHOLDS[state.priceRange]
+      ? state.priceRange
+      : "all",
+    q: String(state.query || "").slice(0, MAX_SAVED_QUERY_LENGTH),
+    s: DASHBOARD_PAGE_SIZES.includes(toNumber(state.pageSize, 50))
+      ? toNumber(state.pageSize, 50)
+      : 50,
+    c: [...state.excludedCategories]
+      .filter((category) => typeof category === "string" && category.trim())
+      .map((category) => category.trim())
+      .sort(),
+  };
+
+  try {
+    const encoded = encodeURIComponent(JSON.stringify(preferences));
+    // Keep comfortably below the per-cookie limit. The dashboard has only a
+    // few dozen categories, so exceeding this means the value is malformed.
+    if (encoded.length > 3500) return false;
+    const secure = new URL(document.baseURI).protocol === "https:"
+      ? "; Secure"
+      : "";
+    document.cookie = (
+      `${DASHBOARD_PREFERENCES_COOKIE_KEY}=${encoded}`
+      + `; Max-Age=${DASHBOARD_PREFERENCES_MAX_AGE}`
+      + `; Path=${dashboardCookiePath()}`
+      + "; SameSite=Lax"
+      + secure
+    );
+    return dashboardCookieValue() === encoded;
+  } catch {
+    return false;
+  }
+}
+
+function loadDashboardPreferences() {
+  try {
+    const encoded = dashboardCookieValue();
+    if (!encoded) return false;
+    const preferences = JSON.parse(decodeURIComponent(encoded));
+    if (!preferences || preferences.v !== 1) return false;
+
+    const horizon = toNumber(preferences.h, 7);
+    const priceRange = String(preferences.p || "all");
+    const pageSize = toNumber(preferences.s, 50);
+    const query = typeof preferences.q === "string"
+      ? preferences.q.slice(0, MAX_SAVED_QUERY_LENGTH)
+      : "";
+    const excludedCategories = Array.isArray(preferences.c)
+      ? preferences.c
+        .filter((category) => typeof category === "string")
+        .map((category) => category.trim())
+        .filter(Boolean)
+      : [];
+
+    els.horizonSelect.value = String(
+      FORECAST_HORIZONS.includes(horizon) ? horizon : 7,
+    );
+    state.priceRange = priceRange === "all" || PRICE_THRESHOLDS[priceRange]
+      ? priceRange
+      : "all";
+    state.query = query;
+    state.pageSize = DASHBOARD_PAGE_SIZES.includes(pageSize) ? pageSize : 50;
+    state.excludedCategories = new Set(excludedCategories);
+
+    if (els.priceRangeFilter) els.priceRangeFilter.value = state.priceRange;
+    if (els.searchInput) els.searchInput.value = state.query;
+    if (els.pageSizeSelect) els.pageSizeSelect.value = String(state.pageSize);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 function loadHiddenItems() {
   try {
@@ -543,15 +646,17 @@ function loadCategoryExclusions() {
 }
 
 function saveCategoryExclusions() {
+  let localStorageSaved = false;
   try {
     window.localStorage.setItem(
       CATEGORY_EXCLUSIONS_STORAGE_KEY,
       JSON.stringify([...state.excludedCategories].sort()),
     );
-    return true;
+    localStorageSaved = true;
   } catch {
-    return false;
+    // The preference cookie remains a fallback when local storage is blocked.
   }
+  return saveDashboardPreferences() || localStorageSaved;
 }
 
 function categoryLabel(category) {
@@ -1116,7 +1221,7 @@ function renderRankingSummary() {
     ? ` ${compact(excludedCategoryCount)} item ${excludedCategoryCount === 1 ? "section is" : "sections are"} excluded on this device.`
     : "";
   els.modelNote.textContent = returned
-    ? `${showing}, sorted by gross ${horizon}-day expected gain.${hiddenNote}${categoryNote} Forecasts use poe.ninja Medium/High observations from Mirage, Keepers, Mercenaries, and Settlers; comparison charts also show exact Low-confidence rows as non-forecast context. Forecast curves use one exact point per UTC league day; optional GGG hourly audit rows never enter them. Base types other than Simplex Amulet and Focused Amulet, unique items (except 1-/3-passive Voices and roll-unresolved Sublime Vision, The Adorned, and Watcher's Eye markets), Valdo maps, and non-Awakened gems are archived but omitted from this investment list.${excludedItems ? ` ${compact(excludedItems)} archived markets are omitted by category, the 1c floor, or the persistent-decline rule.` : ""}`
+    ? `${showing}, sorted by gross ${horizon}-day expected gain.${hiddenNote}${categoryNote} Forecasts use poe.ninja Medium/High observations from Mirage, Keepers, Mercenaries, and Settlers; comparison charts also show exact Low-confidence rows as non-forecast context. Forecast curves use one exact point per league-day window; optional GGG hourly audit rows never enter them. Base types other than Simplex Amulet and Focused Amulet, general uniques without sufficiently covered and broadly supported first-month appreciation, Valdo maps, and non-Awakened gems are archived but omitted. Exact 1-/3-passive Voices and roll-unresolved Sublime Vision, The Adorned, and Watcher's Eye remain exceptions to the unique-history screen; qualified first-month uniques are not rejected for later-life depreciation.${excludedItems ? ` ${compact(excludedItems)} archived markets are omitted by an investment-universe screen, the 1c floor, or the applicable persistent-decline rule.` : ""}`
     : `No item forecast is available yet. Build the broad-league archive, then sync again.`;
 }
 
@@ -2049,7 +2154,10 @@ const renderSearchResults = debounce(() => {
 
 els.syncButton.addEventListener("click", syncMarket);
 els.historyButton.addEventListener("click", syncHistory);
-els.horizonSelect.addEventListener("change", () => loadRecommendations());
+els.horizonSelect.addEventListener("change", () => {
+  saveDashboardPreferences();
+  loadRecommendations();
+});
 els.categoryChecklist?.addEventListener("change", (event) => {
   const index = Number(event.target?.dataset?.categoryIndex);
   const category = Number.isInteger(index) ? state.availableCategories[index] : null;
@@ -2061,12 +2169,14 @@ els.excludeAllCategoriesButton?.addEventListener("click", excludeAllCategories);
 els.priceRangeFilter?.addEventListener("change", (event) => {
   state.priceRange = event.target.value;
   state.page = 1;
+  saveDashboardPreferences();
   renderRankingSummary();
   renderRecommendations();
 });
 els.searchInput.addEventListener("input", (event) => {
   state.query = event.target.value;
   state.page = 1;
+  saveDashboardPreferences();
   renderSearchResults();
 });
 els.resetHiddenItemsButton?.addEventListener("click", resetHiddenItems);
@@ -2083,6 +2193,7 @@ els.nextPageButton?.addEventListener("click", () => {
 els.pageSizeSelect?.addEventListener("change", (event) => {
   state.pageSize = Math.max(1, toNumber(event.target.value, 50));
   state.page = 1;
+  saveDashboardPreferences();
   renderRecommendations();
 });
 els.detailClose.addEventListener("click", () => els.detailDialog.close());
@@ -2105,6 +2216,7 @@ window.addEventListener("storage", (event) => {
   } else {
     loadCategoryExclusions();
     renderCategoryOptions();
+    saveDashboardPreferences();
   }
   renderRankingSummary();
   renderRecommendations();
@@ -2128,7 +2240,10 @@ function configureRuntimeUi() {
   els.settingsIntro.textContent = (
     "This read-only snapshot is generated from the complete market archive by "
     + "a scheduled GitHub workflow. Open the update workflow to request a "
-    + "manual refresh; no GitHub credential is stored in this page."
+    + "manual refresh; no GitHub credential is stored in this page. Up to "
+    + "3,000 ranked detail histories are refreshed. General uniques enter "
+    + "only after a sufficiently covered, recency-weighted first-month "
+    + "appreciation pattern across at least three broad leagues."
   );
   const loadingTitle = els.recommendationList.querySelector(
     ".loading-state strong",
@@ -2146,7 +2261,10 @@ function configureRuntimeUi() {
 
 async function initialize() {
   loadHiddenItems();
-  loadCategoryExclusions();
+  if (!loadDashboardPreferences()) {
+    loadCategoryExclusions();
+    saveDashboardPreferences();
+  }
   try {
     await discoverRuntime();
   } catch (error) {

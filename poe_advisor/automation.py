@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from .server import AdvisorApplication
+from .sync import CURRENT_HISTORY_MAX_ITEMS
 
 
 def run_daily_update(
@@ -12,7 +13,7 @@ def run_daily_update(
     web_dir: str | Path,
     history_hours: int = 0,
     seasonal_items: int = 20,
-    current_history_items: int = 2_000,
+    current_history_items: int = CURRENT_HISTORY_MAX_ITEMS,
 ) -> dict[str, Any]:
     """Run the same durable refresh stages used by the interactive dashboard."""
 
@@ -20,8 +21,11 @@ def run_daily_update(
         raise ValueError("history_hours must be between 0 and 336")
     if not 0 <= int(seasonal_items) <= 2000:
         raise ValueError("seasonal_items must be between 0 and 2000")
-    if not 0 <= int(current_history_items) <= 2000:
-        raise ValueError("current_history_items must be between 0 and 2000")
+    if not 0 <= int(current_history_items) <= CURRENT_HISTORY_MAX_ITEMS:
+        raise ValueError(
+            "current_history_items must be between 0 and "
+            f"{CURRENT_HISTORY_MAX_ITEMS}"
+        )
 
     application = AdvisorApplication.create(
         database_path=database_path,

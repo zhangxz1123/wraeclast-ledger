@@ -13,7 +13,7 @@ from .ninja_history import PoeNinjaHistoryService
 from .recommendation import RecommendationEngine
 from .server import create_server
 from .storage import Storage
-from .sync import SyncService
+from .sync import CURRENT_HISTORY_MAX_ITEMS, SyncService
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -90,10 +90,11 @@ def build_parser() -> argparse.ArgumentParser:
     daily_update.add_argument(
         "--current-history-items",
         type=int,
-        default=2000,
+        default=CURRENT_HISTORY_MAX_ITEMS,
         help=(
             "Ranked current-league curves to refresh "
-            "(0-2000; default: all currently ranked markets, up to 2000)."
+            f"(0-{CURRENT_HISTORY_MAX_ITEMS}; default: all currently ranked "
+            f"markets, up to {CURRENT_HISTORY_MAX_ITEMS})."
         ),
     )
 
@@ -258,8 +259,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             parser.error("--history-hours must be between 0 and 336.")
         if not 0 <= args.seasonal_items <= 2000:
             parser.error("--seasonal-items must be between 0 and 2000.")
-        if not 0 <= args.current_history_items <= 2000:
-            parser.error("--current-history-items must be between 0 and 2000.")
+        if not 0 <= args.current_history_items <= CURRENT_HISTORY_MAX_ITEMS:
+            parser.error(
+                "--current-history-items must be between 0 and "
+                f"{CURRENT_HISTORY_MAX_ITEMS}."
+            )
         from .automation import run_daily_update
 
         result = run_daily_update(
