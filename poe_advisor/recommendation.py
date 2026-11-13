@@ -94,6 +94,7 @@ def _phase_prior(phase: str, category: str) -> float:
             "currency": 0.08,
             "essence": 0.09,
             "scarab": -0.02,
+            "thread": -0.02,
             "divinationcard": -0.04,
         },
         "early": {
@@ -107,6 +108,7 @@ def _phase_prior(phase: str, category: str) -> float:
             "essence": 0.04,
             "fragment": 0.06,
             "scarab": 0.06,
+            "thread": 0.06,
             "divinationcard": 0.05,
             "uniquejewel": 0.04,
         },
@@ -153,6 +155,7 @@ def _round_trip_friction(category: str) -> float:
             "essence",
             "fragment",
             "scarab",
+            "thread",
             "fossil",
             "oil",
             "resonator",
@@ -225,6 +228,7 @@ EXCLUDED_INVESTMENT_CATEGORIES = (
     "Oil",
     "Resonator",
     "Scarab",
+    "Thread",
     "DeliriumOrb",
     "Artifact",
     "Incubator",
@@ -3065,8 +3069,8 @@ class RecommendationEngine:
                 "except general uniques admitted by the explicit first-month "
                 "appreciation screen. "
                 "For each horizon, the model compares today's current-league "
-                "price with the recency-weighted target-day price in Settlers, "
-                "Mercenaries, Keepers, and Mirage. Only poe.ninja historical "
+                "price with the recency-weighted target-day price in Mercenaries, "
+                "Keepers, Mirage, and Allflame. Only poe.ninja historical "
                 "observations graded Medium or High (normalized confidence "
                 "at least 0.5) enter that forecast target. The comparison "
                 "chart also plots exact Low-confidence observations as "

@@ -417,7 +417,7 @@ function renderStatus() {
   els.seasonalPriceCount.textContent = compact(status.seasonal.prices);
   els.archiveSize.textContent = bytes(status.database.size);
   els.historyMeta.textContent = status.seasonal.prices
-    ? `${compact(status.seasonal.prices)} league-day bars from ${status.seasonal.leagues} archived leagues; ${compact(status.seasonal.usableFetches)} item/league histories usable (${compact(status.seasonal.completedFetches)} fully direct). Forecasts use Mirage, Keepers, Mercenaries, and Settlers only.`
+    ? `${compact(status.seasonal.prices)} league-day bars from ${status.seasonal.leagues} archived leagues; ${compact(status.seasonal.usableFetches)} item/league histories usable (${compact(status.seasonal.completedFetches)} fully direct). Forecasts use Allflame, Mirage, Keepers, and Mercenaries only.`
     : "No completed-league bars yet. Build the seasonal archive after the first live market sync.";
   els.historyButton.disabled = status.historySyncing || state.historySyncing;
 
@@ -452,7 +452,7 @@ function renderStatus() {
 }
 
 const FORECAST_HORIZONS = [3, 7, 14];
-const BROAD_LEAGUES = ["Mirage", "Keepers", "Mercenaries", "Settlers"];
+const BROAD_LEAGUES = ["Allflame", "Mirage", "Keepers", "Mercenaries"];
 const HIDDEN_ITEMS_STORAGE_KEY = "wraeclast-ledger.hidden-items.v1";
 const CATEGORY_EXCLUSIONS_STORAGE_KEY = "wraeclast-ledger.excluded-categories.v1";
 const DASHBOARD_PREFERENCES_COOKIE_KEY = "wraeclast_ledger_preferences_v1";
@@ -483,13 +483,13 @@ const VOICES_PASSIVE_STAT_ID = "explicit.stat_1085446536";
 const ADORNED_EFFECT_STAT_ID = "explicit.stat_461663422";
 const ADORNED_HIGH_ROLL_MINIMUM = 90;
 const BROAD_LEAGUE_ALIASES = new Map([
+  ["allflame", "Allflame"],
+  ["curse of the allflame", "Allflame"],
   ["mirage", "Mirage"],
   ["keepers", "Keepers"],
   ["keepers of the flame", "Keepers"],
   ["mercenaries", "Mercenaries"],
   ["mercenaries of trarthus", "Mercenaries"],
-  ["settlers", "Settlers"],
-  ["settlers of kalguur", "Settlers"],
 ]);
 
 function dashboardCookieValue() {
@@ -1221,7 +1221,7 @@ function renderRankingSummary() {
     ? ` ${compact(excludedCategoryCount)} item ${excludedCategoryCount === 1 ? "section is" : "sections are"} excluded on this device.`
     : "";
   els.modelNote.textContent = returned
-    ? `${showing}, sorted by gross ${horizon}-day expected gain.${hiddenNote}${categoryNote} Forecasts use poe.ninja Medium/High observations from Mirage, Keepers, Mercenaries, and Settlers; comparison charts also show exact Low-confidence rows as non-forecast context. Forecast curves use one exact point per league-day window; optional GGG hourly audit rows never enter them. Base types other than Simplex Amulet and Focused Amulet, general uniques without sufficiently covered and broadly supported first-month appreciation, Valdo maps, and non-Awakened gems are archived but omitted. Exact 1-/3-passive Voices and roll-unresolved Sublime Vision, The Adorned, and Watcher's Eye remain exceptions to the unique-history screen; qualified first-month uniques are not rejected for later-life depreciation.${excludedItems ? ` ${compact(excludedItems)} archived markets are omitted by an investment-universe screen, the 1c floor, or the applicable persistent-decline rule.` : ""}`
+    ? `${showing}, sorted by gross ${horizon}-day expected gain.${hiddenNote}${categoryNote} Forecasts use poe.ninja Medium/High observations from Allflame, Mirage, Keepers, and Mercenaries; comparison charts also show exact Low-confidence rows as non-forecast context. Forecast curves use one exact point per league-day window; optional GGG hourly audit rows never enter them. Base types other than Simplex Amulet and Focused Amulet, general uniques without sufficiently covered and broadly supported first-month appreciation, Valdo maps, and non-Awakened gems are archived but omitted. Exact 1-/3-passive Voices and roll-unresolved Sublime Vision, The Adorned, and Watcher's Eye remain exceptions to the unique-history screen; qualified first-month uniques are not rejected for later-life depreciation.${excludedItems ? ` ${compact(excludedItems)} archived markets are omitted by an investment-universe screen, the 1c floor, or the applicable persistent-decline rule.` : ""}`
     : `No item forecast is available yet. Build the broad-league archive, then sync again.`;
 }
 
@@ -1455,8 +1455,8 @@ function seasonalComparisonMarkup(rawComparison, itemName) {
     || currentLeague.leagueName
     || "Current league";
   const weightExplanation = recencyDecay == null
-    ? "Only Mirage, Keepers, Mercenaries, and Settlers contribute; newer broad leagues receive more weight and available weights are normalized to 100%."
-    : `Only Mirage, Keepers, Mercenaries, and Settlers contribute. The newest starts at full weight and each step older receives ${(recencyDecay * 100).toFixed(0)}% of the next newer league's weight; available weights are normalized to 100%.`;
+    ? "Only Allflame, Mirage, Keepers, and Mercenaries contribute; newer broad leagues receive more weight and available weights are normalized to 100%."
+    : `Only Allflame, Mirage, Keepers, and Mercenaries contribute. The newest starts at full weight and each step older receives ${(recencyDecay * 100).toFixed(0)}% of the next newer league's weight; available weights are normalized to 100%.`;
   const windowExplanation = omittedHistoricalPoints > 0
     ? `The plot ends at league day ${chartDayCeiling}, matching the current phase plus the longest ${chartHorizonDays}-day forecast window; ${omittedHistoricalPoints} later archived point${omittedHistoricalPoints === 1 ? " is" : "s are"} omitted from this near-term view.`
     : "";
@@ -1716,7 +1716,7 @@ function renderRecommendations() {
       <div class="empty-state">
         <span class="summary-icon ideas" aria-hidden="true">✦</span>
         <strong>No forecasts yet</strong>
-        <p>Run a market sync, then continue the past-league archive. Exact future-day prices from Mirage, Keepers, Mercenaries, and Settlers are required for a forecast; missing estimates stay blank.</p>
+        <p>Run a market sync, then continue the past-league archive. Exact future-day prices from Allflame, Mirage, Keepers, and Mercenaries are required for a forecast; missing estimates stay blank.</p>
         <button class="secondary-button" type="button" data-sync>Sync market now</button>
       </div>`;
     els.recommendationList.querySelector("[data-sync]")?.addEventListener("click", syncMarket);
@@ -1957,7 +1957,7 @@ function openDetail(rank) {
       <p>Loading the current and weighted broad-league price curves…</p>
     </div>
     <p class="detail-caveat forecast-method-note">
-      Historical targets use only Mirage, Keepers, Mercenaries, and Settlers.
+      Historical targets use only Allflame, Mirage, Keepers, and Mercenaries.
       Only poe.ninja Medium/High observations enter forecasts. The comparison
       chart also plots exact Low-confidence rows as context, but they cannot set
       a forecast target.

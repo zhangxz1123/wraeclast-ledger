@@ -802,8 +802,8 @@ class AdvisorApplication:
                 ),
                 "recency_decay_per_league": decay,
                 "age_rank_basis": (
-                    "Four broadly covered completed leagues only; Mirage has "
-                    "age rank 0, followed by Keepers, Mercenaries, and Settlers."
+                    "Four broadly covered completed leagues only; Allflame has "
+                    "age rank 0, followed by Mirage, Keepers, and Mercenaries."
                 ),
                 "historical_aggregation": (
                     "Per-day recency-weighted arithmetic mean, normalized over "

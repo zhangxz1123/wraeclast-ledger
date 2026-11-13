@@ -68,8 +68,9 @@ After the first live market sync, open the gear menu and click **Build /
 continue past-league archive**. The first pass imports the four selected
 broad-league ZIP dumps listed by poe.ninja; later passes use saved dump
 fingerprints to skip every unchanged league. Forecasts use exact item/day
-observations from those softcore trade leagues: Mirage, Keepers (also
-reported upstream as Keepers of the Flame), Mercenaries, and Settlers.
+observations from those softcore trade leagues: Allflame (also reported
+upstream as Curse of the Allflame), Mirage, Keepers (also reported upstream
+as Keepers of the Flame), and Mercenaries.
 
 ## GitHub Pages and automatic daily updates
 
@@ -343,13 +344,14 @@ lose Divine-relative value as a league matures.
 
 Forecast calculations use only the four broadly covered leagues:
 
+- Allflame (including the upstream name `Curse of the Allflame`)
 - Mirage
 - Keepers (including the upstream name `Keepers of the Flame`)
 - Mercenaries
-- Settlers
 
-Legacy archives may still contain Affliction and Necropolis rows, but they do
-not contribute to forecasts.
+Legacy archives may still contain Affliction, Necropolis, and Settlers rows,
+but they do not contribute to forecasts. Settlers rolled out of the forecast
+window when Allflame completed at the 3.30 (Covens of Umbra) launch.
 For each item and horizon, the model reads the exact historical price at the
 current league day plus 3, 7, or 14 days. Only poe.ninja observations graded
 Medium or High (normalized confidence at least `0.5`) may enter a forecast,
@@ -425,8 +427,8 @@ hide list is stored in browser-local storage and applies across pages, searches,
 filters, syncs, and reloads. `Reset hidden` restores the complete list.
 
 Open any row to compare its exact current-league Divine price curve with the
-recency-weighted curve built only from Mirage, Keepers, Mercenaries, and
-Settlers. Charts begin at league day 1, break across missing days, and never
+recency-weighted curve built only from Allflame, Mirage, Keepers, and
+Mercenaries. Charts begin at league day 1, break across missing days, and never
 copy day 2 backward or infer dates from poe.ninja sparklines.
 
 These are gross price forecasts, not guaranteed profits. Verify the live

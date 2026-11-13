@@ -80,7 +80,7 @@ def parse_dump_catalog(payload: Any) -> list[DumpDescriptor]:
     if not isinstance(rows, list):
         raise ValueError("poe.ninja dump catalog must be an array")
     descriptors: list[DumpDescriptor] = []
-    seen: set[str] = set()
+    seen: dict[str, DumpDescriptor] = {}
     for row in rows:
         if not isinstance(row, dict):
             raise ValueError("poe.ninja dump catalog rows must be objects")
@@ -103,11 +103,16 @@ def parse_dump_catalog(payload: Any) -> list[DumpDescriptor]:
             raise ValueError(
                 f"{descriptor.league_name} dump has an inverted date range"
             )
-        if descriptor.league_name in seen:
+        previous = seen.get(descriptor.league_name)
+        if previous is not None:
+            # The live catalog repeats some rows verbatim; only a repeated
+            # league whose dates or archive differ is ambiguous.
+            if previous == descriptor:
+                continue
             raise ValueError(
                 f"duplicate poe.ninja dump league {descriptor.league_name!r}"
             )
-        seen.add(descriptor.league_name)
+        seen[descriptor.league_name] = descriptor
         descriptors.append(descriptor)
     return descriptors
 

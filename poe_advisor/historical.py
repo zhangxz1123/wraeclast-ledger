@@ -94,17 +94,25 @@ COMPLETED_LEAGUES: tuple[HistoricalLeagueSpec, ...] = (
         start_at="2026-03-06T19:00:00Z",
         end_at="2026-07-24T20:00:00Z",
     ),
+    HistoricalLeagueSpec(
+        league_id="Allflame",
+        name="Curse of the Allflame",
+        source_alias="Allflame",
+        start_at="2026-07-24T20:00:00Z",
+        end_at="2026-11-09T21:00:00Z",
+    ),
 )
 HISTORICAL_LEAGUES = COMPLETED_LEAGUES
 
-# These four leagues have broad item coverage in the local archive. Forecasts
-# deliberately ignore the much thinner Affliction and Necropolis samples so a
-# handful of surviving rows cannot distort a cross-league target.
+# The four newest leagues with broad item coverage in the local archive.
+# Forecasts deliberately ignore the much thinner Affliction and Necropolis
+# samples so a handful of surviving rows cannot distort a cross-league target;
+# Settlers remains archived but rolled out of the forecast window in 3.30.
 BROADLY_COVERED_LEAGUE_IDS = (
-    "Settlers",
     "Mercenaries",
     "Keepers",
     "Mirage",
+    "Allflame",
 )
 BROADLY_COVERED_LEAGUES: tuple[HistoricalLeagueSpec, ...] = tuple(
     spec
@@ -127,6 +135,8 @@ _CATEGORY_MAP = {
     "delirium": "DeliriumOrb",
     "scarab": "Scarab",
     "scarabs": "Scarab",
+    "thread": "Thread",
+    "threads": "Thread",
     "fossil": "Fossil",
     "fossils": "Fossil",
     "resonator": "Resonator",

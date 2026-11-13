@@ -879,7 +879,7 @@ class Storage:
         item_key: str | None = None,
         sources: Iterable[str] | str | None = None,
     ) -> dict[str, list[dict[str, Any]]]:
-        parameters: list[Any] = [league_id, f"-{max(1, days)} days"]
+        parameters: list[Any] = [league_id, league_id, f"-{max(1, days)} days"]
         key_clause = ""
         if item_key:
             key_clause = "AND item_key = ?"
@@ -898,7 +898,14 @@ class Storage:
                    details_json
             FROM price_points
             WHERE league_id = ?
-              AND observed_at >= datetime('now', ?)
+              -- Anchor the window to the league's newest observation, not
+              -- the wall clock, so a stalled refresh or a finished league
+              -- still yields its recent history.
+              AND observed_at >= datetime(
+                  (SELECT MAX(observed_at) FROM price_points
+                   WHERE league_id = ?),
+                  ?
+              )
               {key_clause}
               {source_clause}
             ORDER BY item_key, observed_at ASC,

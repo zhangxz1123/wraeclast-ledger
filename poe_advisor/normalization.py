@@ -642,6 +642,7 @@ def _identifier_info(identifier: str) -> tuple[str, str, str, bool]:
     category_paths = (
         ("divinationcard", "DivinationCard"),
         ("scarab", "Scarab"),
+        ("thread", "Thread"),
         ("essence", "Essence"),
         ("fossil", "Fossil"),
         ("resonator", "Resonator"),

@@ -667,6 +667,19 @@ class DumpCatalogTests(unittest.TestCase):
         self.assertEqual(descriptors[0].league_name, "Settlers")
         self.assertEqual(descriptors[0].start_date.isoformat(), "2024-07-26")
 
+    def test_catalog_skips_verbatim_repeats_but_rejects_conflicts(self) -> None:
+        row = {
+            "leagueName": "Allflame",
+            "minDate": "2026-07-24T00:00:00Z",
+            "maxDate": "2026-11-11T00:00:00Z",
+            "zipName": "Allflame.zip",
+        }
+        descriptors = parse_dump_catalog([row, dict(row), dict(row)])
+        self.assertEqual([d.league_name for d in descriptors], ["Allflame"])
+
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            parse_dump_catalog([row, {**row, "maxDate": "2026-11-12T00:00:00Z"}])
+
     def test_catalog_rejects_missing_identity_fields(self) -> None:
         with self.assertRaisesRegex(ValueError, "zipName"):
             parse_dump_catalog(

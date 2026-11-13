@@ -195,9 +195,10 @@ class SeasonalModelTests(unittest.TestCase):
         )["currency:mirror-shard"]
 
         decay = SeasonalModel.RECENCY_DECAY_PER_LEAGUE
+        # Allflame is the newest completed league, so Mirage is age rank 1.
         expected = (
-            1.0 + 4.0 * decay**3 + 10.0 * decay**5
-        ) / (1.0 + decay**3 + decay**5)
+            1.0 * decay + 4.0 * decay**4 + 10.0 * decay**6
+        ) / (decay + decay**4 + decay**6)
         self.assertAlmostEqual(signal.average_entry_price, 5.0)
         self.assertAlmostEqual(
             signal.recency_weighted_entry_price,
@@ -209,7 +210,7 @@ class SeasonalModelTests(unittest.TestCase):
         )
         self.assertEqual(
             [entry["age_rank"] for entry in signal.league_weights],
-            [0, 3, 5],
+            [1, 4, 6],
         )
         self.assertAlmostEqual(
             sum(
@@ -229,6 +230,7 @@ class SeasonalModelTests(unittest.TestCase):
             row(league="Mercenaries", entry=3.0, ratio=1.04),
             row(league="Keepers", entry=2.0, ratio=1.05),
             row(league="Mirage", entry=1.0, ratio=1.06),
+            row(league="Allflame", entry=0.5, ratio=1.07),
         ]
         forward_rows = [
             observation
@@ -249,14 +251,15 @@ class SeasonalModelTests(unittest.TestCase):
         decay = SeasonalModel.RECENCY_DECAY_PER_LEAGUE
         expected_level = sum(
             price * decay**age_rank
-            for age_rank, price in enumerate([1, 2, 3, 4, 5, 6])
-        ) / sum(decay**age_rank for age_rank in range(6))
+            for age_rank, price in enumerate([0.5, 1, 2, 3, 4, 5, 6])
+        ) / sum(decay**age_rank for age_rank in range(7))
         forward_ratios_by_age = {
-            0: 1.06,
-            1: 1.05,
-            2: 1.04,
-            4: 1.02,
-            5: 1.01,
+            0: 1.07,
+            1: 1.06,
+            2: 1.05,
+            3: 1.04,
+            5: 1.02,
+            6: 1.01,
         }
         expected_forward = math.expm1(
             sum(
@@ -269,9 +272,9 @@ class SeasonalModelTests(unittest.TestCase):
         )
 
         self.assertEqual(signal.status, "ok")
-        self.assertEqual(signal.level_sample_leagues, 6)
-        self.assertEqual(signal.sample_leagues, 5)
-        self.assertAlmostEqual(signal.average_entry_price, 3.5)
+        self.assertEqual(signal.level_sample_leagues, 7)
+        self.assertEqual(signal.sample_leagues, 6)
+        self.assertAlmostEqual(signal.average_entry_price, 21.5 / 7)
         self.assertAlmostEqual(
             signal.recency_weighted_entry_price,
             expected_level,
@@ -280,17 +283,17 @@ class SeasonalModelTests(unittest.TestCase):
             signal.recency_weighted_return,
             expected_forward,
         )
-        self.assertEqual(len(signal.league_weights), 6)
+        self.assertEqual(len(signal.league_weights), 7)
         settlers = next(
             observation
             for observation in signal.league_weights
             if observation["league_id"] == "Settlers"
         )
-        self.assertEqual(settlers["age_rank"], 3)
+        self.assertEqual(settlers["age_rank"], 4)
         self.assertEqual(settlers["entry_divine"], 4.0)
         self.assertEqual(
             signal.as_dict()["historical_level_sample_leagues"],
-            6,
+            7,
         )
 
     def test_missing_or_low_confidence_leagues_fail_closed(self) -> None:

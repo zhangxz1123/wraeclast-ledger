@@ -307,7 +307,7 @@ class ForecastRankingTests(unittest.TestCase):
         self.add_target(
             focused,
             "Focused Amulet",
-            "Mercenaries",
+            "Keepers",
             7,
             0.02556299452221546,
             category="BaseType",
@@ -316,7 +316,7 @@ class ForecastRankingTests(unittest.TestCase):
         self.add_target(
             focused,
             "Focused Amulet",
-            "Settlers",
+            "Mercenaries",
             7,
             0.04838709677419355,
             category="BaseType",
@@ -358,7 +358,7 @@ class ForecastRankingTests(unittest.TestCase):
         )
         self.assertEqual(
             focused_forecast["historical_leagues"],
-            ["Mercenaries", "Settlers"],
+            ["Keepers", "Mercenaries"],
         )
         self.assertLess(
             focused_forecast["raw_historical_target_divine"],

@@ -305,9 +305,9 @@ class HTTPServerTests(unittest.TestCase):
         )
         seasonal_rows = []
         fixture_values = {
-            "Mercenaries": {1: 10.0},
-            "Keepers": {1: 20.0, 2: 25.0},
-            "Mirage": {
+            "Keepers": {1: 10.0},
+            "Mirage": {1: 20.0, 2: 25.0},
+            "Allflame": {
                 1: 40.0,
                 2: 45.0,
                 forecast_target_day: 50.0,
@@ -331,24 +331,24 @@ class HTTPServerTests(unittest.TestCase):
                 )
         seasonal_rows.append(
             {
-                "league_id": "Settlers",
+                "league_id": "Mercenaries",
                 "item_key": item_key,
                 "source": "poe.ninja-history",
                 "source_item_id": "veiled-orb-history",
                 "league_day": 1,
-                "observed_at": "2024-07-26T20:00:00Z",
+                "observed_at": "2025-06-13T20:00:00Z",
                 "divine_value": 1000.0,
                 "confidence": 0.49,
             }
         )
         seasonal_rows.append(
             {
-                "league_id": "Settlers",
+                "league_id": "Mercenaries",
                 "item_key": item_key,
                 "source": "poe.ninja-history",
                 "source_item_id": "veiled-orb-history",
                 "league_day": forecast_target_day,
-                "observed_at": "2024-07-26T20:00:00Z",
+                "observed_at": "2025-06-13T20:00:00Z",
                 "divine_value": 2000.0,
                 "confidence": 0.49,
             }
@@ -432,7 +432,7 @@ class HTTPServerTests(unittest.TestCase):
             50.0,
         )
         self.assertEqual(three_day_forecast["historical_sample_leagues"], 1)
-        self.assertEqual(three_day_forecast["sample_leagues"], ["Mirage"])
+        self.assertEqual(three_day_forecast["sample_leagues"], ["Allflame"])
         self.assertEqual(
             comparison["weighted_historical"]["series_role"],
             "display_only",
@@ -451,21 +451,21 @@ class HTTPServerTests(unittest.TestCase):
                 curve["league_id"]
                 for curve in comparison["past_leagues"]
             ],
-            ["Mirage", "Keepers", "Mercenaries", "Settlers"],
+            ["Allflame", "Mirage", "Keepers", "Mercenaries"],
         )
-        settlers_curve = next(
+        oldest_curve = next(
             curve
             for curve in comparison["past_leagues"]
-            if curve["league_id"] == "Settlers"
+            if curve["league_id"] == "Mercenaries"
         )
         self.assertEqual(
-            [point["league_day"] for point in settlers_curve["points"]],
+            [point["league_day"] for point in oldest_curve["points"]],
             [1, forecast_target_day],
         )
         self.assertTrue(
             all(
                 point["model_grade"] is False
-                for point in settlers_curve["points"]
+                for point in oldest_curve["points"]
             )
         )
         self.assertEqual(
