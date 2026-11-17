@@ -32,6 +32,7 @@ from .models import (
     STANDARD_LEAGUE_ID,
     DataSourceError,
     FetchResult,
+    HTTPStatusError,
     League,
     PricePoint,
     iso_utc,
@@ -98,7 +99,7 @@ POE_NINJA_CURRENT_HISTORY_STATE_SOURCE = "poe.ninja-current-history"
 CURRENT_HISTORY_ITEM_CATEGORY = "current-item-history"
 CURRENT_HISTORY_DIVINE_CATEGORY = "current-divine-history"
 CURRENT_HISTORY_CATALOG_CATEGORY = "current-history-catalog"
-CURRENT_HISTORY_MAX_ITEMS = 3_000
+CURRENT_HISTORY_MAX_ITEMS = 8_000
 CURRENT_HISTORY_REQUEST_PAUSE_SECONDS = 0.10
 CURRENT_HISTORY_RECHECK_DAYS = 7
 CURRENT_HISTORY_NORMALIZATION_VERSION = 2
@@ -461,6 +462,7 @@ class SyncService:
             "gap_recheck_items": 0,
             "gap_recheck_days": 0,
             "failed_items": 0,
+            "unavailable_items": 0,
             "rows_written": 0,
             "snapshots_written": 0,
             "assets_written": 0,
@@ -1010,6 +1012,18 @@ class SyncService:
                     summary[
                         "cached_items" if record["cached"] else "fetched_items"
                     ] += 1
+                except HTTPStatusError as error:
+                    # poe.ninja answers 404 when it keeps no detail history
+                    # for an item in this league; a retry cannot change that,
+                    # so it is reported but does not mark the archive partial.
+                    if error.status == 404:
+                        summary["unavailable_items"] += 1
+                    else:
+                        summary["failed_items"] += 1
+                    self._current_history_warning(
+                        summary,
+                        f"{asset['name']} ({source_item_id}): {error}",
+                    )
                 except Exception as error:
                     summary["failed_items"] += 1
                     self._current_history_warning(
@@ -1046,6 +1060,8 @@ class SyncService:
                     f"{summary['unmatched_items']} unmatched; "
                     f"{summary['gap_recheck_items']} gap repairs; "
                     f"{summary['rows_written']} normalized daily rows; "
+                    f"{summary['unavailable_items']} without poe.ninja "
+                    "history; "
                     f"{summary['failed_items']} failures."
                 ),
                 success=True,

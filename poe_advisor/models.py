@@ -95,5 +95,13 @@ class DataSourceError(AdvisorError):
     """A remote data source returned an unusable response."""
 
 
+class HTTPStatusError(DataSourceError):
+    """A remote data source answered with a non-retryable HTTP status."""
+
+    def __init__(self, message: str, status: int) -> None:
+        super().__init__(message)
+        self.status = status
+
+
 class ConfigurationError(AdvisorError):
     """A required local setting is missing or invalid."""

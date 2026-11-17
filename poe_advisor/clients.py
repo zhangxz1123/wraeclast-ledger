@@ -12,7 +12,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
-from .models import DataSourceError, FetchResult, iso_utc
+from .models import DataSourceError, FetchResult, HTTPStatusError, iso_utc
 
 
 Transport = Callable[[Request, float], Any]
@@ -153,12 +153,17 @@ class HttpJsonClient:
                     self.sleeper(self._retry_delay(error.headers, attempt))
                     continue
                 try:
-                    body = error.read(300).decode("utf-8", errors="replace")
+                    raw_body = error.read()
+                    encoding = str(error.headers.get("Content-Encoding") or "")
+                    if encoding.lower() == "gzip":
+                        raw_body = gzip.decompress(raw_body)
+                    body = raw_body[:300].decode("utf-8", errors="replace")
                 except Exception:
                     body = ""
-                raise DataSourceError(
+                raise HTTPStatusError(
                     f"GET {url} returned HTTP {error.code}"
-                    + (f": {body}" if body else "")
+                    + (f": {body}" if body else ""),
+                    error.code,
                 ) from error
             except (URLError, TimeoutError, OSError) as error:
                 last_error = error

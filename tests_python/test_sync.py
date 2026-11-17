@@ -12,6 +12,7 @@ from poe_advisor.clients import PoeNinjaClient
 from poe_advisor.models import (
     DataSourceError,
     FetchResult,
+    HTTPStatusError,
     League,
     PricePoint,
     iso_utc,
@@ -683,6 +684,51 @@ class SyncServiceTests(unittest.TestCase):
         self.assertTrue(
             all(row["details"]["exactVariant"] for row in exact)
         )
+
+    def test_ranked_history_404_is_unavailable_not_a_failure(self) -> None:
+        class MissingHistoryPoeNinja(FakePoeNinja):
+            def __init__(self, status: int) -> None:
+                super().__init__()
+                self.status = status
+
+            def fetch_stash_item_history(
+                self, league: str, category: str, item_id: int | str, **_: Any
+            ) -> FetchResult:
+                self.history_calls.append(
+                    ("stash-item", league, category, str(item_id))
+                )
+                raise HTTPStatusError(
+                    f"GET history returned HTTP {self.status}", self.status
+                )
+
+        item_key = (
+            "skillgem:awakened-enlighten-support-1-variant-1-"
+            "corrupted-false-gemlevel-1-gemquality-0"
+        )
+        for status, expected in ((404, "success"), (500, "partial")):
+            with self.subTest(status=status):
+                self.storage.set_setting("item_categories", ["SkillGem"])
+                service = self.service(
+                    poe_ninja=MissingHistoryPoeNinja(status)
+                )
+                self.assertTrue(service.sync(backfill_hours=0)["ok"])
+                league = self.storage.get_current_league()
+                assert league is not None
+                with patch(
+                    "poe_advisor.models.utc_now",
+                    return_value=datetime(2026, 7, 31, 6, tzinfo=timezone.utc),
+                ):
+                    summary = service.sync_current_item_histories(
+                        league,
+                        [item_key],
+                        max_items=100,
+                    )
+                self.assertEqual(summary["matched_items"], 1)
+                self.assertEqual(summary["status"], expected)
+                self.assertEqual(
+                    summary["unavailable_items"], int(status == 404)
+                )
+                self.assertEqual(summary["failed_items"], int(status != 404))
 
     def test_ranked_current_history_uses_exact_days_and_keeps_fresher_local(
         self,
