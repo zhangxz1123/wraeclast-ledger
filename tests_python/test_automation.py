@@ -242,6 +242,71 @@ class DailyAutomationTests(unittest.TestCase):
         application.history_service.backfill.assert_not_called()
         application.recommendation_engine.generate.assert_called_once()
 
+    def test_few_failed_curves_publish_but_many_block(self) -> None:
+        cases = (
+            # 29 of 5,195 mirrors the first Covens run that hit it.
+            (29, False, True),
+            (29, True, False),
+            (100, False, False),
+        )
+        for failed_items, divine_partial, expected_ok in cases:
+            with self.subTest(
+                failed_items=failed_items, divine_partial=divine_partial
+            ):
+                league = SimpleNamespace(id="Live", is_demo=False)
+                application = SimpleNamespace()
+                application.storage = Mock()
+                application.storage.get_current_league.return_value = league
+                application.sync_service = Mock()
+                application.sync_service.sync.return_value = {
+                    "ok": True,
+                    "status": "success",
+                    "warnings": [],
+                }
+                application.sync_service.sync_current_item_histories.return_value = {
+                    "status": "partial",
+                    "input_items": 5195,
+                    "requested_items": 5195,
+                    "omitted_items": 0,
+                    "unmatched_items": 0,
+                    "failed_items": failed_items,
+                    "divine_history_partial": divine_partial,
+                }
+                application.sync_meta = Mock(
+                    return_value={"status": "success", "failed_leagues": 0}
+                )
+                application.history_service = Mock()
+                application.history_service.backfill.return_value = {
+                    "status": "success"
+                }
+                application.recommendation_engine = Mock()
+                application.recommendation_engine.generate.side_effect = [
+                    {"rankings": [{"key": "item:a"}]},
+                    {
+                        "generated_at": "2026-11-18T00:00:00Z",
+                        "rankings": [{"key": "item:a"}],
+                    },
+                ]
+
+                with patch(
+                    "poe_advisor.automation.AdvisorApplication.create",
+                    return_value=application,
+                ):
+                    result = run_daily_update(
+                        database_path="archive.sqlite3",
+                        web_dir="web",
+                        current_history_items=8000,
+                    )
+
+                self.assertEqual(result["ok"], expected_ok)
+                if expected_ok:
+                    self.assertTrue(
+                        any(
+                            f"{failed_items} ranked" in warning
+                            for warning in result["warnings"]
+                        )
+                    )
+
     def test_failed_refresh_annotation_names_the_cause(self) -> None:
         output = io.StringIO()
         with contextlib.redirect_stdout(output):

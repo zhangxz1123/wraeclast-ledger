@@ -731,6 +731,10 @@ class SyncServiceTests(unittest.TestCase):
                     summary["unavailable_items"], int(status == 404)
                 )
                 self.assertEqual(summary["failed_items"], int(status != 404))
+                # 404s are counted, not listed, so real errors stay visible.
+                self.assertEqual(
+                    any("HTTP 404" in w for w in summary["warnings"]), False
+                )
                 # A 404 is final; a server error is retried on every pass.
                 item_calls = [
                     call for call in poe_ninja.history_calls

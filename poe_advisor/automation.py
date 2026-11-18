@@ -4,7 +4,10 @@ from pathlib import Path
 from typing import Any
 
 from .server import AdvisorApplication
-from .sync import CURRENT_HISTORY_MAX_ITEMS
+from .sync import (
+    CURRENT_HISTORY_MAX_ITEMS,
+    CURRENT_HISTORY_TOLERATED_FAILURE_FRACTION,
+)
 
 
 def run_daily_update(
@@ -118,11 +121,7 @@ def run_daily_update(
             result["current_history_sync"] = current_history
             history_counts_incomplete = any(
                 int(current_history.get(field) or 0) > 0
-                for field in (
-                    "omitted_items",
-                    "unmatched_items",
-                    "failed_items",
-                )
+                for field in ("omitted_items", "unmatched_items")
             )
             input_items = current_history.get("input_items")
             requested_items = current_history.get("requested_items")
@@ -131,8 +130,30 @@ def run_daily_update(
                 and requested_items is not None
                 and int(requested_items) != int(input_items)
             )
+            # A handful of items that poe.ninja keeps refusing must not hold
+            # back thousands of fresh curves; those few keep yesterday's
+            # curve and are reported. Anything larger still blocks publish.
+            failed_items = int(current_history.get("failed_items") or 0)
+            failure_budget = int(
+                int(requested_items or 0)
+                * CURRENT_HISTORY_TOLERATED_FAILURE_FRACTION
+            )
+            tolerated_partial = (
+                current_history.get("status") == "partial"
+                and 0 < failed_items <= failure_budget
+                and not current_history.get("divine_history_partial")
+            )
+            if tolerated_partial:
+                warnings.append(
+                    f"{failed_items} ranked current-league price curves "
+                    "could not be refreshed and keep their previous data."
+                )
             if (
-                current_history.get("status") != "success"
+                (
+                    current_history.get("status") != "success"
+                    and not tolerated_partial
+                )
+                or failed_items > failure_budget
                 or history_counts_incomplete
                 or request_count_incomplete
             ):

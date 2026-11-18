@@ -103,6 +103,7 @@ CURRENT_HISTORY_MAX_ITEMS = 8_000
 CURRENT_HISTORY_REQUEST_PAUSE_SECONDS = 0.10
 CURRENT_HISTORY_RETRY_PASSES = 2
 CURRENT_HISTORY_RETRY_PAUSE_SECONDS = 60.0
+CURRENT_HISTORY_TOLERATED_FAILURE_FRACTION = 0.01
 CURRENT_HISTORY_RECHECK_DAYS = 7
 CURRENT_HISTORY_NORMALIZATION_VERSION = 2
 _POE_NINJA_CHAOS_PAIR_IDS = ("chaos", "chaos-orb")
@@ -1025,14 +1026,15 @@ class SyncService:
                     except HTTPStatusError as error:
                         # poe.ninja answers 404 when it keeps no detail history
                         # for an item in this league; a retry cannot change that,
-                        # so it is reported but does not mark the archive partial.
+                        # so it is only counted, leaving the warning list for
+                        # real failures, and does not mark the archive partial.
                         if error.status == 404:
                             summary["unavailable_items"] += 1
-                        elif not final_pass:
+                            continue
+                        if not final_pass:
                             retry_assets.append(asset)
                             continue
-                        else:
-                            summary["failed_items"] += 1
+                        summary["failed_items"] += 1
                         self._current_history_warning(
                             summary,
                             f"{asset['name']} ({source_item_id}): {error}",
@@ -1052,6 +1054,7 @@ class SyncService:
                 pending_assets = retry_assets
                 time.sleep(CURRENT_HISTORY_RETRY_PAUSE_SECONDS)
 
+            summary["divine_history_partial"] = divine_quality.partial
             if divine_quality.partial:
                 self._current_history_warning(
                     summary,
