@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from poe_advisor.__main__ import build_parser
+from poe_advisor.__main__ import _annotate_failed_daily_update, build_parser
 from poe_advisor.automation import run_daily_update
 from poe_advisor.sync import CURRENT_HISTORY_MAX_ITEMS
 
@@ -239,6 +241,33 @@ class DailyAutomationTests(unittest.TestCase):
         self.assertIn("previous published dashboard", result["message"])
         application.history_service.backfill.assert_not_called()
         application.recommendation_engine.generate.assert_called_once()
+
+    def test_failed_refresh_annotation_names_the_cause(self) -> None:
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            _annotate_failed_daily_update(
+                {
+                    "ok": False,
+                    "message": "Current-league curve catch-up was incomplete.",
+                    "current_history_sync": {
+                        "status": "partial",
+                        "failed_items": 2,
+                        "unavailable_items": 7,
+                        "warnings": [
+                            "Gem (1): GET x returned HTTP 404",
+                            "Orb (2): GET y returned HTTP 503",
+                        ],
+                    },
+                }
+            )
+        annotation = output.getvalue().strip()
+        self.assertTrue(
+            annotation.startswith("::error title=Daily refresh failed::")
+        )
+        self.assertNotIn("\n", annotation)
+        self.assertIn("failed_items=2", annotation)
+        self.assertIn("HTTP 503", annotation)
+        self.assertNotIn("HTTP 404", annotation)
 
 
 if __name__ == "__main__":

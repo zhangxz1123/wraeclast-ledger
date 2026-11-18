@@ -101,6 +101,8 @@ CURRENT_HISTORY_DIVINE_CATEGORY = "current-divine-history"
 CURRENT_HISTORY_CATALOG_CATEGORY = "current-history-catalog"
 CURRENT_HISTORY_MAX_ITEMS = 8_000
 CURRENT_HISTORY_REQUEST_PAUSE_SECONDS = 0.10
+CURRENT_HISTORY_RETRY_PASSES = 2
+CURRENT_HISTORY_RETRY_PAUSE_SECONDS = 60.0
 CURRENT_HISTORY_RECHECK_DAYS = 7
 CURRENT_HISTORY_NORMALIZATION_VERSION = 2
 _POE_NINJA_CHAOS_PAIR_IDS = ("chaos", "chaos-orb")
@@ -463,6 +465,7 @@ class SyncService:
             "gap_recheck_days": 0,
             "failed_items": 0,
             "unavailable_items": 0,
+            "retried_items": 0,
             "rows_written": 0,
             "snapshots_written": 0,
             "assets_written": 0,
@@ -785,98 +788,146 @@ class SyncService:
                 for point in divine_points
                 if int(point["league_day"]) in divine_quality.prices
             }
-            for asset in selected:
-                item_key = str(asset["item_key"])
-                source_item_id = str(asset["source_item_id"])
-                try:
-                    record = self._poe_ninja_current_history_response(
-                        league,
-                        category=str(asset["category"]),
-                        source_item_id=source_item_id,
-                        history_kind=str(asset["history_kind"]),
-                        snapshot_category=CURRENT_HISTORY_ITEM_CATEGORY,
-                        summary=summary,
-                    )
-                    if asset["history_kind"] == "exchange":
-                        item_points = _poe_ninja_exchange_item_history_points(
-                            record["payload"],
+            # A long catch-up from a shared CI runner can hit transient rate
+            # limits or timeouts; items that fail that way get another pass
+            # after a pause before they count against the archive.
+            pending_assets = list(selected)
+            for retry_pass in range(CURRENT_HISTORY_RETRY_PASSES + 1):
+                final_pass = retry_pass == CURRENT_HISTORY_RETRY_PASSES
+                retry_assets: list[dict[str, Any]] = []
+                for asset in pending_assets:
+                    item_key = str(asset["item_key"])
+                    source_item_id = str(asset["source_item_id"])
+                    try:
+                        record = self._poe_ninja_current_history_response(
                             league,
+                            category=str(asset["category"]),
+                            source_item_id=source_item_id,
+                            history_kind=str(asset["history_kind"]),
+                            snapshot_category=CURRENT_HISTORY_ITEM_CATEGORY,
+                            summary=summary,
                         )
-                    else:
-                        item_points = _poe_ninja_stash_history_points(
-                            record["payload"],
+                        if asset["history_kind"] == "exchange":
+                            item_points = _poe_ninja_exchange_item_history_points(
+                                record["payload"],
+                                league,
+                            )
+                        else:
+                            item_points = _poe_ninja_stash_history_points(
+                                record["payload"],
+                                league,
+                                str(record["fetched_at"]),
+                            )
+                        item_points = [
+                            point
+                            for point in item_points
+                            if 1 <= int(point["league_day"]) <= current_day
+                        ]
+                        provider_days = {
+                            int(point["league_day"]) for point in item_points
+                        }
+                        direct_divine_quote = bool(item_points) and all(
+                            str(point.get("quote_currency") or "") == "divine"
+                            for point in item_points
+                        )
+                        normalized_days = (
+                            sorted(provider_days)
+                            if direct_divine_quote
+                            else sorted(
+                                provider_days.intersection(divine_quality.prices)
+                            )
+                        )
+                        missing_provider_days = [
+                            day
+                            for day in range(1, current_day)
+                            if day not in provider_days
+                        ]
+                        missing_divine_days = (
+                            []
+                            if direct_divine_quote
+                            else sorted(
+                                provider_days.difference(divine_quality.prices)
+                            )
+                        )
+                        metadata = {
+                            "kind": "current-item-history",
+                            "normalization_version": (
+                                CURRENT_HISTORY_NORMALIZATION_VERSION
+                            ),
+                            "provider": PoeNinjaClient.SOURCE,
+                            "provider_league": league.id,
+                            **asset,
+                            "provider_observed_days": sorted(provider_days),
+                            "provider_first_observed_day": (
+                                min(provider_days) if provider_days else None
+                            ),
+                            "provider_last_observed_day": (
+                                max(provider_days) if provider_days else None
+                            ),
+                            "provider_missing_days": missing_provider_days,
+                            "normalized_days": normalized_days,
+                            "missing_divine_anchor_days": missing_divine_days,
+                            "quote_currency": (
+                                "divine" if direct_divine_quote else "chaos"
+                            ),
+                            "checked_through_day": current_day,
+                            "interpolation": "none",
+                            "rechecked_missing_days": list(
+                                asset.get("gap_recheck_days") or []
+                            ),
+                        }
+                        snapshot_id = self._store_poe_ninja_current_history_record(
+                            record,
                             league,
-                            str(record["fetched_at"]),
+                            CURRENT_HISTORY_ITEM_CATEGORY,
+                            metadata,
+                            summary,
                         )
-                    item_points = [
-                        point
-                        for point in item_points
-                        if 1 <= int(point["league_day"]) <= current_day
-                    ]
-                    provider_days = {
-                        int(point["league_day"]) for point in item_points
-                    }
-                    direct_divine_quote = bool(item_points) and all(
-                        str(point.get("quote_currency") or "") == "divine"
-                        for point in item_points
-                    )
-                    normalized_days = (
-                        sorted(provider_days)
-                        if direct_divine_quote
-                        else sorted(
-                            provider_days.intersection(divine_quality.prices)
-                        )
-                    )
-                    missing_provider_days = [
-                        day
-                        for day in range(1, current_day)
-                        if day not in provider_days
-                    ]
-                    missing_divine_days = (
-                        []
-                        if direct_divine_quote
-                        else sorted(
-                            provider_days.difference(divine_quality.prices)
-                        )
-                    )
-                    metadata = {
-                        "kind": "current-item-history",
-                        "normalization_version": (
-                            CURRENT_HISTORY_NORMALIZATION_VERSION
-                        ),
-                        "provider": PoeNinjaClient.SOURCE,
-                        "provider_league": league.id,
-                        **asset,
-                        "provider_observed_days": sorted(provider_days),
-                        "provider_first_observed_day": (
-                            min(provider_days) if provider_days else None
-                        ),
-                        "provider_last_observed_day": (
-                            max(provider_days) if provider_days else None
-                        ),
-                        "provider_missing_days": missing_provider_days,
-                        "normalized_days": normalized_days,
-                        "missing_divine_anchor_days": missing_divine_days,
-                        "quote_currency": (
-                            "divine" if direct_divine_quote else "chaos"
-                        ),
-                        "checked_through_day": current_day,
-                        "interpolation": "none",
-                        "rechecked_missing_days": list(
-                            asset.get("gap_recheck_days") or []
-                        ),
-                    }
-                    snapshot_id = self._store_poe_ninja_current_history_record(
-                        record,
-                        league,
-                        CURRENT_HISTORY_ITEM_CATEGORY,
-                        metadata,
-                        summary,
-                    )
-                    points: list[PricePoint] = []
-                    for point in item_points:
-                        point_day = int(point["league_day"])
-                        if direct_divine_quote:
+                        points: list[PricePoint] = []
+                        for point in item_points:
+                            point_day = int(point["league_day"])
+                            if direct_divine_quote:
+                                points.append(
+                                    PricePoint(
+                                        league_id=league.id,
+                                        item_key=item_key,
+                                        name=str(asset["name"]),
+                                        category=str(asset["category"]),
+                                        source=PoeNinjaClient.SOURCE,
+                                        observed_at=str(point["observed_at"]),
+                                        chaos_value=None,
+                                        divine_value=float(point["mean"]),
+                                        listing_count=point.get("listing_count"),
+                                        volume=point.get("volume"),
+                                        confidence=min(
+                                            float(point["confidence"]),
+                                            0.95,
+                                        ),
+                                        details={
+                                            "history_backfill": True,
+                                            "normalization_version": (
+                                                CURRENT_HISTORY_NORMALIZATION_VERSION
+                                            ),
+                                            "provider": PoeNinjaClient.SOURCE,
+                                            "source_item_id": source_item_id,
+                                            "history_kind": asset["history_kind"],
+                                            "detailsId": source_item_id,
+                                            "league_day": point_day,
+                                            "quote_currency": "divine",
+                                            "normalization": (
+                                                "direct same-league poe.ninja "
+                                                "Divine pair history"
+                                            ),
+                                            "interpolated": False,
+                                        },
+                                        snapshot_id=snapshot_id,
+                                    )
+                                )
+                                continue
+                            divine_point = divine_points_by_day.get(point_day)
+                            if divine_point is None:
+                                continue
+                            divine_chaos = divine_quality.prices[point_day]
                             points.append(
                                 PricePoint(
                                     league_id=league.id,
@@ -885,12 +936,13 @@ class SyncService:
                                     category=str(asset["category"]),
                                     source=PoeNinjaClient.SOURCE,
                                     observed_at=str(point["observed_at"]),
-                                    chaos_value=None,
-                                    divine_value=float(point["mean"]),
+                                    chaos_value=float(point["mean"]),
+                                    divine_value=float(point["mean"]) / divine_chaos,
                                     listing_count=point.get("listing_count"),
                                     volume=point.get("volume"),
                                     confidence=min(
                                         float(point["confidence"]),
+                                        float(divine_point["confidence"]),
                                         0.95,
                                     ),
                                     details={
@@ -901,135 +953,104 @@ class SyncService:
                                         "provider": PoeNinjaClient.SOURCE,
                                         "source_item_id": source_item_id,
                                         "history_kind": asset["history_kind"],
-                                        "detailsId": source_item_id,
+                                        **(
+                                            {"detailsId": source_item_id}
+                                            if asset["history_kind"] == "exchange"
+                                            else {"poe_ninja_id": source_item_id}
+                                        ),
                                         "league_day": point_day,
-                                        "quote_currency": "divine",
+                                        "divine_chaos": divine_chaos,
                                         "normalization": (
-                                            "direct same-league poe.ninja "
-                                            "Divine pair history"
+                                            "exact same-league, same-day poe.ninja "
+                                            "Divine/Chaos pair"
                                         ),
                                         "interpolated": False,
+                                        "divine_snapshot_id": divine_snapshot_id,
                                     },
                                     snapshot_id=snapshot_id,
                                 )
                             )
-                            continue
-                        divine_point = divine_points_by_day.get(point_day)
-                        if divine_point is None:
-                            continue
-                        divine_chaos = divine_quality.prices[point_day]
-                        points.append(
-                            PricePoint(
+                        if item_points and not points:
+                            raise DataSourceError(
+                                "no item day had an exact poe.ninja Divine/Chaos anchor"
+                            )
+                        summary["rows_written"] += (
+                            self.storage.replace_current_history_price_points(
+                                points,
                                 league_id=league.id,
                                 item_key=item_key,
-                                name=str(asset["name"]),
-                                category=str(asset["category"]),
                                 source=PoeNinjaClient.SOURCE,
-                                observed_at=str(point["observed_at"]),
-                                chaos_value=float(point["mean"]),
-                                divine_value=float(point["mean"]) / divine_chaos,
-                                listing_count=point.get("listing_count"),
-                                volume=point.get("volume"),
-                                confidence=min(
-                                    float(point["confidence"]),
-                                    float(divine_point["confidence"]),
-                                    0.95,
-                                ),
-                                details={
-                                    "history_backfill": True,
-                                    "normalization_version": (
-                                        CURRENT_HISTORY_NORMALIZATION_VERSION
-                                    ),
-                                    "provider": PoeNinjaClient.SOURCE,
-                                    "source_item_id": source_item_id,
-                                    "history_kind": asset["history_kind"],
-                                    **(
-                                        {"detailsId": source_item_id}
-                                        if asset["history_kind"] == "exchange"
-                                        else {"poe_ninja_id": source_item_id}
-                                    ),
-                                    "league_day": point_day,
-                                    "divine_chaos": divine_chaos,
-                                    "normalization": (
-                                        "exact same-league, same-day poe.ninja "
-                                        "Divine/Chaos pair"
-                                    ),
-                                    "interpolated": False,
-                                    "divine_snapshot_id": divine_snapshot_id,
-                                },
-                                snapshot_id=snapshot_id,
                             )
                         )
-                    if item_points and not points:
-                        raise DataSourceError(
-                            "no item day had an exact poe.ninja Divine/Chaos anchor"
-                        )
-                    summary["rows_written"] += (
-                        self.storage.replace_current_history_price_points(
-                            points,
+                        self.storage.upsert_current_item_history_coverage(
                             league_id=league.id,
                             item_key=item_key,
-                            source=PoeNinjaClient.SOURCE,
+                            provider=PoeNinjaClient.SOURCE,
+                            source_item_id=source_item_id,
+                            category=str(asset["category"]),
+                            history_kind=str(asset["history_kind"]),
+                            endpoint=str(record["endpoint"]),
+                            fetched_at=str(record["fetched_at"]),
+                            metadata=metadata,
                         )
-                    )
-                    self.storage.upsert_current_item_history_coverage(
-                        league_id=league.id,
-                        item_key=item_key,
-                        provider=PoeNinjaClient.SOURCE,
-                        source_item_id=source_item_id,
-                        category=str(asset["category"]),
-                        history_kind=str(asset["history_kind"]),
-                        endpoint=str(record["endpoint"]),
-                        fetched_at=str(record["fetched_at"]),
-                        metadata=metadata,
-                    )
-                    summary["coverage"][item_key] = {
-                        "source": PoeNinjaClient.SOURCE,
-                        "source_item_id": source_item_id,
-                        "identity_source": asset["identity_source"],
-                        "first_observed_day": (
-                            min(provider_days) if provider_days else None
-                        ),
-                        "last_observed_day": (
-                            max(provider_days) if provider_days else None
-                        ),
-                        "observed_days": sorted(provider_days),
-                        "missing_days": missing_provider_days,
-                        "normalized_days": normalized_days,
-                        "missing_divine_anchor_days": missing_divine_days,
-                        "checked_through_day": current_day,
-                        "normalized_price_days_complete": bool(
-                            normalized_days
-                        ),
-                        "normalization_version": (
-                            CURRENT_HISTORY_NORMALIZATION_VERSION
-                        ),
-                        "interpolation": "none",
-                        "rechecked_missing_days": list(
-                            asset.get("gap_recheck_days") or []
-                        ),
-                    }
-                    summary[
-                        "cached_items" if record["cached"] else "fetched_items"
-                    ] += 1
-                except HTTPStatusError as error:
-                    # poe.ninja answers 404 when it keeps no detail history
-                    # for an item in this league; a retry cannot change that,
-                    # so it is reported but does not mark the archive partial.
-                    if error.status == 404:
-                        summary["unavailable_items"] += 1
-                    else:
+                        summary["coverage"][item_key] = {
+                            "source": PoeNinjaClient.SOURCE,
+                            "source_item_id": source_item_id,
+                            "identity_source": asset["identity_source"],
+                            "first_observed_day": (
+                                min(provider_days) if provider_days else None
+                            ),
+                            "last_observed_day": (
+                                max(provider_days) if provider_days else None
+                            ),
+                            "observed_days": sorted(provider_days),
+                            "missing_days": missing_provider_days,
+                            "normalized_days": normalized_days,
+                            "missing_divine_anchor_days": missing_divine_days,
+                            "checked_through_day": current_day,
+                            "normalized_price_days_complete": bool(
+                                normalized_days
+                            ),
+                            "normalization_version": (
+                                CURRENT_HISTORY_NORMALIZATION_VERSION
+                            ),
+                            "interpolation": "none",
+                            "rechecked_missing_days": list(
+                                asset.get("gap_recheck_days") or []
+                            ),
+                        }
+                        summary[
+                            "cached_items" if record["cached"] else "fetched_items"
+                        ] += 1
+                    except HTTPStatusError as error:
+                        # poe.ninja answers 404 when it keeps no detail history
+                        # for an item in this league; a retry cannot change that,
+                        # so it is reported but does not mark the archive partial.
+                        if error.status == 404:
+                            summary["unavailable_items"] += 1
+                        elif not final_pass:
+                            retry_assets.append(asset)
+                            continue
+                        else:
+                            summary["failed_items"] += 1
+                        self._current_history_warning(
+                            summary,
+                            f"{asset['name']} ({source_item_id}): {error}",
+                        )
+                    except Exception as error:
+                        if not final_pass:
+                            retry_assets.append(asset)
+                            continue
                         summary["failed_items"] += 1
-                    self._current_history_warning(
-                        summary,
-                        f"{asset['name']} ({source_item_id}): {error}",
-                    )
-                except Exception as error:
-                    summary["failed_items"] += 1
-                    self._current_history_warning(
-                        summary,
-                        f"{asset['name']} ({source_item_id}): {error}",
-                    )
+                        self._current_history_warning(
+                            summary,
+                            f"{asset['name']} ({source_item_id}): {error}",
+                        )
+                if not retry_assets:
+                    break
+                summary["retried_items"] += len(retry_assets)
+                pending_assets = retry_assets
+                time.sleep(CURRENT_HISTORY_RETRY_PAUSE_SECONDS)
 
             if divine_quality.partial:
                 self._current_history_warning(

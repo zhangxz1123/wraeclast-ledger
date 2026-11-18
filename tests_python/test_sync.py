@@ -19,6 +19,7 @@ from poe_advisor.models import (
 )
 from poe_advisor.storage import Storage
 from poe_advisor.sync import (
+    CURRENT_HISTORY_RETRY_PASSES,
     DEFAULT_EXCHANGE_CATEGORIES,
     DEFAULT_ITEM_CATEGORIES,
     SyncService,
@@ -708,15 +709,16 @@ class SyncServiceTests(unittest.TestCase):
         for status, expected in ((404, "success"), (500, "partial")):
             with self.subTest(status=status):
                 self.storage.set_setting("item_categories", ["SkillGem"])
-                service = self.service(
-                    poe_ninja=MissingHistoryPoeNinja(status)
-                )
+                poe_ninja = MissingHistoryPoeNinja(status)
+                service = self.service(poe_ninja=poe_ninja)
                 self.assertTrue(service.sync(backfill_hours=0)["ok"])
                 league = self.storage.get_current_league()
                 assert league is not None
                 with patch(
                     "poe_advisor.models.utc_now",
                     return_value=datetime(2026, 7, 31, 6, tzinfo=timezone.utc),
+                ), patch(
+                    "poe_advisor.sync.CURRENT_HISTORY_RETRY_PAUSE_SECONDS", 0
                 ):
                     summary = service.sync_current_item_histories(
                         league,
@@ -729,6 +731,59 @@ class SyncServiceTests(unittest.TestCase):
                     summary["unavailable_items"], int(status == 404)
                 )
                 self.assertEqual(summary["failed_items"], int(status != 404))
+                # A 404 is final; a server error is retried on every pass.
+                item_calls = [
+                    call for call in poe_ninja.history_calls
+                    if call[0] == "stash-item"
+                ]
+                self.assertEqual(
+                    len(item_calls),
+                    1 if status == 404 else CURRENT_HISTORY_RETRY_PASSES + 1,
+                )
+
+    def test_ranked_history_transient_failure_recovers_on_retry_pass(
+        self,
+    ) -> None:
+        class FlakyHistoryPoeNinja(FakePoeNinja):
+            def __init__(self) -> None:
+                super().__init__()
+                self.item_failures_left = 1
+
+            def fetch_stash_item_history(
+                self, league: str, category: str, item_id: int | str, **kwargs: Any
+            ) -> FetchResult:
+                if self.item_failures_left:
+                    self.item_failures_left -= 1
+                    self.history_calls.append(
+                        ("stash-item", league, category, str(item_id))
+                    )
+                    raise HTTPStatusError("GET history returned HTTP 429", 429)
+                return super().fetch_stash_item_history(
+                    league, category, item_id, **kwargs
+                )
+
+        item_key = (
+            "skillgem:awakened-enlighten-support-1-variant-1-"
+            "corrupted-false-gemlevel-1-gemquality-0"
+        )
+        self.storage.set_setting("item_categories", ["SkillGem"])
+        service = self.service(poe_ninja=FlakyHistoryPoeNinja())
+        self.assertTrue(service.sync(backfill_hours=0)["ok"])
+        league = self.storage.get_current_league()
+        assert league is not None
+        with patch(
+            "poe_advisor.models.utc_now",
+            return_value=datetime(2026, 7, 31, 6, tzinfo=timezone.utc),
+        ), patch("poe_advisor.sync.CURRENT_HISTORY_RETRY_PAUSE_SECONDS", 0):
+            summary = service.sync_current_item_histories(
+                league,
+                [item_key],
+                max_items=100,
+            )
+        self.assertEqual(summary["status"], "success")
+        self.assertEqual(summary["failed_items"], 0)
+        self.assertEqual(summary["retried_items"], 1)
+        self.assertEqual(summary["fetched_items"], 1)
 
     def test_ranked_current_history_uses_exact_days_and_keeps_fresher_local(
         self,

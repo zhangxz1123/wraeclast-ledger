@@ -205,6 +205,58 @@ def _validate_host(value: str) -> str:
     return value
 
 
+def _annotate_failed_daily_update(result: dict) -> None:
+    """Emit the failure reason as a GitHub annotation.
+
+    Annotations are readable from the run page and API without signing in,
+    unlike the raw step log.
+    """
+    lines = [str(result.get("message") or "Daily refresh failed.")]
+    for key in ("current_history_sync", "seasonal_sync", "meta_sync"):
+        section = result.get(key)
+        if not isinstance(section, dict):
+            continue
+        counts = ", ".join(
+            f"{field}={section[field]}"
+            for field in (
+                "status",
+                "input_items",
+                "requested_items",
+                "omitted_items",
+                "unmatched_items",
+                "failed_items",
+                "unavailable_items",
+                "retried_items",
+            )
+            if field in section
+        )
+        lines.append(f"{key}: {counts or section.get('status')}")
+        if section.get("status") == "failed" and section.get("message"):
+            lines.append(f"  {section['message']}")
+    stats = result.get("stats") or {}
+    failed_endpoints = {
+        key: value
+        for key, value in stats.items()
+        if "failed" in key and value
+    }
+    if failed_endpoints:
+        lines.append(f"stats: {failed_endpoints}")
+    warnings = list(result.get("warnings") or [])
+    history = result.get("current_history_sync")
+    if isinstance(history, dict):
+        warnings.extend(
+            warning
+            for warning in history.get("warnings") or []
+            if "HTTP 404" not in str(warning)
+        )
+    lines.extend(f"- {warning}" for warning in warnings[:15])
+    text = "\n".join(lines)
+    escaped = (
+        text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    )
+    print(f"::error title=Daily refresh failed::{escaped}")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -274,6 +326,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             current_history_items=args.current_history_items,
         )
         print(json.dumps(result, indent=2))
+        if not result.get("ok") and os.environ.get("GITHUB_ACTIONS"):
+            _annotate_failed_daily_update(result)
         return 0 if result.get("ok") else 1
 
     if args.command == "recommend":
